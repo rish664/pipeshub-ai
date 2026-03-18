@@ -44,7 +44,8 @@ import {
   ListItem,
   Typography,
   Pagination,
-  ListItemText
+  ListItemText,
+  CircularProgress,
 } from '@mui/material';
 
 interface ListViewProps {
@@ -367,6 +368,10 @@ export const ListView: React.FC<ListViewProps> = ({
         displayLabel = 'IN PROGRESS';
         color = theme.palette.info.main;
         break;
+      case 'PROCESSING':
+        displayLabel = 'PROCESSING';
+        color = theme.palette.info.main;
+        break;
       case 'FAILED':
         displayLabel = 'FAILED';
         color = theme.palette.error.main;
@@ -388,7 +393,7 @@ export const ListView: React.FC<ListViewProps> = ({
         color = theme.palette.text.secondary;
         break;
       case 'AUTO_INDEX_OFF':
-        displayLabel = 'MANUAL SYNC';
+        displayLabel = 'MANUAL INDEXING';
         color = theme.palette.primary.main;
         break;
       case 'EMPTY':
@@ -398,6 +403,10 @@ export const ListView: React.FC<ListViewProps> = ({
       case 'ENABLE_MULTIMODAL_MODELS':
         displayLabel = 'ENABLE MULTIMODAL MODELS';
         color = theme.palette.text.secondary;
+        break;
+      case 'CONNECTOR_DISABLED':
+        displayLabel = 'CONNECTOR DISABLED';
+        color = theme.palette.warning.main;
         break;
       default:
         displayLabel = status.replace(/_/g, ' ').toLowerCase();
@@ -464,12 +473,13 @@ export const ListView: React.FC<ListViewProps> = ({
       align: 'center',
       headerAlign: 'center',
       renderCell: (params) => {
-        const item = params.row;
+        const item = params.row as any; // Type assertion for DataGrid row
         if (!item.indexingStatus || item.type === 'folder') {
           return null;
         }
 
         const { label, color } = getStatusDisplay(item.indexingStatus);
+        const isProcessing = item.indexingStatus === 'PROCESSING' || Boolean(item.isProcessing);
 
         return (
           <Box
@@ -481,6 +491,15 @@ export const ListView: React.FC<ListViewProps> = ({
               mt: 2.4,
             }}
           >
+            {isProcessing && (
+              <CircularProgress
+                size={12}
+                thickness={4}
+                sx={{
+                  color: theme.palette.info.main,
+                }}
+              />
+            )}
             <Typography variant="caption" sx={{ color, fontWeight: 500 }}>
               {label}
             </Typography>
@@ -494,11 +513,15 @@ export const ListView: React.FC<ListViewProps> = ({
       width: 110,
       align: 'center',
       headerAlign: 'center',
-      renderCell: (params) => (
-        <Typography variant="caption" sx={{ fontWeight: 500 }}>
-          {params.row.origin || 'LOCAL'}
-        </Typography>
-      ),
+      renderCell: (params) => {
+        const raw = params.row.origin || 'LOCAL';
+        const display = raw === 'COLLECTION' || raw === 'KB' ? 'Collection' : raw === 'CONNECTOR' ? 'Connector' : raw;
+        return (
+          <Typography variant="caption" sx={{ fontWeight: 500 }}>
+            {display}
+          </Typography>
+        );
+      },
     },
     {
       field: 'size',
@@ -508,9 +531,10 @@ export const ListView: React.FC<ListViewProps> = ({
       headerAlign: 'left',
       renderCell: (params) => {
         const item = params.row;
-        const size = item.sizeInBytes || item.fileRecord?.sizeInBytes;
+        // Using ?? (nullish coalescing) to correctly handle 0 as a valid file size
+        const size = item.sizeInBytes ?? item.fileRecord?.sizeInBytes;
         const formattedSize =
-          size !== undefined && !Number.isNaN(size) && size > 0 ? formatFileSize(size) : '—';
+          size !== undefined && size !== null && !Number.isNaN(size) && size >= 0 ? formatFileSize(size) : '—';
 
         return (
           <Typography
@@ -535,7 +559,11 @@ export const ListView: React.FC<ListViewProps> = ({
       renderCell: (params) => {
         const item = params.row;
         const timestamp = item.sourceCreatedAtTimestamp;
-        const formatted = formatDate(timestamp);
+        let formatted = formatDate(timestamp);
+
+        if (!formatted){
+          formatted =  formatDate(item.createdAtTimestamp || item.updatedAtTimestamp)
+        }
 
         if (!formatted) {
           return (
@@ -571,7 +599,11 @@ export const ListView: React.FC<ListViewProps> = ({
       renderCell: (params) => {
         const item = params.row;
         const timestamp = item.sourceLastModifiedTimestamp;
-        const formatted = formatDate(timestamp);
+        let formatted = formatDate(timestamp);
+
+        if (!formatted){
+          formatted =  formatDate(item.updatedAtTimestamp || item.createdAtTimestamp)
+        }
 
         if (!formatted) {
           return (
@@ -702,7 +734,7 @@ export const ListView: React.FC<ListViewProps> = ({
           getRowId={(row) => row.id}
           rowHeight={56}
           localeText={{
-            noRowsLabel: 'No records uploaded for knowledge base',
+            noRowsLabel: 'No records uploaded for Collection',
           }}
           sx={{
             border: 'none',

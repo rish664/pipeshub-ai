@@ -2431,7 +2431,7 @@ class ConfluenceDataSource:
     async def get_page_by_id(
         self,
         id: int,
-        body_format: Optional[Dict[str, Any]] = None,
+        body_format: Optional[str] = None,
         get_draft: Optional[bool] = None,
         status: Optional[list[str]] = None,
         version: Optional[int] = None,
@@ -2447,7 +2447,7 @@ class ConfluenceDataSource:
         include_direct_children: Optional[bool] = None,
         headers: Optional[Dict[str, Any]] = None
     ) -> HTTPResponse:
-        """Auto-generated from OpenAPI: Get page by id\n\nHTTP GET /pages/{id}\nPath params:\n  - id (int)\nQuery params:\n  - body-format (Dict[str, Any], optional)\n  - get-draft (bool, optional)\n  - status (list[str], optional)\n  - version (int, optional)\n  - include-labels (bool, optional)\n  - include-properties (bool, optional)\n  - include-operations (bool, optional)\n  - include-likes (bool, optional)\n  - include-versions (bool, optional)\n  - include-version (bool, optional)\n  - include-favorited-by-current-user-status (bool, optional)\n  - include-webresources (bool, optional)\n  - include-collaborators (bool, optional)\n  - include-direct-children (bool, optional)"""
+        """Auto-generated from OpenAPI: Get page by id\n\nHTTP GET /pages/{id}\nPath params:\n  - id (int)\nQuery params:\n  - body-format (str, optional) - One of: storage, atlas_doc_format, view, export_view, anonymous_export_view, styled_view, editor\n  - get-draft (bool, optional)\n  - status (list[str], optional)\n  - version (int, optional)\n  - include-labels (bool, optional)\n  - include-properties (bool, optional)\n  - include-operations (bool, optional)\n  - include-likes (bool, optional)\n  - include-versions (bool, optional)\n  - include-version (bool, optional)\n  - include-favorited-by-current-user-status (bool, optional)\n  - include-webresources (bool, optional)\n  - include-collaborators (bool, optional)\n  - include-direct-children (bool, optional)"""
         if self._client is None:
             raise ValueError('HTTP client is not initialized')
         _headers: Dict[str, Any] = dict(headers or {})
@@ -7957,6 +7957,101 @@ class ConfluenceDataSource:
             _query['cursor'] = cursor
 
         # Use REST API v1 for CQL search
+        v1_base_url = self.base_url.split('/wiki')[0] + '/wiki'
+        url = f"{v1_base_url}/rest/api/search"
+
+        req = HTTPRequest(
+            method='GET',
+            url=url,
+            headers=_as_str_dict(_headers),
+            path={},
+            query=_as_str_dict(_query),
+            body=None,
+        )
+        resp = await self._client.execute(req)
+        return resp
+
+    async def search_full_text(
+        self,
+        query: str,
+        space_id: Optional[str] = None,
+        content_types: Optional[List[str]] = None,
+        limit: int = 25,
+        cursor: Optional[str] = None,
+        headers: Optional[Dict[str, Any]] = None
+    ) -> HTTPResponse:
+        """Full-text search across all Confluence content using the platform search API.
+
+        Uses the Confluence v1 REST API search endpoint with CQL ``text ~`` operator,
+        which mirrors the Confluence platform search bar — it searches across page/blogpost
+        title, body content, comments, labels, and other metadata simultaneously.
+
+        HTTP GET /wiki/rest/api/search
+
+        Args:
+            query: Free-text search query (used with CQL ``text ~`` for full content search)
+            space_id: Optional space key or numeric ID to restrict search to one space
+            content_types: List of content types to search, e.g. ["page", "blogpost"].
+                           Defaults to ["page", "blogpost"] when omitted.
+            limit: Maximum number of results to return (default 25, max 50)
+            cursor: Pagination cursor from a previous response
+            headers: Additional HTTP headers
+
+        Returns:
+            HTTPResponse with CQL search results:
+            {
+                "results": [
+                    {
+                        "content": {
+                            "id": "...",
+                            "type": "page",        # or "blogpost"
+                            "title": "...",
+                            "space": {"key": "...", "name": "..."},
+                            "_links": {"webui": "/wiki/spaces/KEY/pages/123/Title"}
+                        },
+                        "excerpt": "...highlighted text excerpt...",
+                        "url": "/wiki/spaces/KEY/pages/123/Title",
+                        "lastModified": "..."
+                    }
+                ],
+                "totalSize": 42,
+                "_links": {"next": "...cursor..."}
+            }
+        """
+        if self._client is None:
+            raise ValueError('HTTP client is not initialized')
+
+        _headers: Dict[str, Any] = dict(headers or {})
+
+        types = content_types or ["page", "blogpost"]
+        # Build CQL type clause
+        if len(types) == 1:
+            type_clause = f'type="{types[0]}"'
+        else:
+            type_list = ', '.join(f'"{t}"' for t in types)
+            type_clause = f'type in ({type_list})'
+
+        # Use text ~ for full-content search (title + body + comments + labels)
+        cql_parts = [f'text ~ "{query}"', type_clause]
+        if space_id:
+            # Accept both key ("KEY") and numeric id
+            try:
+                int(space_id)
+                cql_parts.append(f'space.id={space_id}')
+            except ValueError:
+                cql_parts.append(f'space.key="{space_id}"')
+
+        cql = ' AND '.join(cql_parts)
+
+        _query: Dict[str, Any] = {
+            'cql': cql,
+            'limit': min(limit, 50),
+            'expand': 'space,version',
+        }
+        if cursor is not None:
+            _query['cursor'] = cursor
+
+        # Use the REST API v1 search endpoint
         v1_base_url = self.base_url.split('/wiki')[0] + '/wiki'
         url = f"{v1_base_url}/rest/api/search"
 

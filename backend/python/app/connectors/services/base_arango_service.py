@@ -25,10 +25,11 @@ from app.config.constants.arangodb import (
     LegacyGraphNames,
     OriginTypes,
     ProgressStatus,
+    RecordRelations,
     RecordTypes,
 )
 from app.config.constants.http_status_code import HttpStatusCode
-from app.config.constants.service import DefaultEndpoints, config_node_constants
+from app.config.constants.service import config_node_constants
 from app.connectors.services.kafka_service import KafkaService
 from app.models.entities import (
     AppRole,
@@ -36,7 +37,9 @@ from app.models.entities import (
     AppUserGroup,
     CommentRecord,
     FileRecord,
+    LinkRecord,
     MailRecord,
+    ProjectRecord,
     Record,
     RecordGroup,
     RecordType,
@@ -52,22 +55,33 @@ from app.schema.arango.documents import (
     comment_record_schema,
     department_schema,
     file_record_schema,
+    knowledge_schema,
+    link_record_schema,
     mail_record_schema,
     orgs_schema,
+    people_schema,
+    project_record_schema,
+    pull_request_record_schema,
     record_group_schema,
     record_schema,
     team_schema,
     ticket_record_schema,
+    tool_schema,
+    toolset_schema,
     user_schema,
     webpage_record_schema,
 )
 from app.schema.arango.edges import (
+    agent_has_knowledge_schema,
+    agent_has_toolset_schema,
     basic_edge_schema,
     belongs_to_schema,
+    entity_relations_schema,
     inherit_permissions_schema,
     is_of_type_schema,
     permissions_schema,
     record_relations_schema,
+    toolset_has_tool_schema,
     user_app_relation_schema,
     user_drive_relation_schema,
 )
@@ -82,11 +96,11 @@ NODE_COLLECTIONS = [
     (CollectionNames.RECORDS.value, record_schema),
     (CollectionNames.DRIVES.value, None),
     (CollectionNames.FILES.value, file_record_schema),
-    (CollectionNames.LINKS.value, None),
+    (CollectionNames.LINKS.value, link_record_schema),
     (CollectionNames.MAILS.value, mail_record_schema),
     (CollectionNames.WEBPAGES.value, webpage_record_schema),
     (CollectionNames.COMMENTS.value, comment_record_schema),
-    (CollectionNames.PEOPLE.value, None),
+    (CollectionNames.PEOPLE.value, people_schema),
     (CollectionNames.USERS.value, user_schema),
     (CollectionNames.GROUPS.value, None),
     (CollectionNames.ROLES.value, app_role_schema),
@@ -106,7 +120,12 @@ NODE_COLLECTIONS = [
     (CollectionNames.RECORD_GROUPS.value, record_group_schema),
     (CollectionNames.AGENT_INSTANCES.value, agent_schema),
     (CollectionNames.AGENT_TEMPLATES.value, agent_template_schema),
+    (CollectionNames.AGENT_KNOWLEDGE.value, knowledge_schema),
+    (CollectionNames.AGENT_TOOLSETS.value, toolset_schema),
+    (CollectionNames.AGENT_TOOLS.value, tool_schema),
     (CollectionNames.TICKETS.value, ticket_record_schema),
+    (CollectionNames.PROJECTS.value, project_record_schema),
+    (CollectionNames.PULLREQUESTS.value,pull_request_record_schema),
     (CollectionNames.SYNC_POINTS.value, None),
     (CollectionNames.TEAMS.value, team_schema),
     (CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value, None)
@@ -116,6 +135,7 @@ NODE_COLLECTIONS = [
 EDGE_COLLECTIONS = [
     (CollectionNames.IS_OF_TYPE.value, is_of_type_schema),
     (CollectionNames.RECORD_RELATIONS.value, record_relations_schema),
+    (CollectionNames.ENTITY_RELATIONS.value, entity_relations_schema),
     (CollectionNames.USER_DRIVE_RELATION.value, user_drive_relation_schema),
     (CollectionNames.BELONGS_TO_DEPARTMENT.value, basic_edge_schema),
     (CollectionNames.ORG_DEPARTMENT_RELATION.value, basic_edge_schema),
@@ -129,6 +149,9 @@ EDGE_COLLECTIONS = [
     (CollectionNames.BELONGS_TO_RECORD_GROUP.value, basic_edge_schema),
     (CollectionNames.INTER_CATEGORY_RELATIONS.value, basic_edge_schema),
     (CollectionNames.PERMISSION.value, permissions_schema),
+    (CollectionNames.AGENT_HAS_KNOWLEDGE.value, agent_has_knowledge_schema),
+    (CollectionNames.AGENT_HAS_TOOLSET.value, agent_has_toolset_schema),
+    (CollectionNames.TOOLSET_HAS_TOOL.value, toolset_has_tool_schema),
 ]
 
 class BaseArangoService:
@@ -590,6 +613,7 @@ class BaseArangoService:
                     EMPTY: LENGTH(records[* FILTER CURRENT.indexingStatus == "EMPTY"]),
                     QUEUED: LENGTH(records[* FILTER CURRENT.indexingStatus == "QUEUED"]),
                     PAUSED: LENGTH(records[* FILTER CURRENT.indexingStatus == "PAUSED"]),
+                    CONNECTOR_DISABLED: LENGTH(records[* FILTER CURRENT.indexingStatus == "CONNECTOR_DISABLED"]),
                 }
             }
 
@@ -612,6 +636,7 @@ class BaseArangoService:
                             EMPTY: LENGTH(type_records[* FILTER CURRENT.indexingStatus == "EMPTY"]),
                             QUEUED: LENGTH(type_records[* FILTER CURRENT.indexingStatus == "QUEUED"]),
                             PAUSED: LENGTH(type_records[* FILTER CURRENT.indexingStatus == "PAUSED"]),
+                            CONNECTOR_DISABLED: LENGTH(type_records[* FILTER CURRENT.indexingStatus == "CONNECTOR_DISABLED"]),
                         }
                     }
             )
@@ -701,7 +726,13 @@ class BaseArangoService:
                 self.logger.warning(f"User not found for userId: {user_id}")
                 return None
 
-            user.get('_key')
+            user_key=user.get('_key')
+
+            # Get user's accessible apps and extract connector IDs (_key)
+            user_apps_ids = await self._get_user_app_ids(user_key)
+
+            # Build app record filter for connector records
+            app_record_filter = 'FILTER record.origin != "CONNECTOR" OR record.connectorId IN @user_apps_ids'
 
             # First check access and get permission paths
             access_query = f"""
@@ -717,8 +748,9 @@ class BaseArangoService:
                 RETURN k
             )
             LET directAccessPermissionEdge = (
-                FOR records, edge IN 1..1 ANY userDoc._id {CollectionNames.PERMISSION.value}
-                FILTER records._key == @recordId
+                FOR record, edge IN 1..1 ANY userDoc._id {CollectionNames.PERMISSION.value}
+                FILTER record._key == @recordId
+                {app_record_filter}
                 RETURN {{
                     type: 'DIRECT',
                     source: userDoc,
@@ -728,8 +760,9 @@ class BaseArangoService:
             LET groupAccessPermissionEdge = (
                 FOR group, belongsEdge IN 1..1 ANY userDoc._id {CollectionNames.PERMISSION.value}
                 FILTER IS_SAME_COLLECTION("groups", group) OR IS_SAME_COLLECTION("roles", group)
-                FOR records, permEdge IN 1..1 ANY group._id {CollectionNames.PERMISSION.value}
-                FILTER records._key == @recordId
+                FOR record, permEdge IN 1..1 ANY group._id {CollectionNames.PERMISSION.value}
+                FILTER record._key == @recordId
+                {app_record_filter}
                 RETURN {{
                     type: 'GROUP',
                     source: group,
@@ -748,6 +781,7 @@ class BaseArangoService:
                 // Hop 3: RecordGroup -> Record
                 FOR record, recordGroupToRecordEdge IN 1..1 INBOUND recordGroup._id {CollectionNames.INHERIT_PERMISSIONS.value}
                 FILTER record._key == @recordId
+                {app_record_filter}
 
                 RETURN {{
                     type: 'RECORD_GROUP',
@@ -770,12 +804,13 @@ class BaseArangoService:
                 // Hop 4: Child RecordGroup -> Record (belongs_to)
                 FOR record, childRgToRecordEdge IN 1..1 INBOUND childRecordGroup._id {CollectionNames.INHERIT_PERMISSIONS.value}
                     FILTER record._key == @recordId
+                    {app_record_filter}
 
-                RETURN {{
-                    type: 'NESTED_RECORD_GROUP',
-                    source: childRecordGroup,
-                    role: groupToRgEdge.role
-                }}
+                    RETURN {{
+                        type: 'NESTED_RECORD_GROUP',
+                        source: childRecordGroup,
+                        role: groupToRgEdge.role
+                    }}
             )
             LET directUserToRecordGroupAccess = (
                 // Direct user -> record_group permission (with nested record groups support)
@@ -787,6 +822,7 @@ class BaseArangoService:
                         // Only process if final vertex is the target record
                         FILTER record._key == @recordId
                         FILTER IS_SAME_COLLECTION("records", record)
+                        {app_record_filter}
 
                         LET finalEdge = LENGTH(path.edges) > 0 ? path.edges[LENGTH(path.edges) - 1] : edge
 
@@ -799,8 +835,9 @@ class BaseArangoService:
             )
             LET orgAccessPermissionEdge = (
                 FOR org, belongsEdge IN 1..1 ANY userDoc._id {CollectionNames.BELONGS_TO.value}
-                FOR records, permEdge IN 1..1 ANY org._id {CollectionNames.PERMISSION.value}
-                FILTER records._key == @recordId
+                FOR record, permEdge IN 1..1 ANY org._id {CollectionNames.PERMISSION.value}
+                FILTER record._key == @recordId
+                {app_record_filter}
                 RETURN {{
                     type: 'ORGANIZATION',
                     source: org,
@@ -818,6 +855,7 @@ class BaseArangoService:
                         FOR record, edge, path IN 0..2 INBOUND recordGroup._id {CollectionNames.INHERIT_PERMISSIONS.value}
                             FILTER record._key == @recordId
                             FILTER IS_SAME_COLLECTION("records", record)
+                            {app_record_filter}
 
                             LET finalEdge = LENGTH(path.edges) > 0 ? path.edges[LENGTH(path.edges) - 1] : edge
 
@@ -918,6 +956,7 @@ class BaseArangoService:
                 "userId": user_id,
                 "orgId": org_id,
                 "recordId": record_id,
+                "user_apps_ids": user_apps_ids,
                 "@users": CollectionNames.USERS.value,
                 "records": CollectionNames.RECORDS.value,
                 "files": CollectionNames.FILES.value,
@@ -1361,6 +1400,7 @@ class BaseArangoService:
                             FILTER record.orgId == org_id OR record.orgId == null
                             FILTER record.origin == "CONNECTOR"
 
+                            {app_record_filter}
                             {folder_filter}
                             {record_filter}
                             RETURN {{
@@ -1392,6 +1432,7 @@ class BaseArangoService:
                                 FILTER record.orgId == org_id OR record.orgId == null
                                 FILTER record.origin == "CONNECTOR"
 
+                                {app_record_filter}
                                 {folder_filter}
                                 {record_filter}
 
@@ -1517,6 +1558,12 @@ class BaseArangoService:
                 )''' if include_connector_records else '[]'
             }
 
+            // Combine all connector/app record sources
+            // A record can appear in multiple permission paths:
+            // - Direct user permission
+            // - Group/role permission
+            // - Organization permission
+            // - Record group permissions (direct, nested, inherited)
             LET allConnectorRecordsNewPermission = UNION_DISTINCT(
                 connectorRecordsNewPermission,
                 groupConnectorRecordsNewPermission,
@@ -1526,6 +1573,9 @@ class BaseArangoService:
                 inheritedRecordGroupConnectorRecords,
                 directUserToRecordGroupRecords
             )
+            // Deduplicate connector/app records by record key
+            // Even if a record appears via multiple permission paths with different permission metadata,
+            // it should only appear once in the final result
             LET allConnectorRecordsDistinct = (
                 FOR item IN allConnectorRecordsNewPermission
                     COLLECT recordKey = item.record._key
@@ -1533,15 +1583,27 @@ class BaseArangoService:
                     RETURN FIRST(groups[*].item)
             )
 
-            //LET mergeRecords = APPEND(kbRecords, connectorRecords)
-            //LET mergeRecordsNewPermission = APPEND(mergeRecords, connectorRecordsNewPermission)
-            //LET allRecords = APPEND(mergeRecords, allConnectorRecordsDistinct)
-            LET allRecords = APPEND(kbRecords, allConnectorRecordsDistinct)
+            // Deduplicate KB records (a record can appear in multiple KBs)
+            LET kbRecordsDistinct = (
+                FOR item IN kbRecords
+                    COLLECT recordKey = item.record._key
+                    INTO groups
+                    RETURN FIRST(groups[*].item)
+            )
 
+            // Combine KB and connector records
+            // Note: These are mutually exclusive (KB records have origin="UPLOAD", connector records have origin="CONNECTOR")
+            // So no deduplication needed when combining them
+            LET allRecords = APPEND(kbRecordsDistinct, allConnectorRecordsDistinct)
+
+            // Sort with secondary key for deterministic ordering
+            // When sort_by values are equal, use record._key as tiebreaker
+            // For string fields (recordName), use case-insensitive sorting for consistent ordering across pages
             LET sortedRecords = (
                 FOR item IN allRecords
                     LET record = item.record
-                    SORT record.{sort_by} {sort_order.upper()}
+                    {f'LET sortValue = LOWER(record.{sort_by})' if sort_by == "recordName" else f'LET sortValue = record.{sort_by}'}
+                    SORT sortValue {sort_order.upper()}, record._key ASC
                     RETURN item
             )
 
@@ -1619,6 +1681,7 @@ class BaseArangoService:
                     deletedByUserId: record.deletedByUserId,
                     isLatestVersion: record.isLatestVersion != null ? record.isLatestVersion : true,
                     webUrl: record.webUrl,
+                    sizeInBytes: record.sizeInBytes,
                     fileRecord: LENGTH(fileRecord) > 0 ? fileRecord[0] : null,
                     mailRecord: LENGTH(mailRecord) > 0 ? mailRecord[0] : null,
                     ticketRecord: LENGTH(ticketRecord) > 0 ? ticketRecord[0] : null,
@@ -1692,8 +1755,9 @@ class BaseArangoService:
                     RETURN access
             )
 
-            LET kbCount = {
-                f'''LENGTH(
+            // Get unique KB record keys (deduplicate records that appear in multiple KBs)
+            LET kbRecordKeys = {
+                f'''UNIQUE(
                     FOR access IN filteredKbAccess
                         LET kb = access.kb_doc
                         FOR belongsEdge IN @@belongs_to
@@ -1721,8 +1785,8 @@ class BaseArangoService:
 
                             FILTER isValidRecord
                             {record_filter}
-                            RETURN 1
-                )''' if include_kb_records else '0'
+                            RETURN record._key
+                )''' if include_kb_records else '[]'
             }
 
             LET connectorKeysNewPermission = {
@@ -1781,6 +1845,7 @@ class BaseArangoService:
                             FILTER record.orgId == org_id OR record.orgId == null
                             FILTER record.origin == "CONNECTOR"
 
+                            {app_record_filter}
                             {folder_filter}
                             {record_filter}
                             RETURN record._key
@@ -1809,6 +1874,7 @@ class BaseArangoService:
                                 FILTER record.orgId == org_id OR record.orgId == null
                                 FILTER record.origin == "CONNECTOR"
 
+                                {app_record_filter}
                                 {folder_filter}
                                 {record_filter}
 
@@ -1903,7 +1969,7 @@ class BaseArangoService:
                 )''' if include_connector_records else '[]'
             }
 
-            // Combine all keys and count unique ones
+            // Combine all connector record keys and deduplicate
             LET allNewPermissionKeys = UNION_DISTINCT(
                 connectorKeysNewPermission,
                 groupConnectorKeysNewPermission,
@@ -1914,8 +1980,13 @@ class BaseArangoService:
             )
             LET uniqueNewPermissionCount = LENGTH(UNIQUE(allNewPermissionKeys))
 
-            // RETURN kbCount + connectorCount + uniqueNewPermissionCount
-            RETURN kbCount + uniqueNewPermissionCount
+            // Combine KB and connector record keys
+            // Note: These are mutually exclusive (KB records have origin="UPLOAD", connector records have origin="CONNECTOR")
+            // So we can just add the counts directly
+            LET kbCount = LENGTH(kbRecordKeys)
+            LET totalCount = kbCount + uniqueNewPermissionCount
+
+            RETURN totalCount
             """
 
             # ===== FILTERS QUERY (Fixed) =====
@@ -2382,7 +2453,7 @@ class BaseArangoService:
                     }
 
                 user_role = await self.get_user_kb_permission(kb_context["kb_id"], user_key)
-                if user_role not in ["OWNER", "WRITER", "READER"]:
+                if not user_role:
                     return {
                         "success": False,
                         "code": 403,
@@ -2397,12 +2468,28 @@ class BaseArangoService:
                 permission_result = await self._check_record_permissions(record_id, user_key)
                 user_role = permission_result.get("permission")
 
-                if not user_role or user_role not in ["OWNER", "WRITER","READER"]:
+                if not user_role:
                     return {
                         "success": False,
                         "code": 403,
                         "reason": f"Insufficient permissions. User role: {user_role}. Required: OWNER, WRITER, READER"
                     }
+
+                # Check if connector is enabled before allowing reindex
+                if connector_id:
+                    connector_instance = await self.get_document(connector_id, CollectionNames.APPS.value)
+                    if not connector_instance:
+                        return {
+                            "success": False,
+                            "code": 404,
+                            "reason": f"Connector not found: {connector_id}"
+                        }
+                    if not connector_instance.get("isActive", False):
+                        return {
+                            "success": False,
+                            "code": 400,
+                            "reason": f"Cannot reindex: connector '{connector_instance.get('name', connector_name)}' is currently disabled. Please enable the connector first."
+                        }
 
                 connector_type = connector_name
             else:
@@ -2419,6 +2506,10 @@ class BaseArangoService:
 
             # Determine if we should use batch reindex (depth > 0)
             use_batch_reindex = depth != 0
+
+            # Reset indexing status to QUEUED before reindexing
+            # This ensures the record will be properly queued and re-indexed
+            await self._reset_indexing_status_to_queued(record_id)
 
             # Create and publish reindex event
             try:
@@ -2844,14 +2935,13 @@ class BaseArangoService:
         connector_id: str,
         org_id: str,
         depth: int,
-        include_parent: bool = True,
         limit: Optional[int] = None,
         offset: int = 0,
         transaction: Optional[TransactionDatabase] = None
     ) -> List[Record]:
         """
         Get all child records of a parent record (folder) up to a specified depth.
-        Uses graph traversal on recordRelations edge collection.
+        Uses graph traversal on recordRelations edge collection. Parent record is always included.
 
         Args:
             parent_record_id: Record ID of the parent (folder)
@@ -2859,7 +2949,6 @@ class BaseArangoService:
             org_id: Organization ID (for security filtering)
             depth: Depth for traversing children (-1 = unlimited, 0 = only parent,
                    1 = direct children, 2 = children + grandchildren, etc.)
-            include_parent: Whether to include the parent record itself
             limit: Maximum number of records to return (for pagination)
             offset: Number of records to skip (for pagination)
             transaction: Optional database transaction
@@ -2871,7 +2960,7 @@ class BaseArangoService:
             self.logger.info(
                 f"Retrieving child records for parent {parent_record_id}, "
                 f"connector {connector_id}, org {org_id}, depth {depth}, "
-                f"include_parent: {include_parent}, limit: {limit}, offset: {offset}"
+                f"limit: {limit}, offset: {offset}"
             )
 
             # Validate depth - must be >= -1
@@ -2879,10 +2968,6 @@ class BaseArangoService:
                 raise ValueError(
                     f"Depth must be >= -1 (where -1 means unlimited). Got: {depth}"
                 )
-
-            # Early return if depth=0 and include_parent=false (nothing to return)
-            if depth == 0 and not include_parent:
-                return []
 
             # Handle limit/offset for pagination
             limit_clause = ""
@@ -2894,7 +2979,6 @@ class BaseArangoService:
                 )
 
             # Determine max traversal depth (use 100 as practical unlimited)
-            # For depth=0, we set max_depth=0 so the child traversal returns nothing
             max_depth = 100 if depth == -1 else depth
 
             bind_vars = {
@@ -2902,69 +2986,40 @@ class BaseArangoService:
                 "max_depth": max_depth,
                 "connector_id": connector_id,
                 "org_id": org_id,
-                "include_parent": include_parent,
             }
 
             if limit is not None:
                 bind_vars["limit"] = limit
                 bind_vars["offset"] = offset
 
-            # Single unified query that handles all depth cases
-            # When max_depth=0, the child traversal (1..@max_depth) returns empty
-            # When include_parent=false, parentResult is empty
+            # Single unified query using 0..max_depth traversal
+            # Depth 0 = parent, Depth 1+ = children at various levels
             query = f"""
             LET startRecord = DOCUMENT(@record_id)
             FILTER startRecord != null
 
-            // Get parent record with its typed record if include_parent is true
-            LET parentResult = @include_parent ? (
-                LET parentTypedRecord = FIRST(
-                    FOR rec IN 1..1 OUTBOUND startRecord {CollectionNames.IS_OF_TYPE.value}
+            // Single traversal for parent (depth 0) and all children (depth 1+)
+            FOR v, e, p IN 0..@max_depth OUTBOUND startRecord {CollectionNames.RECORD_RELATIONS.value}
+                OPTIONS {{bfs: true, uniqueVertices: "global"}}
+
+                FILTER v.connectorId == @connector_id
+                FILTER v.orgId == @org_id OR v.orgId == null
+                FILTER v.isDeleted != true
+
+                LET typedRecord = FIRST(
+                    FOR rec IN 1..1 OUTBOUND v {CollectionNames.IS_OF_TYPE.value}
                         LIMIT 1
                         RETURN rec
                 )
-                // Only return parent if it matches filters and has typed record
-                FILTER parentTypedRecord != null
-                FILTER startRecord.connectorId == @connector_id
-                FILTER startRecord.orgId == @org_id OR startRecord.orgId == null
-                FILTER startRecord.isDeleted != true
-                RETURN {{
-                    record: startRecord,
-                    typedRecord: parentTypedRecord,
-                    depth: 0
+
+                FILTER typedRecord != null
+
+                LET result = {{
+                    record: v,
+                    typedRecord: typedRecord,
+                    depth: LENGTH(p.edges)
                 }}
-            ) : []
 
-            // Get all children using graph traversal
-            // When max_depth=0, this returns empty (1..0 is invalid range)
-            LET childResults = @max_depth > 0 ? (
-                FOR v, e, p IN 1..@max_depth OUTBOUND startRecord {CollectionNames.RECORD_RELATIONS.value}
-                    OPTIONS {{bfs: true, uniqueVertices: "global"}}
-
-                    FILTER v.connectorId == @connector_id
-                    FILTER v.orgId == @org_id OR v.orgId == null
-                    FILTER v.isDeleted != true
-
-                    LET typedRecord = FIRST(
-                        FOR rec IN 1..1 OUTBOUND v {CollectionNames.IS_OF_TYPE.value}
-                            LIMIT 1
-                            RETURN rec
-                    )
-
-                    FILTER typedRecord != null
-
-                    RETURN {{
-                        record: v,
-                        typedRecord: typedRecord,
-                        depth: LENGTH(p.vertices) - 1
-                    }}
-            ) : []
-
-            // Combine parent and children
-            LET allResults = APPEND(parentResult, childResults)
-
-            // Sort by depth then by key, and apply pagination
-            FOR result IN allResults
                 SORT result.depth, result.record._key
                 {limit_clause}
                 RETURN result
@@ -3162,6 +3217,507 @@ class BaseArangoService:
                 "code": 500,
                 "reason": f"Internal error: {str(e)}"
             }
+
+    async def delete_connector_instance(self, connector_id: str, org_id: str) -> Dict:
+        """
+        Delete a connector instance and ALL its related data using a generic graph-based approach.
+
+        This method dynamically discovers and deletes all edges connected to nodes,
+        making it future-proof when new collections/edges are added.
+
+        Flow:
+        1. Collect all node IDs (records, record groups, roles, groups, drives, app)
+        2. Get all edge collections from the graph definition
+        3. Collect isOfType target nodes (files, mails, etc.) BEFORE deleting edges
+        4. Delete all edges connected to these nodes (dynamically)
+        5. Delete isOfType target nodes using pre-collected targets
+        6. Delete the nodes themselves
+        7. Return virtualRecordIds for Qdrant cleanup
+
+        Classification nodes (departments, categories, topics, languages) are NOT deleted
+        as they are shared resources.
+        Users are NOT deleted - only userAppRelation edges are removed.
+
+        Args:
+            connector_id: The connector instance ID (_key in apps collection)
+            org_id: The organization ID for validation
+
+        Returns:
+            Dict with success status, deletion counts, and virtualRecordIds for Qdrant
+        """
+        try:
+            self.logger.info(f"🗑️ Starting connector instance deletion for {connector_id}")
+
+            # Step 1: Verify connector exists
+            connector = await self.get_document(connector_id, CollectionNames.APPS.value)
+            if not connector:
+                return {
+                    "success": False,
+                    "error": f"Connector instance {connector_id} not found"
+                }
+
+            # Step 2: Collect all entities for this connector
+            collected = await self._collect_connector_entities(connector_id)
+
+            # Step 3: Get all edge collections from graph definition
+            edge_collections = await self._get_all_edge_collections()
+
+            # Step 4: Define all node collections that might have documents to delete
+            node_collections = [
+                CollectionNames.RECORDS.value,
+                CollectionNames.RECORD_GROUPS.value,
+                CollectionNames.ROLES.value,
+                CollectionNames.GROUPS.value,
+                CollectionNames.SYNC_POINTS.value,
+                CollectionNames.FILES.value,
+                CollectionNames.MAILS.value,
+                CollectionNames.WEBPAGES.value,
+                CollectionNames.COMMENTS.value,
+                CollectionNames.TICKETS.value,
+                CollectionNames.APPS.value,
+                CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value,
+            ]
+
+            # Start transaction
+            # Note: lock_timeout is set to 60 seconds (60000ms).
+            # For very large connector instances with millions of records, this may need to be increased.
+            # Consider implementing a more granular deletion strategy for extremely large datasets if timeouts occur.
+            transaction = self.db.begin_transaction(
+                read=edge_collections + node_collections,
+                write=edge_collections + node_collections,
+                exclusive=[],
+                allow_implicit=True,
+                lock_timeout=60000,  # 60 seconds - may need adjustment for very large deletions
+            )
+
+            try:
+                # Step 5: Collect isOfType targets BEFORE deleting edges
+                isoftype_targets = await self._collect_isoftype_targets(
+                    transaction,
+                    collected["record_ids"]
+                )
+
+                # Step 6: Delete all edges connected to nodes
+                await self._delete_all_edges_for_nodes(
+                    transaction,
+                    collected["all_node_ids"],
+                    edge_collections
+                )
+
+                # Step 7: Delete isOfType target nodes (files, mails, etc.)
+                await self._delete_isoftype_targets_from_collected(
+                    transaction,
+                    isoftype_targets,
+                    edge_collections
+                )
+
+                # Step 8: Delete records
+                await self._delete_nodes_by_keys(
+                    transaction,
+                    collected["record_keys"],
+                    CollectionNames.RECORDS.value
+                )
+
+                # Step 9: Delete record groups
+                await self._delete_nodes_by_keys(
+                    transaction,
+                    collected["record_group_keys"],
+                    CollectionNames.RECORD_GROUPS.value
+                )
+
+                # Step 10: Delete roles
+                await self._delete_nodes_by_keys(
+                    transaction,
+                    collected["role_keys"],
+                    CollectionNames.ROLES.value
+                )
+
+                # Step 11: Delete groups
+                await self._delete_nodes_by_keys(
+                    transaction,
+                    collected["group_keys"],
+                    CollectionNames.GROUPS.value
+                )
+
+                # Step 12: Delete syncPoints and blocks
+                await self._delete_nodes_by_connector_id(
+                    transaction,
+                    connector_id,
+                    CollectionNames.SYNC_POINTS.value
+                )
+
+
+                # Step 13: Delete the app itself
+                await self._delete_nodes_by_keys(
+                    transaction,
+                    [connector_id],
+                    CollectionNames.APPS.value
+                )
+
+                # Commit the transaction
+                transaction.commit_transaction()
+
+                self.logger.info(
+                    f"✅ Connector instance {connector_id} deleted successfully. "
+                    f"Records: {len(collected['record_keys'])}, "
+                    f"RecordGroups: {len(collected['record_group_keys'])}, "
+                    f"Roles: {len(collected['role_keys'])}, "
+                    f"Groups: {len(collected['group_keys'])}, "
+                    f"Drives: {len(collected['drive_keys'])}"
+                )
+
+                return {
+                    "success": True,
+                    "deleted_records_count": len(collected["record_keys"]),
+                    "deleted_record_groups_count": len(collected["record_group_keys"]),
+                    "deleted_roles_count": len(collected["role_keys"]),
+                    "deleted_groups_count": len(collected["group_keys"]),
+                    "deleted_drives_count": len(collected["drive_keys"]),
+                    "virtual_record_ids": collected["virtual_record_ids"],
+                    "connector_id": connector_id
+                }
+
+            except Exception as tx_error:
+                try:
+                    transaction.abort_transaction()
+                except Exception as abort_error:
+                    self.logger.error(
+                        f"❌ Failed to abort transaction during connector deletion: {abort_error}. "
+                        f"Original error: {tx_error}"
+                    )
+                raise tx_error
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to delete connector instance {connector_id}: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Failed to delete connector instance: {str(e)}"
+            }
+
+    async def _collect_connector_entities(self, connector_id: str) -> Dict:
+        """
+        Collect all entity IDs for a connector in a single pass.
+        Returns record keys, virtual record IDs, and full node IDs for edge deletion.
+        """
+        result = {
+            "record_keys": [],
+            "record_ids": [],
+            "virtual_record_ids": [],
+            "record_group_keys": [],
+            "role_keys": [],
+            "group_keys": [],
+            "drive_keys": [],
+            "all_node_ids": []
+        }
+
+        # Collect records
+        query = """
+        FOR r IN @@collection FILTER r.connectorId == @connector_id
+        RETURN { _key: r._key, virtualRecordId: r.virtualRecordId }
+        """
+        cursor = self.db.aql.execute(query, bind_vars={
+            "@collection": CollectionNames.RECORDS.value,
+            "connector_id": connector_id
+        })
+        for doc in cursor:
+            result["record_keys"].append(doc["_key"])
+            result["record_ids"].append(f"records/{doc['_key']}")
+            if doc.get("virtualRecordId"):
+                result["virtual_record_ids"].append(doc["virtualRecordId"])
+
+        # Collect record groups
+        query = "FOR rg IN @@collection FILTER rg.connectorId == @connector_id RETURN rg._key"
+        cursor = self.db.aql.execute(query, bind_vars={
+            "@collection": CollectionNames.RECORD_GROUPS.value,
+            "connector_id": connector_id
+        })
+        for key in cursor:
+            result["record_group_keys"].append(key)
+
+        # Collect roles
+        query = "FOR role IN @@collection FILTER role.connectorId == @connector_id RETURN role._key"
+        cursor = self.db.aql.execute(query, bind_vars={
+            "@collection": CollectionNames.ROLES.value,
+            "connector_id": connector_id
+        })
+        for key in cursor:
+            result["role_keys"].append(key)
+
+        # Collect groups
+        query = "FOR grp IN @@collection FILTER grp.connectorId == @connector_id RETURN grp._key"
+        cursor = self.db.aql.execute(query, bind_vars={
+            "@collection": CollectionNames.GROUPS.value,
+            "connector_id": connector_id
+        })
+        for key in cursor:
+            result["group_keys"].append(key)
+
+        # Collect drives
+        query = "FOR drive IN @@collection FILTER drive.connectorId == @connector_id RETURN drive._key"
+        cursor = self.db.aql.execute(query, bind_vars={
+            "@collection": CollectionNames.DRIVES.value,
+            "connector_id": connector_id
+        })
+        for key in cursor:
+            result["drive_keys"].append(key)
+
+        # Build all_node_ids list for edge deletion
+        result["all_node_ids"].extend(result["record_ids"])
+        result["all_node_ids"].extend([f"recordGroups/{k}" for k in result["record_group_keys"]])
+        result["all_node_ids"].extend([f"roles/{k}" for k in result["role_keys"]])
+        result["all_node_ids"].extend([f"groups/{k}" for k in result["group_keys"]])
+        result["all_node_ids"].extend([f"drives/{k}" for k in result["drive_keys"]])
+        result["all_node_ids"].append(f"apps/{connector_id}")
+
+        self.logger.info(
+            f"📊 Collected entities for connector {connector_id}: "
+            f"records={len(result['record_keys'])}, "
+            f"recordGroups={len(result['record_group_keys'])}, "
+            f"roles={len(result['role_keys'])}, "
+            f"groups={len(result['group_keys'])}, "
+            f"drives={len(result['drive_keys'])}"
+        )
+
+        return result
+
+    async def _get_all_edge_collections(self) -> List[str]:
+        """
+        Get all edge collection names from the graph definition.
+        This makes the deletion future-proof when new edge types are added.
+
+        Raises:
+            Exception: If the graph or edge definitions cannot be retrieved.
+        """
+        graph = self.db.graph(GraphNames.KNOWLEDGE_GRAPH.value)
+        edge_definitions = graph.edge_definitions()
+        edge_collections = [ed['edge_collection'] for ed in edge_definitions]
+        self.logger.debug(f"📊 Found {len(edge_collections)} edge collections from graph")
+        return edge_collections
+
+    async def _delete_all_edges_for_nodes(
+        self,
+        transaction,
+        node_ids: List[str],
+        edge_collections: List[str]
+    ) -> int:
+        """
+        Delete all edges where _from or _to matches any of the node_ids.
+        Iterates through each edge collection dynamically.
+        """
+        if not node_ids:
+            return 0
+
+        total_deleted = 0
+
+        deletion_query = """
+        FOR edge IN @@edge_collection
+            FILTER edge._from IN @node_ids OR edge._to IN @node_ids
+            REMOVE edge IN @@edge_collection
+            RETURN 1
+        """
+
+        for edge_collection in edge_collections:
+            try:
+                cursor = transaction.aql.execute(deletion_query, bind_vars={
+                    "@edge_collection": edge_collection,
+                    "node_ids": node_ids
+                })
+                deleted_count = len(list(cursor))
+                total_deleted += deleted_count
+
+                if deleted_count > 0:
+                    self.logger.debug(f"🗑️ Deleted {deleted_count} edges from {edge_collection}")
+
+            except Exception as e:
+                self.logger.warning(f"⚠️ Error deleting from {edge_collection}: {e}")
+                # Continue with other collections
+
+        self.logger.info(f"✅ Deleted {total_deleted} total edges across all collections")
+        return total_deleted
+
+    async def _collect_isoftype_targets(self, transaction, record_ids: List[str]) -> List[Dict]:
+        """
+        Collect isOfType target nodes (files, mails, etc.) BEFORE deleting edges.
+        This must be called before _delete_all_edges_for_nodes to ensure we can find the targets.
+
+        Returns:
+            List of target dictionaries with keys: collection, key, full_id
+        """
+        if not record_ids:
+            return []
+
+        collect_query = """
+        FOR edge IN @@isOfType
+            FILTER edge._from IN @record_ids
+            LET target = PARSE_IDENTIFIER(edge._to)
+            RETURN DISTINCT { collection: target.collection, key: target.key, full_id: edge._to }
+        """
+
+        try:
+            cursor = transaction.aql.execute(collect_query, bind_vars={
+                "@isOfType": CollectionNames.IS_OF_TYPE.value,
+                "record_ids": record_ids
+            })
+            targets = list(cursor)
+            self.logger.debug(f"📊 Collected {len(targets)} isOfType targets before edge deletion")
+            return targets
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error collecting isOfType targets: {e}")
+            return []
+
+    async def _delete_isoftype_targets_from_collected(
+        self,
+        transaction,
+        targets: List[Dict],
+        edge_collections: List[str]
+    ) -> int:
+        """
+        Delete isOfType target nodes using pre-collected targets.
+        This is called after edges are deleted, using targets collected before deletion.
+
+        Args:
+            transaction: The transaction object
+            targets: List of target dicts with keys: collection, key, full_id (from _collect_isoftype_targets)
+            edge_collections: List of edge collection names for cleanup
+        """
+        if not targets:
+            return 0
+
+        # Build list of type node IDs for edge cleanup
+        type_node_ids = [target["full_id"] for target in targets]
+
+        # Delete edges connected to type nodes BEFORE deleting the nodes
+        await self._delete_all_edges_for_nodes(transaction, type_node_ids, edge_collections)
+
+        # Group targets by collection
+        targets_by_collection: Dict[str, List[str]] = {}
+        for target in targets:
+            coll = target["collection"]
+            key = target["key"]
+            if coll not in targets_by_collection:
+                targets_by_collection[coll] = []
+            targets_by_collection[coll].append(key)
+
+        # Delete from each collection
+        total_deleted = 0
+        for collection, keys in targets_by_collection.items():
+            deleted = await self._delete_nodes_by_keys(transaction, keys, collection)
+            total_deleted += deleted
+
+        self.logger.info(f"✅ Deleted {total_deleted} isOfType target documents")
+        return total_deleted
+
+    async def _delete_isoftype_targets(self, transaction, record_ids: List[str], edge_collections: List[str]) -> int:
+        """
+        Delete nodes that records point to via isOfType edges (files, mails, etc.).
+        Dynamically discovers target collection from edge._to.
+        Also deletes any edges connected to these type nodes first.
+        """
+        if not record_ids:
+            return 0
+
+        # First, collect all targets from isOfType edges
+        collect_query = """
+        FOR edge IN @@isOfType
+            FILTER edge._from IN @record_ids
+            LET target = PARSE_IDENTIFIER(edge._to)
+            RETURN DISTINCT { collection: target.collection, key: target.key, full_id: edge._to }
+        """
+
+        try:
+            cursor = transaction.aql.execute(collect_query, bind_vars={
+                "@isOfType": CollectionNames.IS_OF_TYPE.value,
+                "record_ids": record_ids
+            })
+            targets = list(cursor)
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error collecting isOfType targets: {e}")
+            return 0
+
+        if not targets:
+            return 0
+
+        # Build list of type node IDs for edge cleanup
+        type_node_ids = [target["full_id"] for target in targets]
+
+        # Step 6.5: Delete edges connected to type nodes BEFORE deleting the nodes
+        await self._delete_all_edges_for_nodes(transaction, type_node_ids, edge_collections)
+
+        # Group targets by collection
+        targets_by_collection: Dict[str, List[str]] = {}
+        for target in targets:
+            coll = target["collection"]
+            key = target["key"]
+            if coll not in targets_by_collection:
+                targets_by_collection[coll] = []
+            targets_by_collection[coll].append(key)
+
+        # Delete from each collection
+        total_deleted = 0
+        for collection, keys in targets_by_collection.items():
+            deleted = await self._delete_nodes_by_keys(transaction, keys, collection)
+            total_deleted += deleted
+
+        self.logger.info(f"✅ Deleted {total_deleted} isOfType target documents")
+        return total_deleted
+
+    async def _delete_nodes_by_keys(self, transaction, keys: List[str], collection: str, batch_size: int = 1000) -> int:
+        """Delete documents by their _key values using batching."""
+        if not keys:
+            return 0
+
+        total_deleted = 0
+
+        # Process in batches to avoid query size limits
+        for i in range(0, len(keys), batch_size):
+            batch_keys = keys[i:i + batch_size]
+
+            query = """
+            FOR doc IN @@collection
+                FILTER doc._key IN @keys
+                REMOVE doc IN @@collection
+                RETURN 1
+            """
+
+            try:
+                cursor = transaction.aql.execute(query, bind_vars={
+                    "@collection": collection,
+                    "keys": batch_keys
+                })
+                deleted = len(list(cursor))
+                total_deleted += deleted
+            except Exception as e:
+                self.logger.warning(f"⚠️ Error deleting batch from {collection}: {e}")
+                # Continue with next batch even if one fails
+
+        if total_deleted > 0:
+            self.logger.debug(f"🗑️ Deleted {total_deleted} documents from {collection}")
+
+        return total_deleted
+
+    async def _delete_nodes_by_connector_id(self, transaction, connector_id: str, collection: str) -> int:
+        """Delete all documents with matching connectorId."""
+        query = """
+        FOR doc IN @@collection
+            FILTER doc.connectorId == @connector_id
+            REMOVE doc IN @@collection
+            RETURN 1
+        """
+
+        try:
+            cursor = transaction.aql.execute(query, bind_vars={
+                "@collection": collection,
+                "connector_id": connector_id
+            })
+            deleted = len(list(cursor))
+            if deleted > 0:
+                self.logger.debug(f"🗑️ Deleted {deleted} documents from {collection}")
+            return deleted
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error deleting from {collection}: {e}")
+            return 0
+
+
 
     async def delete_record_by_external_id(self, connector_id: str, external_id: str, user_id: str, transaction: Optional[TransactionDatabase] = None) -> None:
         """
@@ -4681,31 +5237,34 @@ class BaseArangoService:
             if not mime_type:
                 mime_type = record.get("mimeType", "")
 
-            endpoints = await self.config_service.get_config(
-                    config_node_constants.ENDPOINTS.value
-                )
-            signed_url_route = ""
+
             file_content = ""
-            if record.get("origin") == OriginTypes.UPLOAD.value:
-                storage_url = endpoints.get("storage").get("endpoint", DefaultEndpoints.STORAGE_ENDPOINT.value)
-                signed_url_route = f"{storage_url}/api/v1/document/internal/{record['externalRecordId']}/download"
-            else:
-                connector_url = endpoints.get("connectors").get("endpoint", DefaultEndpoints.CONNECTOR_ENDPOINT.value)
-                signed_url_route = f"{connector_url}/api/v1/{record['orgId']}/{user_id}/{record['connectorName'].lower()}/record/{record['_key']}/signedUrl"
+            if record.get("origin") != OriginTypes.UPLOAD.value:
 
                 if record.get("recordType") == "MAIL":
-                    url = f"{connector_url}/api/v1/stream/record/{record['_key']}"
-                    file_content_bytes = await self._download_from_signed_url(url,request)
                     mime_type = "text/gmail_content"
-                    # Convert bytes to string for JSON serialization
                     try:
-                        # For mail content, decode as UTF-8 text
-                        file_content = file_content_bytes.decode('utf-8', errors='replace')
+
+                        return {
+                            "orgId": record.get("orgId"),
+                            "recordId": record.get("_key"),
+                            "recordName": record.get("recordName", ""),
+                            "recordType": record.get("recordType", ""),
+                            "version": record.get("version", 1),
+                            "origin": record.get("origin", ""),
+                            "extension": extension,
+                            "mimeType": mime_type,
+                            "body": file_content,
+                            "connectorId": record.get("connectorId", ""),
+                            "createdAtTimestamp": str(record.get("createdAtTimestamp", get_epoch_timestamp_in_ms())),
+                            "updatedAtTimestamp": str(get_epoch_timestamp_in_ms()),
+                            "sourceCreatedAtTimestamp": str(record.get("sourceCreatedAtTimestamp", record.get("createdAtTimestamp", get_epoch_timestamp_in_ms())))
+                        }
                     except Exception as decode_error:
                         self.logger.warning(f"Failed to decode file content as UTF-8: {str(decode_error)}")
                         # Fallback: encode as base64 string for binary content
-                        import base64
-                        file_content = base64.b64encode(file_content_bytes).decode('utf-8')
+                        # import base64
+                        # file_content = base64.b64encode(file_content_bytes).decode('utf-8')
 
 
 
@@ -4715,7 +5274,6 @@ class BaseArangoService:
                 "recordName": record.get("recordName", ""),
                 "recordType": record.get("recordType", ""),
                 "version": record.get("version", 1),
-                "signedUrlRoute": signed_url_route,
                 "origin": record.get("origin", ""),
                 "extension": extension,
                 "mimeType": mime_type,
@@ -5101,6 +5659,55 @@ class BaseArangoService:
             )
             return None
 
+    async def get_record_by_external_revision_id(
+        self, connector_id: str, external_revision_id: str, transaction: Optional[TransactionDatabase] = None
+    ) -> Optional[Record]:
+        """
+        Get record using the external revision ID (e.g., etag for S3).
+
+        Args:
+            connector_id: Connector ID
+            external_revision_id (str): External revision ID to look up (e.g., etag)
+            transaction (Optional[TransactionDatabase]): Optional database transaction
+
+        Returns:
+            Optional[Record]: Record object if found, None otherwise
+        """
+        try:
+            self.logger.debug(
+                "🚀 Retrieving record by external revision ID %s for connector %s", external_revision_id, connector_id
+            )
+
+            query = f"""
+            FOR record IN {CollectionNames.RECORDS.value}
+                FILTER record.externalRevisionId == @external_revision_id AND record.connectorId == @connector_id
+                LIMIT 1
+                RETURN record
+            """
+
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(
+                query, bind_vars={"external_revision_id": external_revision_id, "connector_id": connector_id}
+            )
+            result = next(cursor, None)
+
+            if result:
+                self.logger.debug(
+                    "✅ Successfully retrieved record by external revision ID %s for connector %s", external_revision_id, connector_id
+                )
+                return Record.from_arango_base_record(result)
+            else:
+                self.logger.debug(
+                    "⚠️ No record found for external revision ID %s for connector %s", external_revision_id, connector_id
+                )
+                return None
+
+        except Exception as e:
+            self.logger.error(
+                "❌ Failed to retrieve record by external revision ID %s for connector %s: %s", external_revision_id, connector_id, str(e)
+            )
+            return None
+
     async def get_record_by_issue_key(
         self, connector_id: str, issue_key: str, transaction: Optional[TransactionDatabase] = None
     ) -> Optional[Record]:
@@ -5360,16 +5967,12 @@ class BaseArangoService:
         """
         record_type = record_dict.get("recordType")
 
-        # Check if this record type has a type collection
         if not type_doc or record_type not in RECORD_TYPE_COLLECTION_MAPPING:
-            # No type collection or no type doc - use base Record
             return Record.from_arango_base_record(record_dict)
 
         try:
-            # Determine which collection this type uses
             collection = RECORD_TYPE_COLLECTION_MAPPING[record_type]
 
-            # Map collections to their corresponding Record classes
             if collection == CollectionNames.FILES.value:
                 return FileRecord.from_arango_record(type_doc, record_dict)
             elif collection == CollectionNames.MAILS.value:
@@ -5380,6 +5983,10 @@ class BaseArangoService:
                 return TicketRecord.from_arango_record(type_doc, record_dict)
             elif collection == CollectionNames.COMMENTS.value:
                 return CommentRecord.from_arango_record(type_doc, record_dict)
+            elif collection == CollectionNames.LINKS.value:
+                return LinkRecord.from_arango_record(type_doc, record_dict)
+            elif collection == CollectionNames.PROJECTS.value:
+                return ProjectRecord.from_arango_record(type_doc, record_dict)
             else:
                 # Unknown collection - fallback to base Record
                 return Record.from_arango_base_record(record_dict)
@@ -5408,7 +6015,19 @@ class BaseArangoService:
             query = f"""
             FOR record IN {CollectionNames.RECORDS.value}
                 FILTER record._key == @id
-                RETURN record
+
+                LET typeDoc = (
+                    FOR edge IN {CollectionNames.IS_OF_TYPE.value}
+                        FILTER edge._from == record._id
+                        LET doc = DOCUMENT(edge._to)
+                        FILTER doc != null
+                        RETURN doc
+                )[0]
+
+                RETURN {{
+                    record: record,
+                    typeDoc: typeDoc
+                }}
             """
 
             db = transaction if transaction else self.db
@@ -5421,7 +6040,10 @@ class BaseArangoService:
                 self.logger.info(
                     "✅ Successfully retrieved internal key for id %s", id
                 )
-                return Record.from_arango_base_record(result)
+                return self._create_typed_record_from_arango(
+                    result["record"],
+                    result.get("typeDoc")
+                )
             else:
                 self.logger.warning(
                     "⚠️ No internal key found for id %s", id
@@ -6272,6 +6894,45 @@ class BaseArangoService:
             return count
         except Exception as e:
             self.logger.error("❌ Failed to delete edges from source: %s in collection: %s: %s", from_key, collection, str(e))
+            return 0
+
+    async def delete_parent_child_edges_to(self, to_key: str, transaction: Optional[TransactionDatabase] = None) -> int:
+        """
+        Delete PARENT_CHILD edges pointing to a specific target record.
+
+        Args:
+            to_key: The target node key (e.g., "records/12345")
+            transaction: Optional transaction database
+
+        Returns:
+            int: Number of edges deleted
+        """
+        try:
+            self.logger.debug("🚀 Deleting PARENT_CHILD edges to target: %s", to_key)
+            query = f"""
+            FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
+                FILTER edge._to == @to_key
+                FILTER edge.relationshipType == @relationship_type
+                REMOVE edge IN {CollectionNames.RECORD_RELATIONS.value}
+                RETURN OLD
+            """
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(
+                query,
+                bind_vars={
+                    "to_key": to_key,
+                    "relationship_type": RecordRelations.PARENT_CHILD.value,
+                },
+            )
+            deleted_edges = list(cursor)
+            deleted_count = len(deleted_edges)
+            if deleted_count > 0:
+                self.logger.debug("✅ Deleted %d PARENT_CHILD edge(s) to target: %s", deleted_count, to_key)
+            return deleted_count
+        except Exception as e:
+            self.logger.error("❌ Failed to delete PARENT_CHILD edges to target %s: %s", to_key, str(e))
+            if transaction:
+                raise
             return 0
 
     async def delete_edges_to(self, to_key: str, collection: str, transaction: Optional[TransactionDatabase] = None) -> int:
@@ -7749,11 +8410,22 @@ class BaseArangoService:
                 self.logger.info(
                     "➕ Entity does not exist, saving to people collection"
                 )
+                timestamp = get_epoch_timestamp_in_ms()
                 self.db.collection(CollectionNames.PEOPLE.value).insert(
-                    {"_key": entity_id, "email": email}
+                    {
+                        "_key": entity_id,
+                        "email": email,
+                        "createdAtTimestamp": timestamp,
+                        "updatedAtTimestamp": timestamp,
+                    }
                 )
                 self.logger.info("✅ Entity %s saved to people collection", entity_id)
-                return {"_key": entity_id, "email": email}
+                return {
+                    "_key": entity_id,
+                    "email": email,
+                    "createdAtTimestamp": timestamp,
+                    "updatedAtTimestamp": timestamp,
+                }
             else:
                 self.logger.info(
                     "⏩ Entity %s already exists in people collection", entity_id
@@ -8162,8 +8834,7 @@ class BaseArangoService:
             connector_id (Optional[str]): Connector ID (optional)
 
         Returns:
-            Optional[str]: Current sync state of the drive ('NOT_STARTED', 'IN_PROGRESS', 'PAUSED', 'COMPLETED', 'FAILED')
-                          or None if drive not found
+            Optional[str]: Current sync state of the drive ('NOT_STARTED', 'IN_PROGRESS', 'PAUSED', 'COMPLETED', 'FAILED') or None if drive not found
         """
         try:
             self.logger.info("🔍 Getting sync state for drive %s", drive_id)
@@ -8236,7 +8907,7 @@ class BaseArangoService:
             self.logger.error("❌ Error checking edge existence: %s", str(e))
             return False
 
-    async def _create_new_record_event_payload(self, record_doc: Dict, file_doc: Dict, storage_url: str) -> Dict:
+    async def _create_new_record_event_payload(self, record_doc: Dict, file_doc: Dict) -> Dict:
         """
         Creates  NewRecordEvent to Kafka,
         """
@@ -8244,9 +8915,7 @@ class BaseArangoService:
             record_id = record_doc["_key"]
             self.logger.info(f"🚀 Preparing NewRecordEvent for record_id: {record_id}")
 
-            signed_url_route = (
-                f"{storage_url}/api/v1/document/internal/{record_doc['externalRecordId']}/download"
-            )
+
             timestamp = get_epoch_timestamp_in_ms()
 
             # Construct the payload matching the Node.js NewRecordEvent interface
@@ -8256,7 +8925,6 @@ class BaseArangoService:
                 "recordName": record_doc.get("recordName"),
                 "recordType": record_doc.get("recordType"),
                 "version": record_doc.get("version", 1),
-                "signedUrlRoute": signed_url_route,
                 "origin": record_doc.get("origin"),
                 "extension": file_doc.get("extension", ""),
                 "mimeType": file_doc.get("mimeType", ""),
@@ -8288,16 +8956,6 @@ class BaseArangoService:
 
             self.logger.info(f"🚀 Publishing creation events for {len(created_files_data)} new records.")
 
-            # Get storage endpoint
-            try:
-                endpoints = await self.config_service.get_config(
-                    config_node_constants.ENDPOINTS.value
-                )
-                self.logger.info(f"This the the endpoint {endpoints}")
-                storage_url = endpoints.get("storage").get("endpoint", DefaultEndpoints.STORAGE_ENDPOINT.value)
-            except Exception as config_error:
-                self.logger.error(f"❌ Failed to get storage config: {str(config_error)}")
-                storage_url = "http://localhost:3000"  # Fallback
 
             # Create events with enhanced error handling
             successful_events = 0
@@ -8311,7 +8969,7 @@ class BaseArangoService:
                     if record_doc and file_doc:
                         # Create payload with error handling
                         create_payload = await self._create_new_record_event_payload(
-                            record_doc, file_doc, storage_url
+                            record_doc, file_doc
                         )
 
                         if create_payload:  # Only publish if payload creation succeeded
@@ -8337,17 +8995,11 @@ class BaseArangoService:
     async def _create_update_record_event_payload(
         self,
         record: Dict,
-        file_record: Optional[Dict] = None
+        file_record: Optional[Dict] = None,
+        content_changed: bool = True
     ) -> Dict:
         """Create update record event payload matching Node.js format"""
         try:
-            endpoints = await self.config_service.get_config(
-                    config_node_constants.ENDPOINTS.value
-                )
-            storage_url = endpoints.get("storage").get("endpoint", DefaultEndpoints.STORAGE_ENDPOINT.value)
-
-            signed_url_route = f"{storage_url}/api/v1/document/internal/{record['externalRecordId']}/download"
-
             # Get extension and mimeType from file record
             extension = ""
             mime_type = ""
@@ -8361,11 +9013,11 @@ class BaseArangoService:
                 "version": record.get("version", 1),
                 "extension": extension,
                 "mimeType": mime_type,
-                "signedUrlRoute": signed_url_route,
                 "updatedAtTimestamp": str(record.get("updatedAtTimestamp", get_epoch_timestamp_in_ms())),
                 "sourceLastModifiedTimestamp": str(record.get("sourceLastModifiedTimestamp", record.get("updatedAtTimestamp", get_epoch_timestamp_in_ms()))),
                 "virtualRecordId": record.get("virtualRecordId"),
                 "summaryDocumentId": record.get("summaryDocumentId"),
+                "contentChanged": content_changed,
             }
         except Exception as e:
             self.logger.error(f"❌ Failed to create update record event payload: {str(e)}")
@@ -8417,6 +9069,37 @@ class BaseArangoService:
 
         except Exception as e:
             self.logger.error(f"❌ Failed to publish {event_type} event: {str(e)}")
+
+    async def _reset_indexing_status_to_queued(self, record_id: str) -> None:
+        """
+        Reset indexing status to QUEUED before sending update/reindex events.
+        Only resets if status is not already QUEUED or EMPTY.
+        """
+        try:
+            # Get the record
+            record = await self.get_document(record_id, CollectionNames.RECORDS.value)
+            if not record:
+                self.logger.warning(f"Record {record_id} not found for status reset")
+                return
+
+            current_status = record.get("indexingStatus")
+
+            # Only reset if not already QUEUED or EMPTY
+            if current_status in [ProgressStatus.QUEUED.value, ProgressStatus.EMPTY.value]:
+                self.logger.debug(f"Record {record_id} already has status {current_status}, skipping reset")
+                return
+
+            # Update indexing status to QUEUED
+            doc = {
+                "_key": record_id,
+                "indexingStatus": ProgressStatus.QUEUED.value,
+            }
+
+            await self.batch_upsert_nodes([doc], CollectionNames.RECORDS.value)
+            self.logger.debug(f"✅ Reset record {record_id} status from {current_status} to QUEUED")
+        except Exception as e:
+            # Log but don't fail the main operation if status update fails
+            self.logger.error(f"❌ Failed to reset record {record_id} to QUEUED: {str(e)}")
 
     def _validation_error(self, code: int, reason: str) -> Dict:
         """Helper to create validation error response"""
@@ -8579,13 +9262,9 @@ class BaseArangoService:
         folder_data = {
             "_key": folder_id,
             "orgId": org_id,
-            "recordGroupId": kb_id,
             "name": folder_name,
             "isFile": False,
             "extension": None,
-            "mimeType": "application/vnd.folder",
-            "sizeInBytes": 0,
-            "webUrl": f"/kb/{kb_id}/folder/{folder_id}"
         }
 
         # Create folder
@@ -8821,9 +9500,29 @@ class BaseArangoService:
             self.logger.warning("⚠️ No valid files to create after conflict filtering")
             return []
 
-        # Step 2: Extract records and file records from valid files only
-        records = [f["record"] for f in valid_files]
+        # Step 2: Extract and enrich records and file records from valid files only
+        records = []
         file_records = [f["fileRecord"] for f in valid_files]
+
+        for file_data in valid_files:
+            record = file_data["record"].copy()  # Create a copy to avoid modifying original
+
+            # Enrich record with missing KB-specific fields
+            # Determine externalParentId: null for immediate children of KB, parent_folder_id for nested
+            external_parent_id = parent_folder_id if parent_folder_id else None
+
+            # Add missing fields (using setdefault to only add if not already present)
+            record.setdefault("externalGroupId", kb_id)
+            record.setdefault("externalParentId", external_parent_id)
+            record.setdefault("externalRootGroupId", kb_id)
+            record.setdefault("connectorName", Connectors.KNOWLEDGE_BASE.value)
+            record.setdefault("lastSyncTimestamp", timestamp)
+            record.setdefault("isVLMOcrProcessed", False)
+            record.setdefault("extractionStatus", "NOT_STARTED")  # Files need extraction, unlike folders
+            record.setdefault("isLatestVersion", True)
+            record.setdefault("isDirty", False)
+
+            records.append(record)
 
         # Step 3: Create records and file records
         await self.batch_upsert_nodes(records, CollectionNames.RECORDS.value, transaction)
@@ -8841,15 +9540,6 @@ class BaseArangoService:
             if parent_folder_id:
                 edges_to_create.append({
                     "_from": f"records/{parent_folder_id}",
-                    "_to": f"records/{record_id}",
-                    "relationshipType": "PARENT_CHILD",
-                    "createdAtTimestamp": timestamp,
-                    "updatedAtTimestamp": timestamp,
-                })
-            else:
-                # Record -> KB relationship (KB root)
-                edges_to_create.append({
-                    "_from": f"recordGroups/{kb_id}",
                     "_to": f"records/{record_id}",
                     "relationshipType": "PARENT_CHILD",
                     "createdAtTimestamp": timestamp,
@@ -8873,10 +9563,22 @@ class BaseArangoService:
                 "updatedAtTimestamp": timestamp,
             })
 
+            # Record -> KB inheritPermission edge
+            # KB records inherit permissions from KB by default
+            edges_to_create.append({
+                "_from": f"records/{record_id}",
+                "_to": f"recordGroups/{kb_id}",
+                "createdAtTimestamp": timestamp,
+                "updatedAtTimestamp": timestamp,
+            })
+
         # Step 5: Batch create edges by type
         parent_child_edges = [e for e in edges_to_create if e.get("relationshipType") == "PARENT_CHILD"]
         is_of_type_edges = [e for e in edges_to_create if e["_to"].startswith("files/") and not e.get("relationshipType")]
-        belongs_to_kb_edges = [e for e in edges_to_create if e["_to"].startswith("recordGroups/")]
+        # belongsTo edges have entityType set (e.g., Connectors.KNOWLEDGE_BASE.value)
+        belongs_to_kb_edges = [e for e in edges_to_create if e["_to"].startswith("recordGroups/") and e.get("entityType") == Connectors.KNOWLEDGE_BASE.value]
+        # inheritPermission edges point to recordGroups but don't have entityType
+        inherit_permission_edges = [e for e in edges_to_create if e["_to"].startswith("recordGroups/") and not e.get("entityType")]
 
         if parent_child_edges:
             await self.batch_create_edges(parent_child_edges, CollectionNames.RECORD_RELATIONS.value, transaction)
@@ -8884,6 +9586,8 @@ class BaseArangoService:
             await self.batch_create_edges(is_of_type_edges, CollectionNames.IS_OF_TYPE.value, transaction)
         if belongs_to_kb_edges:
             await self.batch_create_edges(belongs_to_kb_edges, CollectionNames.BELONGS_TO.value, transaction)
+        if inherit_permission_edges:
+            await self.batch_create_edges(inherit_permission_edges, CollectionNames.INHERIT_PERMISSIONS.value, transaction)
 
         # Step 6: Store skipped files for reporting (optional)
         if hasattr(self, '_current_upload_skipped_files'):
@@ -8961,6 +9665,7 @@ class BaseArangoService:
                     CollectionNames.RECORD_RELATIONS.value,
                     CollectionNames.IS_OF_TYPE.value,
                     CollectionNames.BELONGS_TO.value,
+                    CollectionNames.INHERIT_PERMISSIONS.value,
                 ]
             )
 
@@ -9071,15 +9776,10 @@ class BaseArangoService:
             parent_path = "/"  # Default for KB root
 
             if parent_folder_id:
-                # Validate folder exists and belongs to KB
-                folder_valid = await self.validate_folder_exists_in_kb(kb_id, parent_folder_id)
-                if not folder_valid:
-                    return self._validation_error(404, f"Folder {parent_folder_id} not found in KB {kb_id}")
-
-                # Get parent folder details
-                parent_folder = await self.get_document(parent_folder_id, CollectionNames.FILES.value)
+                # Get and validate folder in a single query (optimized)
+                parent_folder = await self.get_and_validate_folder_in_kb(kb_id, parent_folder_id)
                 if not parent_folder:
-                    return self._validation_error(404, f"Parent folder {parent_folder_id} not found")
+                    return self._validation_error(404, f"Folder {parent_folder_id} not found in KB {kb_id}")
 
                 parent_path = parent_folder.get("path", "/")
 
@@ -9100,6 +9800,7 @@ class BaseArangoService:
         self,
         kb_data:Dict,
         permission_edge:Dict,
+        belongs_to_edge:Dict,
         transaction:Optional[TransactionDatabase]=None
     )-> Dict:
         """Create knowledge base with permissions"""
@@ -9116,6 +9817,11 @@ class BaseArangoService:
             await self.batch_create_edges(
                 [permission_edge],
                 CollectionNames.PERMISSION.value,transaction=transaction
+            )
+            # belongs to edge between kb and app
+            await self.batch_create_edges(
+                [belongs_to_edge],
+                CollectionNames.BELONGS_TO.value,transaction=transaction
             )
 
             self.logger.info(f"✅ Knowledge base created successfully: {kb_data['_key']}")
@@ -9524,6 +10230,7 @@ class BaseArangoService:
                 RETURN {{
                     id: kb._key,
                     name: kb.groupName,
+                    connectorId: kb.connectorId,
                     createdAtTimestamp: kb.createdAtTimestamp,
                     updatedAtTimestamp: kb.updatedAtTimestamp,
                     createdBy: kb.createdBy,
@@ -9793,16 +10500,43 @@ class BaseArangoService:
             raise
 
     async def get_folder_record_by_id(self, folder_id: str, transaction: Optional[TransactionDatabase] = None) -> Optional[Dict]:
+        """
+        Get folder by ID. Folders are represented by RECORDS documents with associated FILES documents.
+        Returns combined folder data from both collections.
+        """
         try:
             db = transaction if transaction else self.db
             query = """
-            FOR file IN @@files
-                FILTER file._key == @folder_id
-                RETURN file
+            // Get folder RECORDS document
+            LET folder_record = DOCUMENT(@@records_collection, @folder_id)
+            FILTER folder_record != null
+
+            // Get associated FILES document via IS_OF_TYPE edge
+            LET folder_file = FIRST(
+                FOR isEdge IN @@is_of_type
+                    FILTER isEdge._from == folder_record._id
+                    LET f = DOCUMENT(isEdge._to)
+                    FILTER f != null AND f.isFile == false
+                    RETURN f
+            )
+
+            FILTER folder_file != null
+
+            // Return combined folder data
+            RETURN MERGE(
+                folder_record,
+                {
+                    name: folder_file.name,
+                    isFile: folder_file.isFile,
+                    extension: folder_file.extension,
+                    recordGroupId: folder_record.connectorId
+                }
+            )
             """
             cursor = db.aql.execute(query, bind_vars={
                 "folder_id": folder_id,
-                "@files": CollectionNames.FILES.value,
+                "@records_collection": CollectionNames.RECORDS.value,
+                "@is_of_type": CollectionNames.IS_OF_TYPE.value,
             })
             return next(cursor, None)
         except Exception as e:
@@ -9814,10 +10548,18 @@ class BaseArangoService:
         kb_id: str,
         folder_name: str,
         parent_folder_id: Optional[str] = None,
+        exclude_folder_id: Optional[str] = None,
         transaction: Optional[TransactionDatabase] = None
     ) -> Optional[Dict]:
         """
         Find a folder by name within a specific parent (KB root or folder)
+
+        Args:
+            kb_id: Knowledge base ID
+            folder_name: Name of the folder to find
+            parent_folder_id: Parent folder ID (None for KB root)
+            exclude_folder_id: Optional folder ID to exclude from search (useful for rename operations)
+            transaction: Optional transaction
         """
         try:
             db = transaction if transaction else self.db
@@ -9830,49 +10572,97 @@ class BaseArangoService:
             # For KB root, use recordGroups/{kb_id}
             parent_from = f"records/{parent_folder_id}" if parent_folder_id else f"recordGroups/{kb_id}"
 
-            # Single query for both cases (parent folder or KB root)
-            query = """
-            FOR edge IN @@record_relations
-                FILTER edge._from == @parent_from
-                FILTER edge.relationshipType == "PARENT_CHILD"
-                LET folder_record = DOCUMENT(edge._to)
-                FILTER folder_record != null
-                FILTER folder_record.connectorId == @kb_id
-                // Verify it's a folder by checking associated FILES document via IS_OF_TYPE edge
-                LET folder_file = FIRST(
-                    FOR isEdge IN @@is_of_type
-                        FILTER isEdge._from == folder_record._id
-                        LET f = DOCUMENT(isEdge._to)
-                        FILTER f != null AND f.isFile == false
-                        RETURN f
-                )
-                FILTER folder_file != null
-                LET folder_name_l = LOWER(folder_record.recordName)
-                FILTER folder_name_l IN @name_variants
-                RETURN {
-                    _key: folder_record._key,
-                    name: folder_record.recordName,
-                    recordGroupId: folder_record.connectorId,
-                    orgId: folder_record.orgId
-                }
-            """
+            if parent_folder_id is None:
+                query = """
+                FOR edge IN @@belongs_to
+                    FILTER edge._to == CONCAT('recordGroups/', @kb_id)
+                    FILTER edge.entityType == @entity_type
+                    LET folder_record = DOCUMENT(edge._from)
+                    FILTER folder_record != null
+                    FILTER folder_record.isDeleted != true
+                    // Check if this folder is a child of any other folder
+                    LET isChild = LENGTH(
+                        FOR relEdge IN @@record_relations
+                            FILTER relEdge._to == folder_record._id
+                            FILTER relEdge.relationshipType == "PARENT_CHILD"
+                            RETURN 1
+                    ) > 0
+                    // Only include if NOT a child (immediate child)
+                    FILTER isChild == false
+                    // Verify it's a folder by checking associated FILES document via IS_OF_TYPE edge
+                    LET folder_file = FIRST(
+                        FOR isEdge IN @@is_of_type
+                            FILTER isEdge._from == folder_record._id
+                            LET f = DOCUMENT(isEdge._to)
+                            FILTER f != null AND f.isFile == false
+                            RETURN f
+                    )
+                    FILTER folder_file != null
+                    LET folder_name_l = LOWER(folder_record.recordName)
+                    FILTER folder_name_l IN @name_variants
+                    RETURN {
+                        _key: folder_record._key,
+                        name: folder_record.recordName,
+                        recordGroupId: folder_record.connectorId,
+                        orgId: folder_record.orgId
+                    }
+                """
+                cursor = db.aql.execute(query, bind_vars={
+                    "name_variants": name_variants,
+                    "kb_id": kb_id,
+                    "@belongs_to": CollectionNames.BELONGS_TO.value,
+                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@is_of_type": CollectionNames.IS_OF_TYPE.value,
+                    "entity_type": Connectors.KNOWLEDGE_BASE.value,
+                })
 
-            cursor = db.aql.execute(query, bind_vars={
-                "parent_from": parent_from,
-                "name_variants": name_variants,
-                "kb_id": kb_id,
-                "@record_relations": CollectionNames.RECORD_RELATIONS.value,
-                "@is_of_type": CollectionNames.IS_OF_TYPE.value,
-            })
+                result = next(cursor, None)
+                if result:
+                    self.logger.debug(f"✅ Found folder '{folder_name}' in parent")
+                else:
+                    self.logger.debug(f"📝 Folder '{folder_name}' not found in parent (will be created if needed)")
+                return result
 
-            result = next(cursor, None)
-
-            if result:
-                self.logger.debug(f"✅ Found folder '{folder_name}' in parent")
             else:
-                self.logger.debug(f"❌ Folder '{folder_name}' not found in parent")
+                query = """
+                FOR edge IN @@record_relations
+                    FILTER edge._from == @parent_from
+                    FILTER edge.relationshipType == "PARENT_CHILD"
+                    LET folder_record = DOCUMENT(edge._to)
+                    FILTER folder_record != null
+                    // Verify it's a folder by checking associated FILES document via IS_OF_TYPE edge
+                    LET folder_file = FIRST(
+                        FOR isEdge IN @@is_of_type
+                            FILTER isEdge._from == folder_record._id
+                            LET f = DOCUMENT(isEdge._to)
+                            FILTER f != null AND f.isFile == false
+                            RETURN f
+                    )
+                    FILTER folder_file != null
+                    LET folder_name_l = LOWER(folder_record.recordName)
+                    FILTER folder_name_l IN @name_variants
+                    RETURN {
+                        _key: folder_record._key,
+                        name: folder_record.recordName,
+                        recordGroupId: folder_record.connectorId,
+                        orgId: folder_record.orgId
+                    }
+                """
 
-            return result
+                cursor = db.aql.execute(query, bind_vars={
+                    "parent_from": parent_from,
+                    "name_variants": name_variants,
+                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@is_of_type": CollectionNames.IS_OF_TYPE.value,
+                })
+
+                result = next(cursor, None)
+
+                if result:
+                    self.logger.debug(f"✅ Found folder '{folder_name}' in parent")
+                else:
+                    self.logger.debug(f"📝 Folder '{folder_name}' not found in parent (will be created if needed)")
+                return result
 
         except Exception as e:
             self.logger.error(f"❌ Failed to find folder by name: {str(e)}")
@@ -9953,6 +10743,7 @@ class BaseArangoService:
                         CollectionNames.IS_OF_TYPE.value,
                         CollectionNames.BELONGS_TO.value,
                         CollectionNames.RECORD_RELATIONS.value,
+                        CollectionNames.INHERIT_PERMISSIONS.value,
                     ]
                 )
 
@@ -9962,13 +10753,9 @@ class BaseArangoService:
             try:
                 # Step 1: Validate parent folder exists (if nested)
                 if parent_folder_id:
-                    parent_folder = await self.get_folder_record_by_id(parent_folder_id, transaction)
+                    parent_folder = await self.get_and_validate_folder_in_kb(kb_id, parent_folder_id, transaction)
                     if not parent_folder:
-                        raise ValueError(f"Parent folder {parent_folder_id} not found")
-                    if parent_folder.get("isFile") is not False:
-                        raise ValueError(f"Parent {parent_folder_id} is not a folder")
-                    if parent_folder.get("recordGroupId") != kb_id:
-                        raise ValueError(f"Parent folder does not belong to KB {kb_id}")
+                        raise ValueError(f"Parent folder {parent_folder_id} not found in KB {kb_id}")
 
                     self.logger.info(f"✅ Validated parent folder: {parent_folder.get('name')}")
 
@@ -9992,15 +10779,17 @@ class BaseArangoService:
                     }
 
                 # Step 3: Create RECORDS document for folder
-                # Determine parent: for root folders use KB ID, for nested folders use parent folder ID
-                external_parent_id = parent_folder_id if parent_folder_id else kb_id
-
+                # Determine parent: for immediate children of record group, externalParentId should be null
+                # For nested folders (under another folder), use parent folder ID
+                # Note: externalParentId is used to distinguish immediate children (null) from nested children (parent folder ID)
+                external_parent_id = parent_folder_id if parent_folder_id else None
+                kb_connector_id = f"knowledgeBase_{org_id}"
                 record_data = {
                     "_key": folder_id,
                     "orgId": org_id,
                     "recordName": folder_name,
                     "externalRecordId": f"kb_folder_{folder_id}",
-                    "connectorId": kb_id,  # Always KB ID
+                    "connectorId": kb_connector_id,  # Always KB ID
                     "externalGroupId": kb_id,  # Always KB ID (the knowledge base)
                     "externalParentId": external_parent_id,  # KB ID for root, parent folder ID for nested
                     "externalRootGroupId": kb_id,  # Always KB ID (the root knowledge base)
@@ -10022,6 +10811,8 @@ class BaseArangoService:
                     "extractionStatus": "COMPLETED",
                     "isLatestVersion": True,
                     "isDirty": False,
+                    # Note: inheritPermissions is not stored on the record document (not in schema)
+                    # but we default to True for KB folders when creating inheritPermission edges
                 }
 
                 self.logger.debug(
@@ -10033,13 +10824,9 @@ class BaseArangoService:
                 folder_data = {
                     "_key": folder_id,
                     "orgId": org_id,
-                    "recordGroupId": kb_id,
                     "name": folder_name,
                     "isFile": False,
                     "extension": None,
-                    "mimeType": "application/vnd.folder",
-                    "sizeInBytes": 0,
-                    "webUrl": f"/kb/{kb_id}/folder/{folder_id}"
                 }
 
                 # Step 5: Insert both documents
@@ -10068,6 +10855,16 @@ class BaseArangoService:
                 }
                 edges_to_create.append((kb_relationship_edge, CollectionNames.BELONGS_TO.value))
 
+                # Create inheritPermission edge (RECORDS -> KB)
+                # KB folders inherit permissions from KB by default
+                inherit_permission_edge = {
+                    "_from": f"{CollectionNames.RECORDS.value}/{folder_id}",
+                    "_to": f"{CollectionNames.RECORD_GROUPS.value}/{kb_id}",
+                    "createdAtTimestamp": timestamp,
+                    "updatedAtTimestamp": timestamp,
+                }
+                edges_to_create.append((inherit_permission_edge, CollectionNames.INHERIT_PERMISSIONS.value))
+
                 # Create parent-child relationship (RECORDS -> RECORDS)
                 if parent_folder_id:
                     # Nested folder: Parent Record -> Child Record
@@ -10079,16 +10876,6 @@ class BaseArangoService:
                         "updatedAtTimestamp": timestamp,
                     }
                     edges_to_create.append((parent_child_edge, CollectionNames.RECORD_RELATIONS.value))
-                else:
-                    # Root folder: KB -> Folder Record
-                    kb_parent_edge = {
-                        "_from": f"{CollectionNames.RECORD_GROUPS.value}/{kb_id}",
-                        "_to": f"{CollectionNames.RECORDS.value}/{folder_id}",
-                        "relationshipType": "PARENT_CHILD",
-                        "createdAtTimestamp": timestamp,
-                        "updatedAtTimestamp": timestamp,
-                    }
-                    edges_to_create.append((kb_parent_edge, CollectionNames.RECORD_RELATIONS.value))
 
                 # Step 8: Create all edges
                 for edge_data, collection in edges_to_create:
@@ -10102,7 +10889,7 @@ class BaseArangoService:
                 return {
                     "id": folder_id,
                     "name": folder_name,
-                    "webUrl": folder_data["webUrl"],
+                    "webUrl": record_data["webUrl"],
                     "exists": False,
                     "success": True
                 }
@@ -10147,6 +10934,13 @@ class BaseArangoService:
 
             result = next(cursor, None)
 
+            updates_for_record = {
+                "_key": folder_id,
+                "recordName": updates.get("name"),
+                "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+            }
+            await self.batch_upsert_nodes([updates_for_record], CollectionNames.RECORDS.value, transaction)
+
             if result:
                 self.logger.info("✅ Folder updated successfully")
                 return True
@@ -10175,7 +10969,6 @@ class BaseArangoService:
             // Folders are now represented by RECORDS documents
             LET folder_record = DOCUMENT(@@records_collection, @folder_id)
             FILTER folder_record != null
-            FILTER folder_record.connectorId == @kb_id
             // Verify it's a folder by checking associated FILES document via IS_OF_TYPE edge
             LET folder_file = FIRST(
                 FOR isEdge IN @@is_of_type
@@ -10197,7 +10990,6 @@ class BaseArangoService:
 
             cursor = db.aql.execute(query, bind_vars={
                 "folder_id": folder_id,
-                "kb_id": kb_id,
                 "folder_from": f"records/{folder_id}",
                 "kb_to": f"recordGroups/{kb_id}",
                 "entity_type": Connectors.KNOWLEDGE_BASE.value,
@@ -10216,6 +11008,83 @@ class BaseArangoService:
         except Exception as e:
             self.logger.error(f"❌ Failed to validate folder in KB: {str(e)}")
             return False
+
+    async def get_and_validate_folder_in_kb(
+        self,
+        kb_id: str,
+        folder_id: str,
+        transaction: Optional[TransactionDatabase] = None
+    ) -> Optional[Dict]:
+        """
+        Get folder by ID and validate it belongs to the specified KB in a single query.
+        This combines validate_folder_in_kb() and get_folder_record_by_id() for better performance.
+
+        Returns:
+            Dict with folder data if valid and belongs to KB, None otherwise
+        """
+        try:
+            db = transaction if transaction else self.db
+
+            query = """
+            // Get folder RECORDS document
+            LET folder_record = DOCUMENT(@@records_collection, @folder_id)
+            FILTER folder_record != null
+
+            // Get associated FILES document via IS_OF_TYPE edge
+            LET folder_file = FIRST(
+                FOR isEdge IN @@is_of_type
+                    FILTER isEdge._from == folder_record._id
+                    LET f = DOCUMENT(isEdge._to)
+                    FILTER f != null AND f.isFile == false
+                    RETURN f
+            )
+
+            FILTER folder_file != null
+
+            // Verify BELONGS_TO relationship
+            LET relationship = FIRST(
+                FOR edge IN @@belongs_to_collection
+                    FILTER edge._from == @folder_from
+                    FILTER edge._to == @kb_to
+                    FILTER edge.entityType == @entity_type
+                    RETURN 1
+            )
+
+            // Return folder data only if all validations pass
+            FILTER relationship != null
+
+            // Return combined folder data
+            RETURN MERGE(
+                folder_record,
+                {
+                    name: folder_file.name,
+                    isFile: folder_file.isFile,
+                    extension: folder_file.extension,
+                    recordGroupId: folder_record.connectorId
+                }
+            )
+            """
+
+            cursor = db.aql.execute(query, bind_vars={
+                "folder_id": folder_id,
+                "folder_from": f"records/{folder_id}",
+                "kb_to": f"recordGroups/{kb_id}",
+                "entity_type": Connectors.KNOWLEDGE_BASE.value,
+                "@records_collection": CollectionNames.RECORDS.value,
+                "@belongs_to_collection": CollectionNames.BELONGS_TO.value,
+                "@is_of_type": CollectionNames.IS_OF_TYPE.value,
+            })
+
+            result = next(cursor, None)
+
+            if not result:
+                self.logger.warning(f"⚠️ Folder {folder_id} validation failed for KB {kb_id}")
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to get and validate folder in KB: {str(e)}")
+            return None
 
     async def validate_record_in_folder(self, folder_id: str, record_id: str, transaction: Optional[TransactionDatabase] = None) -> bool:
         """Check if a record is a child of a folder via PARENT_CHILD edge.
@@ -10446,7 +11315,8 @@ class BaseArangoService:
                 # Step 5: Prepare update data (no redundant validation needed)
                 timestamp = get_epoch_timestamp_in_ms()
                 # Check SHA256 to determine if version should increment
-                increment_version = True
+                # Only increment version if file is being uploaded with new content
+                increment_version = False  # Default to False, only True if file content changes
                 if file_metadata and current_file_record:
                     new_sha256 = file_metadata.get("sha256Hash")
                     current_sha256 = current_file_record.get("sha256Hash")
@@ -10454,6 +11324,10 @@ class BaseArangoService:
                     if new_sha256 and current_sha256 and new_sha256 == current_sha256:
                         increment_version = False
                         self.logger.info(f"File content unchanged (SHA256 match). Keeping version {current_record.get('version', 0)}")
+                    else:
+                        # File content changed - increment version
+                        increment_version = True
+                        self.logger.info(f"File content changed. Incrementing version to {current_record.get('version', 0) + 1}")
 
                 version = (current_record.get("version", 0)) + (1 if increment_version else 0)
                 processed_updates = {
@@ -10563,8 +11437,10 @@ class BaseArangoService:
 
                 # Step 9: Publish update event (after successful commit)
                 try:
+                    # Only trigger reindex if file content changed (not for name-only updates)
+                    content_changed = increment_version and file_metadata is not None
                     update_payload = await self._create_update_record_event_payload(
-                        updated_record, updated_file
+                        updated_record, updated_file, content_changed=content_changed
                     )
                     if update_payload:
                         await self._publish_record_event("updateRecord", update_payload)
@@ -11219,7 +12095,7 @@ class BaseArangoService:
             # Build conditions for targets
             target_conditions = []
             if user_ids:
-                target_conditions.append("(perm._from IN @user_froms AND perm.type == 'USER' AND perm.role != 'OWNER')")
+                target_conditions.append("(perm._from IN @user_froms AND perm.type == 'USER')")
                 bind_vars["user_froms"] = [f"users/{user_id}" for user_id in user_ids]
 
             # Teams don't have roles - they just have access or not
@@ -12500,29 +13376,49 @@ class BaseArangoService:
             main_query = f"""
             LET kb = DOCUMENT("recordGroups", @kb_id)
             FILTER kb != null
-            // Get ALL folders with level traversal (sorted by name)
-            // Folders are identified by FILES document's isFile == false, not by recordType
+            // Get immediate children of KB using belongs_to edges
+            // A record is an immediate child if:
+            // 1. It has a belongs_to edge TO KB record group (record belongs to KB)
+            // 2. It is NOT a parent of any other record (no outgoing record_relations edge)
+            LET allImmediateChildren = (
+                FOR belongsEdge IN @@belongs_to
+                    FILTER belongsEdge._to == kb._id
+                    FILTER belongsEdge.entityType == @kb_connector_type
+                    LET record = DOCUMENT(belongsEdge._from)
+                    FILTER IS_SAME_COLLECTION("records", record._id)
+                    FILTER record != null
+                    FILTER record.isDeleted != true
+                    // Check if this record is a child of any other record
+                    LET isChild = LENGTH(
+                        FOR relEdge IN @@record_relations
+                            FILTER relEdge._to == record._id
+                            FILTER relEdge.relationshipType == "PARENT_CHILD"
+                            RETURN 1
+                    ) > 0
+                    // Only include if NOT a parent (immediate child)
+                    FILTER isChild == false
+                    RETURN record
+            )
+            // Separate folders and records from immediate children
+            // Folders are identified by FILES document's isFile == false
             LET allFolders = (
-                FOR v, e, p IN 1..@level OUTBOUND kb._id @@record_relations
-                    FILTER e.relationshipType == "PARENT_CHILD"
-                    LET folder_record = v
+                FOR record IN allImmediateChildren
                     // Get associated FILES document via IS_OF_TYPE edge
                     // Check if it's a folder based on FILES document's isFile property
                     LET folder_file = FIRST(
                         FOR isEdge IN @@is_of_type
-                            FILTER isEdge._from == folder_record._id
+                            FILTER isEdge._from == record._id
                             LET f = DOCUMENT(isEdge._to)
                             FILTER f != null AND f.isFile == false
                             RETURN f
                     )
                     // Only include if it's a folder (isFile == false)
                     FILTER folder_file != null
-                    LET current_level = LENGTH(p.edges)
                     {folder_filter}
-                    // Get counts for this folder (check child RECORDS via FILES document's isFile property)
+                    // Get counts for this folder (check child RECORDS via record_relations)
                     LET direct_subfolders = LENGTH(
                         FOR relEdge IN @@record_relations
-                            FILTER relEdge._from == folder_record._id
+                            FILTER relEdge._from == record._id
                             FILTER relEdge.relationshipType == "PARENT_CHILD"
                             LET child_record = DOCUMENT(relEdge._to)
                             FILTER child_record != null
@@ -12539,14 +13435,14 @@ class BaseArangoService:
                     )
                     LET direct_records = LENGTH(
                         FOR relEdge IN @@record_relations
-                            FILTER relEdge._from == folder_record._id
+                            FILTER relEdge._from == record._id
                             FILTER relEdge.relationshipType == "PARENT_CHILD"
-                            LET record = DOCUMENT(relEdge._to)
-                            FILTER record != null AND record.isDeleted != true
+                            LET child_record = DOCUMENT(relEdge._to)
+                            FILTER child_record != null AND child_record.isDeleted != true
                             // Exclude folders by checking FILES document's isFile property
                             LET child_file = FIRST(
                                 FOR isEdge IN @@is_of_type
-                                    FILTER isEdge._from == record._id
+                                    FILTER isEdge._from == child_record._id
                                     LET f = DOCUMENT(isEdge._to)
                                     FILTER f != null AND f.isFile == false
                                     RETURN 1
@@ -12554,18 +13450,18 @@ class BaseArangoService:
                             FILTER child_file == null
                             RETURN 1
                     )
-                    SORT folder_record.recordName ASC
+                    SORT record.recordName ASC
                     RETURN {{
-                        id: folder_record._key,
-                        name: folder_record.recordName,
+                        id: record._key,
+                        name: record.recordName,
                         path: folder_file.path,
-                        level: current_level,
-                        parent_id: p.edges[-1] ? PARSE_IDENTIFIER(p.edges[-1]._from).key : null,
-                        webUrl: folder_record.webUrl,
-                        recordGroupId: folder_record.connectorId,
+                        level: 1,
+                        parent_id: null,
+                        webUrl: record.webUrl,
+                        recordGroupId: record.connectorId,
                         type: "folder",
-                        createdAtTimestamp: folder_record.createdAtTimestamp,
-                        updatedAtTimestamp: folder_record.updatedAtTimestamp,
+                        createdAtTimestamp: record.createdAtTimestamp,
+                        updatedAtTimestamp: record.updatedAtTimestamp,
                         counts: {{
                             subfolders: direct_subfolders,
                             records: direct_records,
@@ -12577,12 +13473,7 @@ class BaseArangoService:
             // Get ALL records directly in KB root (excluding folders)
             // Folders are identified by FILES document's isFile == false
             LET allRecords = (
-                FOR edge IN @@record_relations
-                    FILTER edge._from == kb._id
-                    FILTER edge.relationshipType == "PARENT_CHILD"
-                    LET record = DOCUMENT(edge._to)
-                    FILTER record != null
-                    FILTER record.isDeleted != true
+                FOR record IN allImmediateChildren
                     // Exclude folders by checking FILES document's isFile property
                     LET record_file = FIRST(
                         FOR isEdge IN @@is_of_type
@@ -12690,6 +13581,8 @@ class BaseArangoService:
                 "skip": skip,
                 "limit": limit,
                 "level": level,
+                "kb_connector_type": Connectors.KNOWLEDGE_BASE.value,
+                "@belongs_to": CollectionNames.BELONGS_TO.value,
                 "@record_relations": CollectionNames.RECORD_RELATIONS.value,
                 "@is_of_type": CollectionNames.IS_OF_TYPE.value,
                 **filter_vars
@@ -12779,7 +13672,6 @@ class BaseArangoService:
             // Folders are identified by FILES document's isFile == false, not by recordType
             LET folder_record = DOCUMENT("records", @folder_id)
             FILTER folder_record != null
-            FILTER folder_record.connectorId == @kb_id
             // Get folder file metadata via IS_OF_TYPE edge
             // Verify it's a folder by checking FILES document's isFile property
             LET folder_file = FIRST(
@@ -12852,7 +13744,6 @@ class BaseArangoService:
                         level: current_level,
                         parentId: p.edges[-1] ? PARSE_IDENTIFIER(p.edges[-1]._from).key : null,
                         webUrl: subfolder_record.webUrl,
-                        recordGroupId: subfolder_record.connectorId,
                         type: "folder",
                         createdAtTimestamp: subfolder_record.createdAtTimestamp,
                         updatedAtTimestamp: subfolder_record.updatedAtTimestamp,
@@ -12954,7 +13845,6 @@ class BaseArangoService:
                     path: folder_file.path,
                     type: "folder",
                     webUrl: folder_record.webUrl,
-                    recordGroupId: folder_record.connectorId
                 }},
                 folders: paginatedSubfolders,
                 records: paginatedRecords,
@@ -12973,7 +13863,6 @@ class BaseArangoService:
             """
 
             bind_vars = {
-                "kb_id": kb_id,
                 "folder_id": folder_id,
                 "skip": skip,
                 "limit": limit,
@@ -13032,67 +13921,56 @@ class BaseArangoService:
                     return False
 
             try:
-                # Step 1: Get complete inventory of what we're deleting
-                # Folders are now represented by RECORDS documents
+                # Step 1: Get complete inventory of what we're deleting using graph traversal
+                # This collects ALL records/folders at any depth and FILES documents BEFORE edge deletion
                 inventory_query = """
                 LET kb = DOCUMENT("recordGroups", @kb_id)
                 FILTER kb != null
-                // Find all folders (RECORDS documents with isFile == false in associated FILES document)
-                LET all_folders = (
-                    FOR folder_record IN @@records_collection
-                        FILTER folder_record.connectorId == @kb_id
-                        // Verify it's a folder by checking associated FILES document
-                        LET folder_file = FIRST(
-                            FOR isEdge IN @@is_of_type
-                                FILTER isEdge._from == folder_record._id
-                                LET f = DOCUMENT(isEdge._to)
-                                FILTER f != null AND f.isFile == false
-                                RETURN 1
-                        )
-                        FILTER folder_file != null
-                        RETURN folder_record._key
-                )
-                LET all_kb_records_with_details = (
+                LET kb_id_full = CONCAT('recordGroups/', @kb_id)
+                LET all_records_and_folders = (
                     FOR edge IN @@belongs_to_kb
-                        FILTER edge._to == CONCAT('recordGroups/', @kb_id)
+                        FILTER edge._to == kb_id_full
                         LET record = DOCUMENT(edge._from)
                         FILTER record != null
-                        // Exclude folders - ensure it's a file record by checking FILES document
-                        LET record_file = FIRST(
-                            FOR isEdge IN @@is_of_type
-                                FILTER isEdge._from == record._id
-                                LET f = DOCUMENT(isEdge._to)
-                                FILTER f != null AND f.isFile != false
-                                RETURN 1
-                        )
-                        FILTER record_file == null  // Exclude folders (isFile == false)
-                        // Get associated file record for each record
-                        LET file_record = FIRST(
-                            FOR isEdge IN @@is_of_type
-                                FILTER isEdge._from == record._id
-                                LET fileRecord = DOCUMENT(isEdge._to)
-                                FILTER fileRecord != null AND fileRecord.isFile == true
-                                RETURN fileRecord
-                        )
-                        FILTER file_record != null
+                        FILTER IS_SAME_COLLECTION(@@records_collection, record._id)
+                        RETURN record
+                )
+                LET all_files_with_details = (
+                    FOR record IN all_records_and_folders
+                        FOR edge IN @@is_of_type
+                            FILTER edge._from == record._id
+                            LET file = DOCUMENT(edge._to)
+                            FILTER file != null
+                            RETURN {
+                                file_key: file._key,
+                                is_folder: file.isFile == false,
+                                record_key: record._key,
+                                record: record,
+                                file_doc: file
+                            }
+                )
+                // Separate folders and file records
+                LET folders = (
+                    FOR item IN all_files_with_details
+                        FILTER item.is_folder == true
+                        RETURN item.record_key
+                )
+                LET file_records = (
+                    FOR item IN all_files_with_details
+                        FILTER item.is_folder == false
                         RETURN {
-                            record: record,
-                            file_record: file_record
+                            record: item.record,
+                            file_record: item.file_doc
                         }
                 )
-                LET all_file_records = (
-                    FOR record_data IN all_kb_records_with_details
-                        FILTER record_data.file_record != null
-                        RETURN record_data.file_record._key
-                )
                 RETURN {
-                    kb_exists: kb != null,
-                    folders: all_folders,
-                    records_with_details: all_kb_records_with_details,
-                    file_records: all_file_records,
-                    total_folders: LENGTH(all_folders),
-                    total_records: LENGTH(all_kb_records_with_details),
-                    total_file_records: LENGTH(all_file_records)
+                    kb_exists: true,
+                    record_keys: all_records_and_folders[*]._key,
+                    file_keys: all_files_with_details[*].file_key,
+                    folder_keys: folders,
+                    records_with_details: file_records,
+                    total_folders: LENGTH(folders),
+                    total_records: LENGTH(all_records_and_folders)
                 }
                 """
 
@@ -13113,127 +13991,112 @@ class BaseArangoService:
                     return True
 
                 records_with_details = inventory.get("records_with_details", [])
+                all_record_keys = inventory.get("record_keys", [])
 
-                self.logger.info(f"📋 KB {kb_id} deletion inventory:")
-                self.logger.info(f"   📁 Folders: {inventory['total_folders']}")
-                self.logger.info(f"   📄 Records: {inventory['total_records']}")
-                self.logger.info(f"   🗂️ File records: {inventory['total_file_records']}")
+                self.logger.info(f"folder_keys: {inventory.get('folder_keys', [])}")
+                self.logger.info(f"total_folders: {inventory.get('total_folders', 0)}")
+
 
                 # Step 2: Delete ALL edges first (prevents foreign key issues)
-                self.logger.info("🗑️ Step 1: Deleting all edges...")
-
-                all_record_keys = [rd["record"]["_key"] for rd in records_with_details]
+                self.logger.info("🗑️ Step 2: Deleting all edges...")
                 edges_cleanup_query = """
-                LET btk_keys_to_delete = (FOR e IN @@belongs_to_kb FILTER e._to == CONCAT('recordGroups/', @kb_id) RETURN e._key)
-                LET perm_keys_to_delete = (FOR e IN @@permission FILTER e._to == CONCAT('recordGroups/', @kb_id) RETURN e._key)
-                LET iot_keys_to_delete = (FOR rk IN @all_records FOR e IN @@is_of_type FILTER e._from == CONCAT('records/', rk) RETURN e._key)
-                // Folders are now RECORDS documents, so use records/{folder_key}
-                LET all_related_doc_ids = APPEND((FOR f IN @all_folders RETURN CONCAT('records/', f)), (FOR r IN @all_records RETURN CONCAT('records/', r)))
-                LET relation_keys_to_delete = (FOR e IN @@record_relations FILTER e._from IN all_related_doc_ids OR e._to IN all_related_doc_ids COLLECT k = e._key RETURN k)
-                FOR btk_key IN btk_keys_to_delete REMOVE btk_key IN @@belongs_to_kb OPTIONS { ignoreErrors: true }
-                FOR perm_key IN perm_keys_to_delete REMOVE perm_key IN @@permission OPTIONS { ignoreErrors: true }
-                FOR iot_key IN iot_keys_to_delete REMOVE iot_key IN @@is_of_type OPTIONS { ignoreErrors: true }
-                FOR relation_key IN relation_keys_to_delete REMOVE relation_key IN @@record_relations OPTIONS { ignoreErrors: true }
+                LET record_ids = (FOR k IN @record_keys RETURN CONCAT('records/', k))
+                LET kb_id_full = CONCAT('recordGroups/', @kb_id)
+
+                // Collect ALL edge keys in one pass
+                // Edges TO the KB (records/folders -> record group)
+                LET belongs_to_keys = (
+                    FOR e IN @@belongs_to_kb
+                        FILTER e._to == kb_id_full
+                        RETURN e._key
+                )
+                // Edge FROM KB record group TO KB app (record group -> app)
+                LET belongs_to_kb_app_keys = (
+                    FOR e IN @@belongs_to_kb
+                        FILTER e._from == kb_id_full
+                        RETURN e._key
+                )
+                LET all_belongs_to_keys = APPEND(belongs_to_keys, belongs_to_kb_app_keys)
+
+                LET is_of_type_keys = (
+                    FOR e IN @@is_of_type
+                        FILTER e._from IN record_ids
+                        RETURN e._key
+                )
+
+                LET permission_keys = (
+                    FOR e IN @@permission
+                        FILTER e._to == kb_id_full OR e._to IN record_ids
+                        RETURN e._key
+                )
+
+                LET relation_keys = (
+                    FOR e IN @@record_relations
+                        FILTER e._from IN record_ids OR e._to IN record_ids
+                        RETURN e._key
+                )
+
+                // Delete all edges (using different variable names to avoid AQL error)
+                FOR btk_key IN all_belongs_to_keys REMOVE btk_key IN @@belongs_to_kb OPTIONS { ignoreErrors: true }
+                FOR iot_key IN is_of_type_keys REMOVE iot_key IN @@is_of_type OPTIONS { ignoreErrors: true }
+                FOR perm_key IN permission_keys REMOVE perm_key IN @@permission OPTIONS { ignoreErrors: true }
+                FOR rel_key IN relation_keys REMOVE rel_key IN @@record_relations OPTIONS { ignoreErrors: true }
+
+                RETURN {
+                    belongs_to_deleted: LENGTH(all_belongs_to_keys),
+                    is_of_type_deleted: LENGTH(is_of_type_keys),
+                    permission_deleted: LENGTH(permission_keys),
+                    relation_deleted: LENGTH(relation_keys)
+                }
                 """
-                transaction.aql.execute(edges_cleanup_query, bind_vars={
+                cursor = transaction.aql.execute(edges_cleanup_query, bind_vars={
                     "kb_id": kb_id,
-                    "all_folders": inventory["folders"],
-                    "all_records": all_record_keys,
+                    "record_keys": all_record_keys,
                     "@belongs_to_kb": CollectionNames.BELONGS_TO.value,
                     "@permission": CollectionNames.PERMISSION.value,
                     "@is_of_type": CollectionNames.IS_OF_TYPE.value,
                     "@record_relations": CollectionNames.RECORD_RELATIONS.value,
                 })
-                self.logger.info(f"✅ All edges deleted for KB {kb_id}")
+                # Fully consume the cursor to release the transaction lock
+                results = list(cursor)
+                edge_deletion_result = results[0] if results else {}
 
-                # Step 3: Delete all file records
-                if inventory["file_records"]:
-                    self.logger.info(f"🗑️ Step 2: Deleting {len(inventory['file_records'])} file records...")
-                    transaction.aql.execute(
-                        "FOR k IN @keys REMOVE k IN @@files_collection OPTIONS { ignoreErrors: true }",
-                        bind_vars={
-                            "keys": inventory["file_records"],
-                            "@files_collection": CollectionNames.FILES.value
-                        }
-                    )
-                    self.logger.info(f"✅ Deleted {len(inventory['file_records'])} file records")
+                self.logger.info(f"✅ All edges deleted for KB {kb_id}: "
+                               f"belongs_to={edge_deletion_result.get('belongs_to_deleted', 0)}, "
+                               f"is_of_type={edge_deletion_result.get('is_of_type_deleted', 0)}, "
+                               f"permission={edge_deletion_result.get('permission_deleted', 0)}, "
+                               f"relations={edge_deletion_result.get('relation_deleted', 0)}")
 
-                # Step 4: Delete all records
+                # Step 3: Delete all FILES documents (folders + files) using helper method
+                file_keys = inventory.get("file_keys", [])
+                if file_keys:
+                    self.logger.info(f"🗑️ Step 3: Deleting {len(file_keys)} FILES documents (folders + files)...")
+                    await self.delete_nodes(file_keys, CollectionNames.FILES.value, transaction=transaction)
+                    self.logger.info(f"✅ Deleted {len(file_keys)} FILES documents")
+
+                # Step 4: Delete all RECORDS documents (folders + files) using helper method
                 if all_record_keys:
-                    self.logger.info(f"🗑️ Step 3: Deleting {len(all_record_keys)} records...")
-                    transaction.aql.execute(
-                        "FOR k IN @keys REMOVE k IN @@records_collection OPTIONS { ignoreErrors: true }",
-                        bind_vars={
-                            "keys": all_record_keys,
-                            "@records_collection": CollectionNames.RECORDS.value
-                        }
-                    )
-                    self.logger.info(f"✅ Deleted {len(all_record_keys)} records")
+                    self.logger.info(f"🗑️ Step 4: Deleting {len(all_record_keys)} RECORDS documents (folders + files)...")
+                    await self.delete_nodes(all_record_keys, CollectionNames.RECORDS.value, transaction=transaction)
+                    self.logger.info(f"✅ Deleted {len(all_record_keys)} RECORDS documents")
 
-                # Step 5: Delete all folders (RECORDS documents and their associated FILES documents)
-                if inventory["folders"]:
-                    self.logger.info(f"🗑️ Step 4: Deleting {len(inventory['folders'])} folders...")
-
-                    # First, get all folder FILES document keys
-                    folder_files_query = """
-                    FOR folder_key IN @folder_keys
-                        LET folder_record = DOCUMENT("records", folder_key)
-                        FILTER folder_record != null
-                        LET folder_file = FIRST(
-                            FOR isEdge IN @@is_of_type
-                                FILTER isEdge._from == folder_record._id
-                                LET f = DOCUMENT(isEdge._to)
-                                FILTER f != null AND f.isFile == false
-                                RETURN f._key
-                        )
-                        FILTER folder_file != null
-                        RETURN folder_file
-                    """
-
-                    folder_files_cursor = transaction.aql.execute(folder_files_query, bind_vars={
-                        "folder_keys": inventory["folders"],
-                        "@is_of_type": CollectionNames.IS_OF_TYPE.value,
-                    })
-                    folder_file_keys = [f for f in folder_files_cursor]
-
-                    # Delete folder FILES documents
-                    if folder_file_keys:
-                        transaction.aql.execute(
-                            "FOR k IN @keys REMOVE k IN @@files_collection OPTIONS { ignoreErrors: true }",
-                            bind_vars={
-                                "keys": folder_file_keys,
-                                "@files_collection": CollectionNames.FILES.value
-                            }
-                        )
-                        self.logger.info(f"✅ Deleted {len(folder_file_keys)} folder FILES documents")
-
-                    # Delete folder RECORDS documents
-                    transaction.aql.execute(
-                        "FOR k IN @keys REMOVE k IN @@records_collection OPTIONS { ignoreErrors: true }",
-                        bind_vars={
-                            "keys": inventory["folders"],
-                            "@records_collection": CollectionNames.RECORDS.value
-                        }
-                    )
-                    self.logger.info(f"✅ Deleted {len(inventory['folders'])} folder RECORDS documents")
-
-                # Step 6: Delete the KB document itself
+                # Step 5: Delete the KB document itself
                 self.logger.info(f"🗑️ Step 5: Deleting KB document {kb_id}...")
-                transaction.aql.execute(
-                    "REMOVE @kb_id IN @@recordGroups_collection OPTIONS { ignoreErrors: true }",
+                cursor = transaction.aql.execute(
+                    "REMOVE @kb_id IN @@recordGroups_collection OPTIONS { ignoreErrors: true } RETURN OLD",
                     bind_vars={
                         "kb_id": kb_id,
                         "@recordGroups_collection": CollectionNames.RECORD_GROUPS.value
                     }
                 )
-
-                # Step 7: Commit transaction
+                list(cursor)  # Consume cursor to ensure query completes and locks are released
+                # Step 6: Commit transaction
                 if should_commit:
                     self.logger.info("💾 Committing complete deletion transaction...")
                     await asyncio.to_thread(lambda: transaction.commit_transaction())
                     self.logger.info("✅ Transaction committed successfully!")
 
-                # Step 8: Publish delete events for all records (after successful transaction)
+                # Step 7: Publish delete events for all records (after successful transaction)
                 try:
                     delete_event_tasks = []
                     for record_data in records_with_details:
@@ -13303,7 +14166,6 @@ class BaseArangoService:
                 inventory_query = """
                 LET target_folder_record = DOCUMENT("records", @folder_id)
                 FILTER target_folder_record != null
-                FILTER target_folder_record.connectorId == @kb_id
                 // Verify it's a folder by checking associated FILES document
                 LET target_folder_file = FIRST(
                     FOR isEdge IN @@is_of_type
@@ -13376,7 +14238,6 @@ class BaseArangoService:
 
                 cursor = transaction.aql.execute(inventory_query, bind_vars={
                     "folder_id": folder_id,
-                    "kb_id": kb_id,
                     "@record_relations": CollectionNames.RECORD_RELATIONS.value,
                     "@is_of_type": CollectionNames.IS_OF_TYPE.value,
                 })
@@ -14608,6 +15469,7 @@ class BaseArangoService:
                 LET directKbRecords = (
                     FOR kb IN 1..1 ANY userDoc._id {CollectionNames.PERMISSION.value}
                         FILTER IS_SAME_COLLECTION("recordGroups", kb)
+                        FILTER kb._key IN @kb_ids
                     FOR records IN 1..1 ANY kb._id {CollectionNames.BELONGS_TO.value}
                     RETURN DISTINCT records
                 )
@@ -14620,6 +15482,7 @@ class BaseArangoService:
                     FOR kb, teamKbEdge IN 1..1 OUTBOUND team._id {CollectionNames.PERMISSION.value}
                         FILTER IS_SAME_COLLECTION("recordGroups", kb)
                         FILTER teamKbEdge.type == "TEAM"
+                        FILTER kb._key IN @kb_ids
                     FOR records IN 1..1 ANY kb._id {CollectionNames.BELONGS_TO.value}
                     RETURN DISTINCT records
                 )
@@ -15455,11 +16318,19 @@ class BaseArangoService:
             return False
 
 
-    async def get_agent(self, agent_id: str, user_id: str) -> Optional[Dict]:
-        """Get an agent by ID with user permissions - flattened response"""
+    async def get_agent(self, agent_id: str, user_id: str, org_id: str) -> Optional[Dict]:
+        """
+        Get an agent by ID with user permissions and linked graph data.
+
+        Includes:
+        - Agent document with permissions
+        - Linked toolsets with their tools (via agentHasToolset -> toolsetHasTool)
+        - Linked knowledge with filters (via agentHasKnowledge)
+        """
         try:
             query = f"""
             LET user_key = @user_id
+            LET org_key = @org_id
             LET agent_path = CONCAT('{CollectionNames.AGENT_INSTANCES.value}/', @agent_id)
 
             // Get user's teams first
@@ -15509,17 +16380,150 @@ class BaseArangoService:
                     }})
             ) : []
 
-            // Return individual access first, then team access
-            LET final_result = LENGTH(individual_access) > 0 ?
-                FIRST(individual_access) :
-                (LENGTH(team_access) > 0 ? FIRST(team_access) : null)
+            // Check org permissions on the agent (only if no individual or team access)
+            LET org_access = LENGTH(individual_access) == 0 && LENGTH(team_access) == 0 && org_key != null ? (
+                FOR perm IN {CollectionNames.PERMISSION.value}
+                    FILTER perm._from == CONCAT('{CollectionNames.ORGS.value}/', org_key)
+                    FILTER perm._to == agent_path
+                    FILTER perm.type == "ORG"
+                    LET agent = DOCUMENT(agent_path)
+                    FILTER agent != null
+                    FILTER agent.isDeleted != true
+                    RETURN MERGE(agent, {{
+                        access_type: "ORG",
+                        user_role: perm.role,
+                        can_edit: perm.role IN ["OWNER", "WRITER", "ORGANIZER"],
+                        can_delete: perm.role == "OWNER",
+                        can_share: perm.role IN ["OWNER", "ORGANIZER"],
+                        can_view: true
+                    }})
+            ) : []
 
-            RETURN final_result
+            // Get base agent with permissions
+            LET base_agent = LENGTH(individual_access) > 0 ?
+                FIRST(individual_access) :
+                (LENGTH(team_access) > 0 ? FIRST(team_access) :
+                (LENGTH(org_access) > 0 ? FIRST(org_access) : null))
+
+            // Get linked toolsets with their tools
+            LET linked_toolsets = base_agent != null ? (
+                FOR edge IN {CollectionNames.AGENT_HAS_TOOLSET.value}
+                    FILTER edge._from == agent_path
+                    LET toolset = DOCUMENT(edge._to)
+                    FILTER toolset != null
+
+                    // Get tools linked to this toolset
+                    LET toolset_tools = (
+                        FOR tool_edge IN {CollectionNames.TOOLSET_HAS_TOOL.value}
+                            FILTER tool_edge._from == edge._to
+                            LET tool = DOCUMENT(tool_edge._to)
+                            FILTER tool != null
+                            RETURN {{
+                                _key: tool._key,
+                                name: tool.toolName,
+                                fullName: tool.fullName,
+                                toolsetName: tool.toolsetName,
+                                description: tool.description
+                            }}
+                    )
+
+                    RETURN {{
+                        _key: toolset._key,
+                        name: toolset.name,
+                        displayName: toolset.displayName,
+                        type: toolset.type,
+                        userId: toolset.userId,
+                        selectedTools: toolset.selectedTools,
+                        tools: toolset_tools
+                    }}
+            ) : []
+
+            // Get linked knowledge with filters and enrich with names
+            LET linked_knowledge = base_agent != null ? (
+                FOR edge IN {CollectionNames.AGENT_HAS_KNOWLEDGE.value}
+                    FILTER edge._from == agent_path
+                    LET knowledge = DOCUMENT(edge._to)
+                    FILTER knowledge != null
+
+                    // Parse filters to check if this is a KB or app
+                    LET filters_parsed = TYPENAME(knowledge.filters) == "string" ?
+                        JSON_PARSE(knowledge.filters) : knowledge.filters
+                    LET record_groups = filters_parsed.recordGroups || []
+                    LET is_kb = LENGTH(record_groups) > 0
+
+                    // For KBs: Get KB name from record group document
+                    // KBs have recordGroups in filters, and we look up the KB document
+                    LET kb_info = is_kb && LENGTH(record_groups) > 0 ? (
+                        LET first_kb_id = record_groups[0]
+                        LET kb_doc = DOCUMENT(CONCAT('{CollectionNames.RECORD_GROUPS.value}/', first_kb_id))
+                        FILTER kb_doc != null
+                        FILTER kb_doc.groupType == @kb_type
+                        RETURN {{
+                            name: kb_doc.groupName,
+                            type: "KB",
+                            displayName: kb_doc.groupName,
+                            // Use KB connector instance ID from KB document, fallback to knowledge.connectorId
+                            connectorId: kb_doc.connectorId || knowledge.connectorId
+                        }}
+                    ) : []
+
+                    // For apps: Get connector instance name from APPS collection
+                    // Apps have empty recordGroups or no recordGroups
+                    LET app_info = !is_kb ? (
+                        LET connector_instance = DOCUMENT(CONCAT('{CollectionNames.APPS.value}/', knowledge.connectorId))
+                        FILTER connector_instance != null
+                        RETURN {{
+                            name: connector_instance.name,
+                            type: connector_instance.type || "APP",
+                            displayName: connector_instance.name
+                        }}
+                    ) : []
+
+                    // Determine the display info
+                    LET display_info = LENGTH(kb_info) > 0 ? FIRST(kb_info) :
+                                      (LENGTH(app_info) > 0 ? FIRST(app_info) : {{
+                                          name: knowledge.connectorId,
+                                          type: "UNKNOWN",
+                                          displayName: knowledge.connectorId
+                                      }})
+
+                    RETURN {{
+                        _key: knowledge._key,
+                        // For KBs, use connectorId from KB document (KB connector instance ID)
+                        // For apps, use the connectorId from knowledge (connector instance ID)
+                        connectorId: LENGTH(kb_info) > 0 ? FIRST(kb_info).connectorId : knowledge.connectorId,
+                        filters: knowledge.filters,
+                        name: display_info.name,
+                        type: display_info.type,
+                        displayName: display_info.displayName || display_info.name
+                    }}
+            ) : []
+
+            // Check if the agent is shared with the org (edge-based, not stored in doc)
+            LET share_with_org = base_agent != null && org_key != null ? (
+                LENGTH(
+                    FOR perm IN {CollectionNames.PERMISSION.value}
+                        FILTER perm._from == CONCAT('{CollectionNames.ORGS.value}/', org_key)
+                        FILTER perm._to == agent_path
+                        FILTER perm.type == "ORG"
+                        LIMIT 1
+                        RETURN 1
+                ) > 0
+            ) : false
+
+            // Return agent with linked data
+            RETURN base_agent != null ? MERGE(base_agent, {{
+                toolsets: linked_toolsets,
+                knowledge: linked_knowledge,
+                shareWithOrg: share_with_org
+            }}) : null
             """
 
             bind_vars = {
                 "agent_id": agent_id,
                 "user_id": user_id,
+                "org_id": org_id,
+                "kb_type": Connectors.KNOWLEDGE_BASE.value,
             }
 
             cursor = self.db.aql.execute(query, bind_vars=bind_vars)
@@ -15529,18 +16533,32 @@ class BaseArangoService:
                 self.logger.warning(f"No permissions found for user {user_id} on agent {agent_id}")
                 return None
 
-            return result[0]
+            agent = result[0]
+
+            # Parse knowledge filters from JSON strings
+            if agent.get("knowledge"):
+                for knowledge in agent["knowledge"]:
+                    filters_str = knowledge.get("filters", "{}")
+                    if isinstance(filters_str, str):
+                        try:
+                            knowledge["filtersParsed"] = json.loads(filters_str)
+                        except json.JSONDecodeError:
+                            knowledge["filtersParsed"] = {}
+                    else:
+                        knowledge["filtersParsed"] = filters_str
+
+            return agent
 
         except Exception as e:
             self.logger.error(f"Failed to get agent: {str(e)}")
             return None
 
-
-    async def get_all_agents(self, user_id: str) -> List[Dict]:
-        """Get all agents accessible to a user via individual or team access - flattened response"""
+    async def get_all_agents(self, user_id: str, org_id: str) -> List[Dict]:
+        """Get all agents accessible to a user via individual, team, or org access - flattened response with deduplication"""
         try:
             query = f"""
             LET user_key = @user_id
+            LET org_key = @org_id
 
             // Get user's teams
             LET user_teams = (
@@ -15551,8 +16569,10 @@ class BaseArangoService:
                     RETURN perm._to
             )
 
-            // Get agents with individual access
-            LET individual_agents = (
+            // Get all agents with all permission types in a single optimized query
+            // Collect all permissions first, then deduplicate by agent ID with priority
+            LET all_permissions = (
+                // Individual user permissions
                 FOR perm IN {CollectionNames.PERMISSION.value}
                     FILTER perm._from == CONCAT('{CollectionNames.USERS.value}/', user_key)
                     FILTER perm.type == "USER"
@@ -15560,45 +16580,86 @@ class BaseArangoService:
                     LET agent = DOCUMENT(perm._to)
                     FILTER agent != null
                     FILTER agent.isDeleted != true
-                    RETURN MERGE(agent, {{
+                    RETURN {{
+                        agent_id: agent._id,
+                        agent: agent,
+                        role: perm.role,
                         access_type: "INDIVIDUAL",
-                        user_role: perm.role,
-                        can_edit: perm.role IN ["OWNER", "WRITER", "ORGANIZER"],
-                        can_delete: perm.role == "OWNER",
-                        can_share: perm.role IN ["OWNER", "ORGANIZER"],
-                        can_view: true
-                    }})
+                        priority: 1
+                    }}
             )
 
-            // Get agents with team access (excluding those already found via individual access)
-            LET individual_agent_ids = (FOR ind_agent IN individual_agents RETURN ind_agent._id)
-
-            LET team_agents = (
+            LET team_permissions = (
+                // Team permissions
                 FOR perm IN {CollectionNames.PERMISSION.value}
                     FILTER perm._from IN user_teams
                     FILTER perm.type == "TEAM"
                     FILTER STARTS_WITH(perm._to, '{CollectionNames.AGENT_INSTANCES.value}/')
-                    FILTER perm._to NOT IN individual_agent_ids
                     LET agent = DOCUMENT(perm._to)
                     FILTER agent != null
                     FILTER agent.isDeleted != true
-                    RETURN MERGE(agent, {{
+                    RETURN {{
+                        agent_id: agent._id,
+                        agent: agent,
+                        role: perm.role,
                         access_type: "TEAM",
-                        user_role: perm.role,
-                        can_edit: perm.role IN ["OWNER", "WRITER", "ORGANIZER"],
-                        can_delete: perm.role == "OWNER",
-                        can_share: perm.role IN ["OWNER", "ORGANIZER"],
-                        can_view: true
-                    }})
+                        priority: 2
+                    }}
             )
 
-            // Flatten and return all agents
-            FOR agent_result IN APPEND(individual_agents, team_agents)
-                RETURN agent_result
+            LET org_permissions = org_key != null ? (
+                // Org permissions
+                FOR perm IN {CollectionNames.PERMISSION.value}
+                    FILTER perm._from == CONCAT('{CollectionNames.ORGS.value}/', org_key)
+                    FILTER perm.type == "ORG"
+                    FILTER STARTS_WITH(perm._to, '{CollectionNames.AGENT_INSTANCES.value}/')
+                    LET agent = DOCUMENT(perm._to)
+                    FILTER agent != null
+                    FILTER agent.isDeleted != true
+                    RETURN {{
+                        agent_id: agent._id,
+                        agent: agent,
+                        role: perm.role,
+                        access_type: "ORG",
+                        priority: 3
+                    }}
+            ) : []
+
+            // Pre-compute set of agent paths shared with the org (edge-based, not stored in doc)
+            LET org_shared_agent_paths = org_key != null ? (
+                FOR perm IN {CollectionNames.PERMISSION.value}
+                    FILTER perm._from == CONCAT('{CollectionNames.ORGS.value}/', org_key)
+                    FILTER perm.type == "ORG"
+                    FILTER STARTS_WITH(perm._to, '{CollectionNames.AGENT_INSTANCES.value}/')
+                    RETURN perm._to
+            ) : []
+
+            // Combine all permissions and deduplicate by agent_id, keeping highest priority
+            LET combined = APPEND(APPEND(all_permissions, team_permissions), org_permissions)
+
+            // Deduplicate: group by agent_id and keep entry with lowest priority number
+            FOR perm_entry IN combined
+                COLLECT agent_id = perm_entry.agent_id INTO groups
+                LET best_entry = (
+                    FOR entry IN groups[*].perm_entry
+                        SORT entry.priority ASC
+                        LIMIT 1
+                        RETURN entry
+                )[0]
+                RETURN MERGE(best_entry.agent, {{
+                    access_type: best_entry.access_type,
+                    user_role: best_entry.role,
+                    can_edit: best_entry.role IN ["OWNER", "WRITER", "ORGANIZER"],
+                    can_delete: best_entry.role == "OWNER",
+                    can_share: best_entry.role IN ["OWNER", "ORGANIZER"],
+                    can_view: true,
+                    shareWithOrg: best_entry.agent._id IN org_shared_agent_paths
+                }})
             """
 
             bind_vars = {
                 "user_id": user_id,
+                "org_id": org_id,
             }
 
             cursor = self.db.aql.execute(query, bind_vars=bind_vars)
@@ -15608,11 +16669,16 @@ class BaseArangoService:
             self.logger.error(f"Failed to get all agents: {str(e)}")
             return []
 
-    async def update_agent(self, agent_id: str, agent_updates: Dict[str, Any], user_id: str) -> Optional[bool]:
-        """Update an agent"""
+    async def update_agent(self, agent_id: str, agent_updates: Dict[str, Any], user_id: str, org_id: str) -> Optional[bool]:
+        """
+        Update an agent.
+
+        New schema only allows: name, description, startMessage, systemPrompt, models (as keys), tags
+        Tools, connectors, kb, vectorDBs are handled via edges, not in agent document.
+        """
         try:
             # Check if user has permission to update the agent using the new method
-            agent_with_permission = await self.get_agent(agent_id, user_id)
+            agent_with_permission = await self.get_agent(agent_id, user_id, org_id)
             if agent_with_permission is None:
                 self.logger.warning(f"No permission found for user {user_id} on agent {agent_id}")
                 return False
@@ -15625,14 +16691,60 @@ class BaseArangoService:
             # Prepare update data
             update_data = {
                 "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
-                "updatedByUserId": user_id
+                "updatedBy": user_id
             }
 
-            # Add only the fields that are provided in agent_updates
-            allowed_fields = ["name", "description", "startMessage", "systemPrompt", "tools", "models", "apps", "kb", "vectorDBs", "tags"]
+            # Add only schema-allowed fields
+            # Note: tools, connectors, kb, vectorDBs are handled via edges, not agent document
+            allowed_fields = ["name", "description", "startMessage", "systemPrompt", "tags", "isActive"]
             for field in allowed_fields:
                 if field in agent_updates:
                     update_data[field] = agent_updates[field]
+
+            # Handle models specially - convert model objects to model keys and deduplicate
+            if "models" in agent_updates:
+                raw_models = agent_updates["models"]
+                if isinstance(raw_models, list):
+                    model_entries = []
+                    seen_entries = set()  # Track seen full entries to prevent duplicates
+
+                    for model in raw_models:
+                        model_key = None
+                        model_name = None
+
+                        # Extract model key and name from different input formats
+                        if isinstance(model, dict):
+                            model_key = model.get("modelKey")
+                            model_name = model.get("modelName", "")
+                        elif isinstance(model, str):
+                            # Handle both "modelKey" and "modelKey_modelName" formats
+                            if "_" in model:
+                                parts = model.split("_", 1)
+                                model_key = parts[0]
+                                model_name = parts[1] if len(parts) > 1 else ""
+                            else:
+                                model_key = model
+                                model_name = ""
+
+                        # Build the entry string
+                        if model_key:
+                            # Store in same format as create: "modelKey_modelName" or just "modelKey"
+                            if model_name:
+                                entry = f"{model_key}_{model_name}"
+                            else:
+                                entry = model_key
+
+                            # Only add if we haven't seen this exact entry before
+                            # This allows same modelKey with different modelNames
+                            if entry not in seen_entries:
+                                model_entries.append(entry)
+                                seen_entries.add(entry)
+
+                    # Always set models array (even if empty) to completely replace existing one
+                    update_data["models"] = model_entries
+                elif raw_models is None:
+                    # Explicitly set to empty array if None is provided
+                    update_data["models"] = []
 
             # Update the agent using AQL UPDATE statement - Fixed to use proper collection name
             update_query = f"""
@@ -15661,7 +16773,7 @@ class BaseArangoService:
             self.logger.error(f"Failed to update agent: {str(e)}")
             return False
 
-    async def delete_agent(self, agent_id: str, user_id: str) -> Optional[bool]:
+    async def delete_agent(self, agent_id: str, user_id: str, org_id: str) -> Optional[bool]:
         """Delete an agent"""
         try:
             # Check if agent exists
@@ -15671,7 +16783,7 @@ class BaseArangoService:
                 return False
 
             # Check if user has permission to delete the agent using the new method
-            agent_with_permission = await self.get_agent(agent_id, user_id)
+            agent_with_permission = await self.get_agent(agent_id, user_id, org_id)
             if agent_with_permission is None:
                 self.logger.warning(f"No permission found for user {user_id} on agent {agent_id}")
                 return False
@@ -15715,11 +16827,11 @@ class BaseArangoService:
             self.logger.error(f"Failed to delete agent: {str(e)}")
             return False
 
-    async def share_agent(self, agent_id: str, user_id: str, user_ids: Optional[List[str]], team_ids: Optional[List[str]]) -> Optional[bool]:
+    async def share_agent(self, agent_id: str, user_id: str, org_id: str, user_ids: Optional[List[str]], team_ids: Optional[List[str]]) -> Optional[bool]:
         """Share an agent to users and teams"""
         try:
             # Check if agent exists and user has permission to share it
-            agent_with_permission = await self.get_agent(agent_id, user_id)
+            agent_with_permission = await self.get_agent(agent_id, user_id, org_id)
             if agent_with_permission is None:
                 self.logger.warning(f"No permission found for user {user_id} on agent {agent_id}")
                 return False
@@ -15778,11 +16890,11 @@ class BaseArangoService:
             self.logger.error("❌ Failed to share agent: %s", str(e), exc_info=True)
             return False
 
-    async def unshare_agent(self, agent_id: str, user_id: str, user_ids: Optional[List[str]], team_ids: Optional[List[str]]) -> Optional[Dict]:
+    async def unshare_agent(self, agent_id: str, user_id: str, org_id: str, user_ids: Optional[List[str]], team_ids: Optional[List[str]]) -> Optional[Dict]:
         """Unshare an agent from users and teams - direct deletion without validation"""
         try:
             # Check if user has permission to unshare the agent
-            agent_with_permission = await self.get_agent(agent_id, user_id)
+            agent_with_permission = await self.get_agent(agent_id, user_id, org_id)
             if agent_with_permission is None or not agent_with_permission.get("can_share", False):
                 return {"success": False, "reason": "Insufficient permissions to unshare agent"}
 
@@ -15825,11 +16937,11 @@ class BaseArangoService:
             self.logger.error("Failed to unshare agent: %s", str(e), exc_info=True)
             return {"success": False, "reason": f"Internal error: {str(e)}"}
 
-    async def update_agent_permission(self, agent_id: str, owner_user_id: str, user_ids: Optional[List[str]], team_ids: Optional[List[str]], role: str) -> Optional[Dict]:
+    async def update_agent_permission(self, agent_id: str, owner_user_id: str, org_id: str, user_ids: Optional[List[str]], team_ids: Optional[List[str]], role: str) -> Optional[Dict]:
         """Update permission role for users and teams on an agent (only OWNER can do this)"""
         try:
             # Check if the requesting user is the OWNER of the agent
-            agent_with_permission = await self.get_agent(agent_id, owner_user_id)
+            agent_with_permission = await self.get_agent(agent_id, owner_user_id, org_id)
             if agent_with_permission is None:
                 self.logger.warning(f"No permission found for user {owner_user_id} on agent {agent_id}")
                 return {"success": False, "reason": "Agent not found or no permission"}
@@ -15901,11 +17013,11 @@ class BaseArangoService:
             self.logger.error(f"Failed to update agent permission: {str(e)}")
             return {"success": False, "reason": f"Internal error: {str(e)}"}
 
-    async def get_agent_permissions(self, agent_id: str, user_id: str) -> Optional[List[Dict]]:
+    async def get_agent_permissions(self, agent_id: str, user_id: str, org_id: str) -> Optional[List[Dict]]:
         """Get all permissions for an agent (only OWNER can view all permissions)"""
         try:
             # Check if user has access to the agent
-            agent_with_permission = await self.get_agent(agent_id, user_id)
+            agent_with_permission = await self.get_agent(agent_id, user_id, org_id)
             if agent_with_permission is None:
                 self.logger.warning(f"No permission found for user {user_id} on agent {agent_id}")
                 return None
@@ -16136,3 +17248,279 @@ class BaseArangoService:
                 "❌ Failed to retrieve file record for id %s: %s", id, str(e)
             )
             return None
+
+    # ========================================================================
+    # Move Record API Methods
+    # ========================================================================
+
+    def is_record_descendant_of(
+        self,
+        ancestor_id: str,
+        potential_descendant_id: str,
+        transaction: Optional[TransactionDatabase] = None
+    ) -> bool:
+        """
+        Check if potential_descendant_id is a descendant of ancestor_id.
+        Used to prevent circular references when moving folders.
+
+        Args:
+            ancestor_id: The folder being moved (record key)
+            potential_descendant_id: The target destination (record key)
+            transaction: Optional transaction
+
+        Returns:
+            bool: True if potential_descendant_id is under ancestor_id
+        """
+        query = """
+        LET ancestor_doc_id = CONCAT("records/", @ancestor_id)
+
+        // Traverse down from ancestor to find if descendant is reachable
+        FOR v IN 1..100 OUTBOUND ancestor_doc_id recordRelations
+            OPTIONS { bfs: true, uniqueVertices: "global" }
+            FILTER v._key == @descendant_id
+            LIMIT 1
+            RETURN 1
+        """
+        try:
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(
+                query,
+                bind_vars={
+                    "ancestor_id": ancestor_id,
+                    "descendant_id": potential_descendant_id,
+                }
+            )
+            result = list(cursor)
+            is_descendant = len(result) > 0
+            self.logger.debug(
+                f"Circular reference check: {potential_descendant_id} is "
+                f"{'a descendant' if is_descendant else 'not a descendant'} of {ancestor_id}"
+            )
+            return is_descendant
+        except Exception as e:
+            self.logger.error(f"Failed to check descendant relationship: {e}")
+            return False
+
+    def get_record_parent_info(
+        self,
+        record_id: str,
+        transaction: Optional[TransactionDatabase] = None
+    ) -> Optional[Dict]:
+        """
+        Get the current parent information for a record.
+
+        Args:
+            record_id: The record key
+            transaction: Optional transaction
+
+        Returns:
+            Dict with parentId, parentType ('record' or 'recordGroup'), or None if at root
+        """
+        query = """
+        LET record_doc_id = CONCAT("records/", @record_id)
+
+        // Find the incoming PARENT_CHILD edge
+        LET parent_edge = FIRST(
+            FOR edge IN recordRelations
+                FILTER edge._to == record_doc_id
+                FILTER edge.relationshipType == "PARENT_CHILD"
+                RETURN edge
+        )
+
+        LET parent_id = parent_edge != null ? PARSE_IDENTIFIER(parent_edge._from).key : null
+        LET parent_collection = parent_edge != null ? PARSE_IDENTIFIER(parent_edge._from).collection : null
+        LET parent_type = parent_collection == "recordGroups" ? "recordGroup" : (
+            parent_collection == "records" ? "record" : null
+        )
+
+        RETURN parent_id != null ? {
+            parentId: parent_id,
+            parentType: parent_type,
+            edgeKey: parent_edge._key
+        } : null
+        """
+        try:
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(query, bind_vars={"record_id": record_id})
+            result = next(cursor, None)
+            return result if result else None
+        except Exception as e:
+            self.logger.error(f"Failed to get record parent info: {e}")
+            return None
+
+    def delete_parent_child_edge_to_record(
+        self,
+        record_id: str,
+        transaction: Optional[TransactionDatabase] = None
+    ) -> int:
+        """
+        Delete all PARENT_CHILD edges pointing to a record.
+
+        Args:
+            record_id: The record key (target of the edge)
+            transaction: Optional transaction
+
+        Returns:
+            int: Number of edges deleted
+        """
+        query = """
+        LET record_doc_id = CONCAT("records/", @record_id)
+
+        FOR edge IN recordRelations
+            FILTER edge._to == record_doc_id
+            FILTER edge.relationshipType == "PARENT_CHILD"
+            REMOVE edge IN recordRelations
+            RETURN OLD
+        """
+        try:
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(query, bind_vars={"record_id": record_id})
+            result = list(cursor)
+            deleted_count = len(result)
+            self.logger.debug(f"Deleted {deleted_count} PARENT_CHILD edge(s) to record {record_id}")
+            return deleted_count
+        except Exception as e:
+            self.logger.error(f"Failed to delete parent-child edge: {e}")
+            if transaction:
+                raise
+            return 0
+
+    def create_parent_child_edge(
+        self,
+        parent_id: str,
+        child_id: str,
+        parent_is_kb: bool,
+        transaction: Optional[TransactionDatabase] = None
+    ) -> bool:
+        """
+        Create a PARENT_CHILD edge from parent to child.
+
+        Args:
+            parent_id: The parent key (folder or KB)
+            child_id: The child key (record being moved)
+            parent_is_kb: True if parent is a KB (recordGroups), False if folder (records)
+            transaction: Optional transaction
+
+        Returns:
+            bool: True if edge created successfully
+        """
+        parent_collection = "recordGroups" if parent_is_kb else "records"
+        timestamp = get_epoch_timestamp_in_ms()
+
+        query = """
+        INSERT {
+            _from: CONCAT(@parent_collection, "/", @parent_id),
+            _to: CONCAT("records/", @child_id),
+            relationshipType: "PARENT_CHILD",
+            createdAtTimestamp: @timestamp,
+            updatedAtTimestamp: @timestamp
+        } INTO recordRelations
+        RETURN NEW
+        """
+        try:
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(
+                query,
+                bind_vars={
+                    "parent_collection": parent_collection,
+                    "parent_id": parent_id,
+                    "child_id": child_id,
+                    "timestamp": timestamp,
+                }
+            )
+            result = list(cursor)
+            success = len(result) > 0
+            if success:
+                self.logger.debug(
+                    f"Created PARENT_CHILD edge: {parent_collection}/{parent_id} -> records/{child_id}"
+                )
+            return success
+        except Exception as e:
+            self.logger.error(f"Failed to create parent-child edge: {e}")
+            if transaction:
+                raise
+            return False
+
+    def update_record_external_parent_id(
+        self,
+        record_id: str,
+        new_parent_id: str,
+        transaction: Optional[TransactionDatabase] = None
+    ) -> bool:
+        """
+        Update the externalParentId field of a record.
+
+        Args:
+            record_id: The record key
+            new_parent_id: The new parent ID (folder ID or KB ID)
+            transaction: Optional transaction
+
+        Returns:
+            bool: True if updated successfully
+        """
+        timestamp = get_epoch_timestamp_in_ms()
+        query = """
+        UPDATE { _key: @record_id } WITH {
+            externalParentId: @new_parent_id,
+            updatedAtTimestamp: @timestamp
+        } IN records
+        RETURN NEW
+        """
+        try:
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(
+                query,
+                bind_vars={
+                    "record_id": record_id,
+                    "new_parent_id": new_parent_id,
+                    "timestamp": timestamp,
+                }
+            )
+            result = list(cursor)
+            success = len(result) > 0
+            if success:
+                self.logger.debug(f"Updated externalParentId for record {record_id} to {new_parent_id}")
+            return success
+        except Exception as e:
+            self.logger.error(f"Failed to update record externalParentId: {e}")
+            if transaction:
+                raise
+            return False
+
+    def is_record_folder(
+        self,
+        record_id: str,
+        transaction: Optional[TransactionDatabase] = None
+    ) -> bool:
+        """
+        Check if a record is a folder (isFile=false in FILES collection).
+
+        Args:
+            record_id: The record key
+            transaction: Optional transaction
+
+        Returns:
+            bool: True if the record is a folder
+        """
+        query = """
+        LET record = DOCUMENT("records", @record_id)
+        FILTER record != null
+
+        LET file_info = FIRST(
+            FOR edge IN isOfType
+                FILTER edge._from == record._id
+                LET f = DOCUMENT(edge._to)
+                FILTER f != null AND f.isFile == false
+                RETURN true
+        )
+
+        RETURN file_info == true
+        """
+        try:
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(query, bind_vars={"record_id": record_id})
+            result = next(cursor, None)
+            return result if result else False
+        except Exception as e:
+            self.logger.error(f"Failed to check if record is folder: {e}")
+            return False

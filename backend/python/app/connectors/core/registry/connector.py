@@ -9,148 +9,8 @@ from app.connectors.core.registry.connector_builder import (
     ConnectorBuilder,
     ConnectorScope,
     DocumentationLink,
+    SyncStrategy,
 )
-
-
-@ConnectorBuilder("Drive")\
-    .in_group("Google Workspace")\
-    .with_description("Sync files and folders from Google Drive")\
-    .with_categories(["Storage"])\
-    .with_scopes([ConnectorScope.TEAM.value])\
-    .with_auth([
-        AuthBuilder.type(AuthType.OAUTH).oauth(
-            connector_name="Drive",
-            authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
-            token_url="https://oauth2.googleapis.com/token",
-            redirect_uri="connectors/oauth/callback/Drive",
-            scopes=OAuthScopeConfig(
-                personal_sync=[],
-                team_sync=[
-                    "https://www.googleapis.com/auth/drive.readonly",
-                    "https://www.googleapis.com/auth/drive.metadata.readonly",
-                    "https://www.googleapis.com/auth/drive.metadata",
-                    "https://www.googleapis.com/auth/documents.readonly",
-                    "https://www.googleapis.com/auth/spreadsheets.readonly",
-                    "https://www.googleapis.com/auth/presentations.readonly",
-                    "https://www.googleapis.com/auth/drive.file",
-                    "https://www.googleapis.com/auth/drive",
-                ],
-                agent=[]
-            ),
-            fields=[
-                CommonFields.client_id("Google Cloud Console"),
-                CommonFields.client_secret("Google Cloud Console")
-            ],
-            icon_path="/assets/icons/connectors/drive.svg",
-            app_group="Google Workspace",
-            app_description="OAuth application for accessing Google Drive API and related Google Workspace services",
-            app_categories=["Storage"],
-            additional_params={
-                "access_type": "offline",
-                "prompt": "consent",
-                "include_granted_scopes": "true"
-            }
-        )
-    ])\
-    .configure(lambda builder: builder
-        .with_icon("/assets/icons/connectors/drive.svg")
-        .with_realtime_support(True)
-        .add_documentation_link(DocumentationLink(
-            "Google Drive API Setup",
-            "https://developers.google.com/workspace/guides/auth-overview",
-            "setup"
-        ))
-        .add_documentation_link(DocumentationLink(
-            'Pipeshub Documentation',
-            'https://docs.pipeshub.com/connectors/google-workspace/drive/drive',
-            'pipeshub'
-        ))
-        .with_webhook_config(True, ["file.created", "file.modified", "file.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
-        .with_scheduled_config(True, 60)
-        .add_sync_custom_field(CommonFields.batch_size_field())
-        .with_sync_support(True)
-        .with_agent_support(True)
-    )\
-    .build_decorator()
-class GoogleDriveConnector:
-    """Google Drive connector built with the builder pattern"""
-
-    def __init__(self) -> None:
-        self.name = "Drive"
-
-    def connect(self) -> bool:
-        """Connect to Google Drive"""
-        print(f"Connecting to {self.name}")
-        return True
-
-
-@ConnectorBuilder("Gmail")\
-    .in_group("Google Workspace")\
-    .with_description("Sync emails and messages from Gmail")\
-    .with_categories(["Email"])\
-    .with_scopes([ConnectorScope.TEAM.value])\
-    .with_auth([
-        AuthBuilder.type(AuthType.OAUTH).oauth(
-            connector_name="Gmail",
-            authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
-            token_url="https://oauth2.googleapis.com/token",
-            redirect_uri="connectors/oauth/callback/Gmail",
-            scopes=OAuthScopeConfig(
-                personal_sync=[],
-                team_sync=[
-                    'https://www.googleapis.com/auth/gmail.readonly',
-                    "https://www.googleapis.com/auth/documents.readonly",
-                    "https://www.googleapis.com/auth/spreadsheets.readonly",
-                    "https://www.googleapis.com/auth/presentations.readonly",
-                ],
-                agent=[]
-            ),
-            fields=[
-                CommonFields.client_id("Google Cloud Console"),
-                CommonFields.client_secret("Google Cloud Console")
-            ],
-            icon_path="/assets/icons/connectors/gmail.svg",
-            app_group="Google Workspace",
-            app_description="OAuth application for accessing Gmail API and Google Workspace services",
-            app_categories=["Email"],
-            additional_params={
-                "access_type": "offline",
-                "prompt": "consent",
-                "include_granted_scopes": "true"
-            }
-        )
-    ])\
-    .configure(lambda builder: builder
-        .with_icon("/assets/icons/connectors/gmail.svg")
-        .with_realtime_support(True)
-        .add_documentation_link(DocumentationLink(
-            "Gmail API Setup",
-            "https://developers.google.com/workspace/guides/auth-overview",
-            "setup"
-        ))
-        .add_documentation_link(DocumentationLink(
-            'Pipeshub Documentation',
-            'https://docs.pipeshub.com/connectors/google-workspace/gmail/gmail',
-            'pipeshub'
-        ))
-        .with_webhook_config(True, ["message.created", "message.modified", "message.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
-        .with_scheduled_config(True, 60)
-        .with_sync_support(True)
-        .with_agent_support(True)
-    )\
-    .build_decorator()
-class GmailConnector:
-    """Gmail connector built with the builder pattern"""
-
-    def __init__(self) -> None:
-        self.name = "Gmail"
-
-    def connect(self) -> bool:
-        """Connect to Gmail"""
-        print(f"Connecting to {self.name}")
-        return True
 
 
 @ConnectorBuilder("Slack")\
@@ -183,7 +43,7 @@ class GmailConnector:
             'https://docs.pipeshub.com/connectors/slack/slack',
             'pipeshub'
         ))
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -199,56 +59,6 @@ class SlackConnector:
         """Connect to Slack"""
         print(f"Connecting to {self.name}")
         return True
-
-
-@ConnectorBuilder("Notion")\
-    .in_group("Notion")\
-    .with_description("Sync messages and channels from Notion")\
-    .with_categories(["Messaging"])\
-    .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])\
-    .with_auth([
-        AuthBuilder.type(AuthType.API_TOKEN).fields([
-            AuthField(
-                name="apiToken",
-                display_name="Api Token",
-                placeholder="ntn-...",
-                description="The Access Token from Notion App settings",
-                field_type="PASSWORD",
-                max_length=8000,
-                is_secret=True
-            )
-        ])
-    ])\
-    .configure(lambda builder: builder
-        .with_icon("/assets/icons/connectors/notion.svg")
-        .add_documentation_link(DocumentationLink(
-            "Notion Bot Token Setup",
-            "https://api.notion.com/authentication/basics",
-            "setup"
-        ))
-        .add_documentation_link(DocumentationLink(
-            'Pipeshub Documentation',
-            'https://docs.pipeshub.com/connectors/notion/notion',
-            'pipeshub'
-        ))
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
-        .with_scheduled_config(True, 60)
-        .with_sync_support(False)
-        .with_agent_support(True)
-    )\
-    .build_decorator()
-class  NotionConnector:
-    """Notion connector built with the builder pattern"""
-
-    def __init__(self) -> None:
-        self.name = "Notion"
-
-    def connect(self) -> bool:
-        """Connect to Notion"""
-        print(f"Connecting to {self.name}")
-        return True
-
-
 
 @ConnectorBuilder("Calendar")\
     .in_group("Google Workspace")\
@@ -303,7 +113,7 @@ class  NotionConnector:
             'pipeshub'
         ))
         .with_webhook_config(True, ["event.created", "event.modified", "event.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -378,7 +188,7 @@ class CalendarConnector:
             'pipeshub'
         ))
         .with_webhook_config(True, ["space.created", "space.modified", "space.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -453,7 +263,7 @@ class MeetConnector:
             'pipeshub'
         ))
         .with_webhook_config(True, ["document.created", "document.modified", "document.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -519,7 +329,7 @@ class DocsConnector:
             'pipeshub'
         ))
         .with_webhook_config(True, ["sheet.created", "sheet.modified", "sheet.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -595,7 +405,7 @@ class SheetsConnector:
             'pipeshub'
         ))
         .with_webhook_config(True, ["form.created", "form.modified", "form.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -667,7 +477,7 @@ class FormsConnector:
             'pipeshub'
         ))
         .with_webhook_config(True, ["slide.created", "slide.modified", "slide.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -715,7 +525,7 @@ class SlidesConnector:
             'https://docs.pipeshub.com/connectors/airtable/airtable',
             'pipeshub'
         ))
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -729,86 +539,6 @@ class AirtableConnector:
 
     def connect(self) -> bool:
         """Connect to Airtable"""
-        print(f"Connecting to {self.name}")
-        return True
-
-
-@ConnectorBuilder("Azure Blob")\
-    .in_group("Azure")\
-    .with_description("Sync files and folders from Azure Blob Storage")\
-    .with_categories(["Storage"])\
-    .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])\
-    .with_auth([
-        AuthBuilder.type(AuthType.ACCOUNT_KEY).fields([
-            AuthField(
-                name="accountName",
-                display_name="Account Name",
-                placeholder="mystorageaccount",
-                description="The Account Name from Azure Blob Storage App settings",
-                field_type="TEXT",
-                max_length=2000
-            ),
-            AuthField(
-                name="accountKey",
-                display_name="Account Key",
-                placeholder="Your account key",
-                description="The Account Key from Azure Blob Storage App settings",
-                field_type="PASSWORD",
-                max_length=2000,
-                is_secret=True
-            ),
-            AuthField(
-                name="containerName",
-                display_name="Container Name",
-                placeholder="my-container",
-                description="The Container Name from Azure Blob Storage App settings",
-                field_type="TEXT",
-                max_length=2000
-            ),
-            AuthField(
-                name="endpointProtocol",
-                display_name="Endpoint Protocol",
-                placeholder="https",
-                description="The Endpoint Protocol from Azure Blob Storage App settings",
-                field_type="TEXT",
-                max_length=2000
-            ),
-            AuthField(
-                name="endpointSuffix",
-                display_name="Endpoint Suffix",
-                placeholder="core.windows.net",
-                description="The Endpoint Suffix from Azure Blob Storage App settings",
-                field_type="TEXT",
-                max_length=2000
-            )
-        ])
-    ])\
-    .configure(lambda builder: builder
-        .with_icon("/assets/icons/connectors/azureblob.svg")
-        .add_documentation_link(DocumentationLink(
-            "Azure Blob Storage Connection String Setup",
-            "https://learn.microsoft.com/en-us/azure/storage/blobs/storage-quickstart-blobs-portal",
-            "setup"
-        ))
-        .add_documentation_link(DocumentationLink(
-            'Pipeshub Documentation',
-            'https://docs.pipeshub.com/connectors/azure/azureblob',
-            'pipeshub'
-        ))
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
-        .with_scheduled_config(True, 60)
-        .with_sync_support(False)
-        .with_agent_support(True)
-    )\
-    .build_decorator()
-class AzureBlobConnector:
-    """Azure Blob connector built with the builder pattern"""
-
-    def __init__(self) -> None:
-        self.name = "Azure Blob"
-
-    def connect(self) -> bool:
-        """Connect to Azure Blob"""
         print(f"Connecting to {self.name}")
         return True
 
@@ -843,7 +573,7 @@ class AzureBlobConnector:
             'https://docs.pipeshub.com/connectors/linear/linear',
             'pipeshub'
         ))
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)
@@ -906,7 +636,7 @@ class LinearConnector:
             'https://docs.pipeshub.com/connectors/zendesk/zendesk',
             'pipeshub'
         ))
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(False)
         .with_agent_support(True)

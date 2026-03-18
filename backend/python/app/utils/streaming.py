@@ -19,6 +19,7 @@ import aiohttp
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_anthropic import ChatAnthropic
+from langchain_aws import ChatBedrock
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.output_parsers import PydanticOutputParser
@@ -28,6 +29,11 @@ from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from pydantic import BaseModel
 
 from app.config.constants.http_status_code import HttpStatusCode
+from app.modules.agents.qna.schemas import (
+    AgentAnswerWithMetadataDict,
+    AgentAnswerWithMetadataJSON,
+)
+from app.modules.parsers.excel.prompt_template import RowDescriptions
 from app.modules.qna.prompt_templates import (
     AnswerWithMetadataDict,
     AnswerWithMetadataJSON,
@@ -94,10 +100,24 @@ def supports_human_message_after_tool(llm: BaseChatModel) -> bool:
     return True
 
 
-# Create a logger for this module
-parser = PydanticOutputParser(pydantic_object=AnswerWithMetadataJSON)
-format_instructions = parser.get_format_instructions()
+def _get_schema_for_structured_output(is_agent: bool = False) -> Union[Type[AgentAnswerWithMetadataDict], Type[AnswerWithMetadataDict]]:
+    """Get the appropriate TypedDict schema for structured output."""
+    if is_agent:
+        return AgentAnswerWithMetadataDict
+    return AnswerWithMetadataDict
 
+
+def _get_schema_for_parsing(is_agent: bool = False) -> Union[Type[AgentAnswerWithMetadataJSON], Type[AnswerWithMetadataJSON]]:
+    """Get the appropriate Pydantic BaseModel schema for parsing."""
+    if is_agent:
+        return AgentAnswerWithMetadataJSON
+    return AnswerWithMetadataJSON
+
+
+def get_parser(schema: Type[BaseModel] = AnswerWithMetadataJSON) -> Tuple[PydanticOutputParser, str]:
+    parser = PydanticOutputParser(pydantic_object=schema)
+    format_instructions = parser.get_format_instructions()
+    return parser, format_instructions
 
 
 async def stream_content(signed_url: str, record_id: Optional[str] = None, file_name: Optional[str] = None) -> AsyncGenerator[bytes, None]:
@@ -337,11 +357,11 @@ async def aiter_llm_stream(llm, messages,parts=None) -> AsyncGenerator[str | dic
 
 # Configuration for Qdrant limits based on context length.
 VECTOR_DB_LIMIT_TIERS = [
-    (17000, 65),  # For context lengths up to 17k
-    (33000, 231),  # For context lengths up to 33k
-    (65000, 320),  # For context lengths up to 65k
+    (17000, 43),  # For context lengths up to 17k
+    (33000, 154),  # For context lengths up to 33k
+    (65000, 213),  # For context lengths up to 65k
 ]
-DEFAULT_VECTOR_DB_LIMIT = 400
+DEFAULT_VECTOR_DB_LIMIT = 266
 
 def get_vectorDb_limit(context_length: int) -> int:
     """Determines the vector db search limit based on the LLM's context length."""
@@ -366,19 +386,26 @@ async def execute_tool_calls(
     target_words_per_chunk: int = 1,
     is_multimodal_llm: Optional[bool] = False,
     max_hops: int = 1,
+    is_agent: bool = False,  # Use is_agent flag instead of schema
 ) -> AsyncGenerator[Dict[str, Any], tuple[List[Dict], bool]]:
     """
     Execute tool calls if present in the LLM response.
     Yields tool events and returns updated messages and whether tools were executed.
-    """
 
+    Args:
+        is_agent: If True, use agent schemas (with referenceData support).
+                  If False, use chatbot schemas (default).
+    """
     if not tools:
         raise ValueError("Tools are required")
+
+    # Get appropriate schema based on is_agent flag
+    schema_for_structured = _get_schema_for_structured_output(is_agent)
 
     llm_to_pass = bind_tools_for_llm(llm, tools)
     if not llm_to_pass:
         logger.warning("Failed to bind tools for LLM, so using structured output")
-        llm_to_pass = _apply_structured_output(llm,schema=AnswerWithMetadataDict)
+        llm_to_pass = _apply_structured_output(llm, schema=schema_for_structured)
 
     hops = 0
     tools_executed = False
@@ -389,7 +416,16 @@ async def execute_tool_calls(
         try:
             # Measure LLM invocation latency
             ai = None
-            async for event in call_aiter_llm_stream(llm_to_pass, messages, final_results, records=[], target_words_per_chunk=target_words_per_chunk, original_llm=llm):
+
+            async for event in call_aiter_llm_stream(
+                llm_to_pass,
+                messages,
+                final_results,
+                records=[],
+                target_words_per_chunk=target_words_per_chunk,
+                original_llm=llm,
+                is_agent=is_agent  # Pass is_agent flag
+            ):
                 if event.get("event") == "complete" or event.get("event") == "error":
                     yield event
                     return
@@ -656,12 +692,16 @@ async def stream_llm_response(
     logger,
     target_words_per_chunk: int = 1,
     mode: Optional[str] = "json",
+    virtual_record_id_to_result: Optional[Dict[str, Dict[str, Any]]] = None,
+    records: Optional[List[Dict[str, Any]]] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     Incrementally stream the answer portion of an LLM response.
     For each chunk we also emit the citations visible so far.
     Supports both JSON mode (with structured output) and simple mode (direct streaming).
     """
+    if records is None:
+        records = []
 
     if mode == "json":
         # Original streaming logic for the final answer
@@ -700,7 +740,8 @@ async def stream_llm_response(
                     reason = None
                     confidence = None
 
-                    normalized, cites = normalize_citations_and_chunks_for_agent(final_answer, final_results)
+                # Always normalize citations - don't use LLM-generated citations
+                normalized, cites = normalize_citations_and_chunks_for_agent(final_answer, final_results, virtual_record_id_to_result, records)
 
                 words = re.findall(r'\S+', normalized)
                 for i in range(0, len(words), target_words_per_chunk):
@@ -712,7 +753,7 @@ async def stream_llm_response(
                         "data": {
                             "chunk": chunk_text,
                             "accumulated": accumulated,
-                            "citations": cites,
+                            "citations": cites,  # Use normalized citations
                         },
                     }
 
@@ -720,7 +761,7 @@ async def stream_llm_response(
                     "event": "complete",
                     "data": {
                         "answer": normalized,
-                        "citations": cites,
+                        "citations": cites,  # Use normalized citations
                         "reason": reason,
                         "confidence": confidence,
                     },
@@ -772,8 +813,16 @@ async def stream_llm_response(
                                 continue
 
                             normalized, cites = normalize_citations_and_chunks_for_agent(
-                                current_raw, final_results
+                                current_raw, final_results, virtual_record_id_to_result, records
                             )
+
+                            # CRITICAL DEBUG: Log citation generation
+                            if not cites and "[R" in current_raw:
+                                logger.warning("⚠️ CITATION BUG: Found [R markers but got 0 citations!")
+                                logger.warning(f"   - Text has markers: {bool('[R' in current_raw)}")
+                                logger.warning(f"   - final_results count: {len(final_results)}")
+                                logger.warning(f"   - virtual_record_id_to_result count: {len(virtual_record_id_to_result) if virtual_record_id_to_result else 0}")
+                                logger.warning(f"   - records count: {len(records) if records else 0}")
 
                             chunk_text = normalized[prev_norm_len:]
                             prev_norm_len = len(normalized)
@@ -792,19 +841,34 @@ async def stream_llm_response(
                 parsed = json.loads(escape_ctl(full_json_buf))
                 final_answer = parsed.get("answer", answer_buf)
 
-                normalized, c = normalize_citations_and_chunks_for_agent(final_answer, final_results)
-                yield {
-                    "event": "complete",
-                    "data": {
+                normalized, c = normalize_citations_and_chunks_for_agent(final_answer, final_results, virtual_record_id_to_result, records)
+
+                # CRITICAL DEBUG: Log final citation count
+                logger.info("📊 CITATION DEBUG - Final complete event:")
+                logger.info(f"   - Answer has [R markers: {bool('[R' in final_answer)}")
+                logger.info(f"   - Citations generated: {len(c)}")
+                if not c and "[R" in final_answer:
+                    logger.error("⚠️ CITATION BUG: Answer has [R markers but NO citations created!")
+                    logger.error(f"   - final_results: {len(final_results)}")
+                    logger.error(f"   - virtual_record_id_to_result: {len(virtual_record_id_to_result) if virtual_record_id_to_result else 0}")
+                    logger.error(f"   - records: {len(records) if records else 0}")
+
+                complete_data = {
                         "answer": normalized,
-                        "citations": c,
+                        "citations": c,  # Use normalized citations
                         "reason": parsed.get("reason"),
                         "confidence": parsed.get("confidence"),
-                    },
+                    }
+                # Include referenceData if present (IDs for follow-up queries)
+                if parsed.get("referenceData"):
+                    complete_data["referenceData"] = parsed.get("referenceData")
+                yield {
+                    "event": "complete",
+                    "data": complete_data,
                 }
             except Exception:
                 # Fallback if JSON parsing fails
-                normalized, c = normalize_citations_and_chunks_for_agent(answer_buf, final_results)
+                normalized, c = normalize_citations_and_chunks_for_agent(answer_buf, final_results, virtual_record_id_to_result, records)
                 yield {
                     "event": "complete",
                     "data": {
@@ -844,7 +908,7 @@ async def stream_llm_response(
 
             if existing_ai_content:
                 logger.info("stream_llm_response: detected existing AI message (simple mode), streaming directly")
-                normalized, cites = normalize_citations_and_chunks_for_agent(existing_ai_content, final_results)
+                normalized, cites = normalize_citations_and_chunks_for_agent(existing_ai_content, final_results, virtual_record_id_to_result, records)
 
                 words = re.findall(r'\S+', normalized)
                 for i in range(0, len(words), target_words_per_chunk):
@@ -897,7 +961,7 @@ async def stream_llm_response(
                             continue
 
                         normalized, cites = normalize_citations_and_chunks_for_agent(
-                            current_raw, final_results
+                            current_raw, final_results, virtual_record_id_to_result, records
                         )
 
                         chunk_text = normalized[prev_norm_len:]
@@ -913,7 +977,7 @@ async def stream_llm_response(
                         }
 
             # Final normalization and emit complete
-            normalized, cites = normalize_citations_and_chunks_for_agent(content_buf, final_results)
+            normalized, cites = normalize_citations_and_chunks_for_agent(content_buf, final_results, virtual_record_id_to_result, records)
             yield {
                 "event": "complete",
                 "data": {
@@ -974,10 +1038,18 @@ async def handle_json_mode(
     records: List[Dict[str, Any]],
     logger: logging.Logger,
     target_words_per_chunk: int = 1,
+    is_agent: bool = False,  # Use is_agent flag instead of schema
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     Handle JSON mode streaming.
+
+    Args:
+        is_agent: If True, use agent schemas (with referenceData support).
+                  If False, use chatbot schemas (default).
     """
+    # Get appropriate schemas based on is_agent flag
+    schema_for_structured = _get_schema_for_structured_output(is_agent)
+
     # Fast-path: if the last message is already an AI answer (e.g., from invalid tool call conversion), stream it directly
     try:
         last_msg = messages[-1] if messages else None
@@ -996,10 +1068,12 @@ async def handle_json_mode(
                 final_answer = parsed.get("answer", existing_ai_content)
                 reason = parsed.get("reason")
                 confidence = parsed.get("confidence")
+                reference_data = parsed.get("referenceData", None)  # Extract referenceData if present
             except Exception:
                 final_answer = existing_ai_content
                 reason = None
                 confidence = None
+                reference_data = None
 
             normalized, cites = normalize_citations_and_chunks(final_answer, final_results, records)
 
@@ -1017,14 +1091,18 @@ async def handle_json_mode(
                     },
                 }
 
+            complete_data = {
+                "answer": normalized,
+                "citations": cites,
+                "reason": reason,
+                "confidence": confidence,
+            }
+            # Include referenceData if present (for agent responses)
+            if reference_data:
+                complete_data["referenceData"] = reference_data
             yield {
                 "event": "complete",
-                "data": {
-                    "answer": normalized,
-                    "citations": cites,
-                    "reason": reason,
-                    "confidence": confidence,
-                },
+                "data": complete_data,
             }
             return
     except Exception as e:
@@ -1033,10 +1111,17 @@ async def handle_json_mode(
 
 
     try:
-        logger.debug("handle_json_mode: Starting LLM stream")
-        llm_with_structured_output = _apply_structured_output(llm,schema=AnswerWithMetadataDict)
+        logger.debug("handle_json_mode: Starting LLM stream with is_agent=%s", is_agent)
+        llm_with_structured_output = _apply_structured_output(llm, schema=schema_for_structured)
 
-        async for token in call_aiter_llm_stream(llm_with_structured_output, messages,final_results,records,target_words_per_chunk):
+        async for token in call_aiter_llm_stream(
+            llm_with_structured_output,
+            messages,
+            final_results,
+            records,
+            target_words_per_chunk,
+            is_agent=is_agent  # Pass is_agent flag
+        ):
             yield token
     except Exception as exc:
         yield {
@@ -1051,6 +1136,7 @@ async def handle_simple_mode(
     records: List[Dict[str, Any]],
     logger: logging.Logger,
     target_words_per_chunk: int = 1,
+    virtual_record_id_to_result: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     # Simple mode: stream content directly without JSON parsing
         logger.debug("stream_llm_response_with_tools: simple mode - streaming raw content")
@@ -1130,7 +1216,7 @@ async def handle_simple_mode(
                             continue
 
                         normalized, cites = normalize_citations_and_chunks_for_agent(
-                            current_raw, final_results
+                            current_raw, final_results, virtual_record_id_to_result, records
                         )
 
                         chunk_text = normalized[prev_norm_len:]
@@ -1146,7 +1232,7 @@ async def handle_simple_mode(
                         }
 
             # Final normalization and emit complete
-            normalized, cites = normalize_citations_and_chunks_for_agent(content_buf, final_results)
+            normalized, cites = normalize_citations_and_chunks_for_agent(content_buf, final_results, virtual_record_id_to_result, records)
             yield {
                 "event": "complete",
                 "data": {
@@ -1179,22 +1265,27 @@ async def stream_llm_response_with_tools(
     tool_runtime_kwargs: Optional[Dict[str, Any]] = None,
     target_words_per_chunk: int = 1,
     mode: Optional[str] = "json",
-
+    is_agent: bool = False,  # Use is_agent flag instead of schema
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     Enhanced streaming with tool support.
     Incrementally stream the answer portion of an LLM JSON response.
     For each chunk we also emit the citations visible so far.
     Now supports tool calls before generating the final answer.
+
+    Args:
+        is_agent: If True, use agent schemas (with referenceData support).
+                  If False, use chatbot schemas (default).
     """
     logger.info(
-        "stream_llm_response_with_tools: START | messages=%d tools=%s target_words_per_chunk=%d mode=%s user_id=%s org_id=%s",
+        "stream_llm_response_with_tools: START | messages=%d tools=%s target_words_per_chunk=%d mode=%s user_id=%s org_id=%s is_agent=%s",
         len(messages) if isinstance(messages, list) else -1,
         bool(tools),
         target_words_per_chunk,
         mode,
         user_id,
         org_id,
+        is_agent,
     )
     records = []
 
@@ -1225,7 +1316,8 @@ async def stream_llm_response_with_tools(
                 user_id=user_id,
                 org_id=org_id,
                 context_length=context_length,
-                is_multimodal_llm=is_multimodal_llm
+                is_multimodal_llm=is_multimodal_llm,
+                is_agent=is_agent  # Pass is_agent flag through to execute_tool_calls
             ):
 
                 if tool_event.get("event") == "tool_execution_complete":
@@ -1281,10 +1373,18 @@ async def stream_llm_response_with_tools(
     # Stream the final answer with comprehensive error handling
     try:
         if mode == "json":
-            async for event in handle_json_mode(llm, messages, final_results, records, logger, target_words_per_chunk):
+            async for event in handle_json_mode(
+                llm,
+                messages,
+                final_results,
+                records,
+                logger,
+                target_words_per_chunk,
+                is_agent=is_agent  # Pass is_agent flag
+            ):
                 yield event
         else:
-            async for event in handle_simple_mode(llm, messages, final_results, records, logger, target_words_per_chunk):
+            async for event in handle_simple_mode(llm, messages, final_results, records, logger, target_words_per_chunk, virtual_record_id_to_result):
                 yield event
 
         logger.info("stream_llm_response_with_tools: COMPLETE | Successfully completed streaming")
@@ -1328,8 +1428,17 @@ async def call_aiter_llm_stream(
     reflection_retry_count=0,
     max_reflection_retries=MAX_REFLECTION_RETRIES_DEFAULT,
     original_llm=None,
+    is_agent: bool = False,  # Use is_agent flag instead of schema
 ) -> AsyncGenerator[Dict[str, Any], None]:
-    """Stream LLM response and parse answer field from JSON, emitting chunks and final event."""
+    """Stream LLM response and parse answer field from JSON, emitting chunks and final event.
+
+    Args:
+        is_agent: If True, use agent schemas (with referenceData support).
+                  If False, use chatbot schemas (default).
+    """
+    # Get appropriate schema based on is_agent flag
+    schema = _get_schema_for_parsing(is_agent)
+
     state = AnswerParserState()
     answer_key_re, cite_block_re, incomplete_cite_re, word_iter = _initialize_answer_parser_regex()
 
@@ -1351,6 +1460,10 @@ async def call_aiter_llm_stream(
                 # Only process if we have new content beyond what we've already emitted
                 if len(safe_answer) <= state.emit_upto:
                     # Nothing safe to emit yet, wait for more content
+                    yield {
+                        "event": "metadata",
+                        "data": {},
+                    }
                     continue
 
                 state.emit_upto = len(safe_answer)
@@ -1470,11 +1583,14 @@ async def call_aiter_llm_stream(
         if  isinstance(response_text, str):
             response_text = cleanup_content(response_text)
 
+        parser, format_instructions = get_parser(schema)
+
         try:
             if isinstance(response_text, str):
                 parsed = parser.parse(response_text)
             else:
-                parsed = AnswerWithMetadataJSON.model_validate(response_text)
+                # Response is already a dict/Pydantic model
+                parsed = schema.model_validate(response_text)
         except Exception as e:
             # JSON parsing failed - use reflection to guide the LLM
             if reflection_retry_count < max_reflection_retries:
@@ -1504,7 +1620,8 @@ async def call_aiter_llm_stream(
                 updated_messages.append(reflection_message)
 
                 if original_llm:
-                    llm = _apply_structured_output(original_llm,schema=AnswerWithMetadataDict)
+                    schema_for_structured = _get_schema_for_structured_output(is_agent)
+                    llm = _apply_structured_output(original_llm, schema=schema_for_structured)
                 async for event in call_aiter_llm_stream(
                     llm,
                     updated_messages,
@@ -1514,6 +1631,7 @@ async def call_aiter_llm_stream(
                     reflection_retry_count + 1,
                     max_reflection_retries,
                     original_llm=original_llm,
+                    is_agent=is_agent,  # Pass is_agent flag through
                 ):
                     yield event
                 return
@@ -1546,14 +1664,18 @@ async def call_aiter_llm_stream(
 
         final_answer = parsed.answer if parsed.answer else state.answer_buf
         normalized, c = normalize_citations_and_chunks(final_answer, final_results, records)
+        complete_data = {
+            "answer": normalized,
+            "citations": c,
+            "reason": parsed.reason,
+            "confidence": parsed.confidence,
+        }
+        # Include referenceData if present (IDs for follow-up queries)
+        if hasattr(parsed, 'referenceData') and parsed.referenceData:
+            complete_data["referenceData"] = parsed.referenceData
         yield {
             "event": "complete",
-            "data": {
-                "answer": normalized,
-                "citations": c,
-                "reason": parsed.reason,
-                "confidence": parsed.confidence,
-            },
+            "data": complete_data,
         }
     except Exception as e:
         logger.error("Error in call_aiter_llm_stream", exc_info=True)
@@ -1571,7 +1693,7 @@ def bind_tools_for_llm(llm, tools: List[object]) -> BaseChatModel|bool:
         return False
 
 def _apply_structured_output(llm: BaseChatModel,schema) -> BaseChatModel:
-    if isinstance(llm, (ChatGoogleGenerativeAI,ChatAnthropic,ChatOpenAI,ChatMistralAI,AzureChatOpenAI)):
+    if isinstance(llm, (ChatGoogleGenerativeAI,ChatAnthropic,ChatOpenAI,ChatMistralAI,AzureChatOpenAI,ChatBedrock)):
 
         additional_kwargs = {}
         if isinstance(llm, ChatAnthropic):
@@ -1586,7 +1708,8 @@ def _apply_structured_output(llm: BaseChatModel,schema) -> BaseChatModel:
 
             additional_kwargs["stream"] = True
 
-        additional_kwargs["method"] = "json_schema"
+        if not isinstance(llm, ChatBedrock):
+            additional_kwargs["method"] = "json_schema"
 
         try:
             model_with_structure = llm.with_structured_output(
@@ -1732,4 +1855,101 @@ Respond only with valid JSON that matches the schema."""
                     reflection_messages.append(HumanMessage(content=f"Still incorrect. Error: {str(reflection_error)}. Please try again."))
 
         logger.error("All reflection attempts failed")
+        return None
+
+
+async def invoke_with_row_descriptions_and_reflection(
+    llm: BaseChatModel,
+    messages: List,
+    expected_count: int,
+    max_retries: int = MAX_REFLECTION_RETRIES_DEFAULT,
+) -> Optional[RowDescriptions]:
+    """
+    Invoke LLM with row description output and validate count matches expected.
+
+    If the LLM returns an incorrect number of descriptions, performs reflection
+    to give it one chance to correct the count mismatch.
+
+    Args:
+        llm: The LangChain chat model to use
+        messages: List of messages to send to the LLM
+        expected_count: Expected number of row descriptions
+        max_retries: Maximum number of reflection retries on parse failure (default: 2)
+
+    Returns:
+        Validated RowDescriptions instance with correct count, or None if validation fails
+    """
+    # First, try to get a parsed response using the standard reflection function
+    parsed_response = await invoke_with_structured_output_and_reflection(
+        llm, messages, RowDescriptions, max_retries
+    )
+
+    if parsed_response is None:
+        logger.warning("Failed to parse RowDescriptions after initial attempts")
+        return None
+
+    # Validate the count matches expected
+    actual_count = len(parsed_response.descriptions)
+
+    if actual_count == expected_count:
+        logger.debug(f"Row count validation passed: {actual_count} descriptions")
+        return parsed_response
+
+    # Count mismatch detected - perform reflection to correct it
+    logger.warning(
+        f"Row count mismatch: LLM returned {actual_count} descriptions "
+        f"but {expected_count} were expected. Attempting reflection..."
+    )
+
+    # Build reflection messages
+    reflection_messages = list(messages)
+    reflection_messages.append(
+        AIMessage(content=json.dumps(parsed_response.model_dump()))
+    )
+
+    reflection_prompt = f"""Your previous response contained {actual_count} descriptions, but exactly {expected_count} descriptions are required.
+
+CRITICAL: You must provide EXACTLY {expected_count} descriptions - one for each row, in the same order they were provided.
+
+Please correct your response to include exactly {expected_count} descriptions. Do not skip any rows, do not combine rows, and do not split rows.
+
+Respond with a valid JSON object:
+{{
+    "descriptions": [
+        "Description for row 1",
+        "Description for row 2",
+        ...
+        "Description for row {expected_count}"
+    ]
+}}"""
+
+    reflection_messages.append(HumanMessage(content=reflection_prompt))
+
+    # Try reflection once (per user preference: 1 reflection attempt for count mismatches)
+    try:
+        reflection_response = await invoke_with_structured_output_and_reflection(
+            llm, reflection_messages, RowDescriptions, max_retries=1
+        )
+
+        if reflection_response is None:
+            logger.error("Reflection failed to parse response")
+            return None
+
+        # Validate the count again
+        reflection_count = len(reflection_response.descriptions)
+
+        if reflection_count == expected_count:
+            logger.info(
+                f"Reflection successful: corrected from {actual_count} to {reflection_count} descriptions"
+            )
+            return reflection_response
+        else:
+            logger.error(
+                f"Reflection failed: still have {reflection_count} descriptions "
+                f"instead of {expected_count}"
+            )
+            return None
+
+    except Exception as e:
+        logger.error(f"Reflection attempt failed with error: {e}")
         return None

@@ -31,6 +31,8 @@ import {
   groupConnectorInstances,
   groupToolsByConnectorType,
 } from './sidebar/index';
+import { SidebarToolsetsSection } from './sidebar/sidebar-toolsets-section';
+import { SidebarSkeleton } from '../skeleton-loader';
 
 interface FlowBuilderSidebarProps {
   sidebarOpen: boolean;
@@ -40,7 +42,11 @@ interface FlowBuilderSidebarProps {
   activeAgentConnectors: Connector[];
   configuredConnectors: Connector[];
   connectorRegistry: any[];
+  toolsets: any[]; // Pre-loaded toolsets with status
+  refreshToolsets: () => Promise<void>; // Refresh toolsets after OAuth
   isBusiness: boolean;
+  activeToolsetTypes?: string[];
+  userId?: string; // For toolsets section
 }
 
 const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
@@ -51,17 +57,19 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
   activeAgentConnectors,
   configuredConnectors,
   connectorRegistry,
+  toolsets,
+  refreshToolsets,
   isBusiness,
+  activeToolsetTypes = [],
+  userId = '',
 }) => {
   const theme = useTheme();
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedCategories, setExpandedCategories] = useState<Record<string, boolean>>({
     'Input / Output': true,
-    Agents: false,
     'LLM Models': false,
     Knowledge: false,
     Tools: true,
-    'Vector Stores': false,
   });
   const [expandedApps, setExpandedApps] = useState<Record<string, boolean>>({});
 
@@ -112,6 +120,15 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
     [filteredTemplates]
   );
 
+  // Calculate actual Knowledge count (connector instances + individual KBs, excluding group nodes)
+  const knowledgeCount = useMemo(() => {
+    const connectorInstancesCount = Object.entries(groupedConnectorInstances).reduce(
+      (acc, [_, data]) => acc + data.instances.length,
+      0
+    );
+    return connectorInstancesCount + individualKBs.length;
+  }, [groupedConnectorInstances, individualKBs]);
+
   const handleCategoryToggle = (categoryName: string) => {
     setExpandedCategories((prev) => ({
       ...prev,
@@ -146,7 +163,7 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
             c.name.toUpperCase() === appName.toUpperCase() ||
             c.name === appName
         );
-        itemIcon = connector?.iconPath || '/assets/icons/connectors/default.svg';
+        itemIcon = connector?.iconPath || '/assets/icons/connectors/collections-gray.svg';
       } else {
         if (typeof appIcon === 'string' || appIcon.toString().includes('/assets/icons/connectors/')) {
           isDynamicIcon = true;
@@ -156,7 +173,7 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
     } else if (sectionType === 'tools' && template.defaultConfig?.appName) {
       itemIcon = getToolIcon(template.type, template.defaultConfig.appName);
     } else if (sectionType === 'connectors' && template.defaultConfig?.name) {
-      itemIcon = template.defaultConfig.iconPath || '/assets/icons/connectors/default.svg';
+      itemIcon = template.defaultConfig.iconPath || '/assets/icons/connectors/collections-gray.svg';
       isDynamicIcon = true;
     }
 
@@ -164,6 +181,9 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
     if (!isDynamicIcon && typeof itemIcon === 'string') {
       isDynamicIcon = true;
     }
+
+    // Input/output nodes should not be draggable
+    const isDraggable = template.category !== 'inputs' && template.category !== 'outputs';
 
     return (
       <SidebarNodeItem
@@ -173,6 +193,7 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
         sectionType={sectionType}
         itemIcon={itemIcon}
         isDynamicIcon={isDynamicIcon}
+        isDraggable={isDraggable}
       />
     );
   };
@@ -183,11 +204,6 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
       name: 'Input / Output',
       icon: CATEGORY_ICONS.inputOutput,
       categories: ['inputs', 'outputs'],
-    },
-    {
-      name: 'Agents',
-      icon: CATEGORY_ICONS.agent,
-      categories: ['agent'],
     },
     {
       name: 'LLM Models',
@@ -204,12 +220,9 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
       icon: CATEGORY_ICONS.processing,
       categories: ['tools', 'connectors'],
     },
-    {
-      name: 'Vector Stores',
-      icon: CATEGORY_ICONS.vector,
-      categories: ['vector'],
-    },
   ];
+
+  const isDark = theme.palette.mode === 'dark';
 
   return (
     <Drawer
@@ -220,9 +233,10 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
         width: sidebarOpen ? sidebarWidth : 0,
         flexShrink: 0,
         transition: theme.transitions.create(['width'], {
-          easing: theme.transitions.easing.sharp,
-          duration: theme.transitions.duration.leavingScreen,
+          easing: theme.transitions.easing.easeInOut,
+          duration: theme.transitions.duration.standard,
         }),
+        height: '100%',
         '& .MuiDrawer-paper': {
           width: sidebarWidth,
           boxSizing: 'border-box',
@@ -235,8 +249,8 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
           overflowX: 'hidden',
           boxShadow: 'none',
           transition: theme.transitions.create(['width'], {
-            easing: theme.transitions.easing.sharp,
-            duration: theme.transitions.duration.leavingScreen,
+            easing: theme.transitions.easing.easeInOut,
+            duration: theme.transitions.duration.standard,
           }),
         },
       }}
@@ -248,18 +262,18 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
       <Box
         sx={{
           overflow: 'auto',
-          height: 'calc(100% - 140px)',
+          height: 'calc(100% - 100px)',
           minHeight: 0,
           overflowX: 'hidden',
           '&::-webkit-scrollbar': {
-            width: '4px',
+            width: '6px',
           },
           '&::-webkit-scrollbar-track': {
             background: 'transparent',
           },
           '&::-webkit-scrollbar-thumb': {
             backgroundColor: alpha(theme.palette.text.secondary, 0.2),
-            borderRadius: '8px',
+            borderRadius: '3px',
             '&:hover': {
               backgroundColor: alpha(theme.palette.text.secondary, 0.3),
             },
@@ -267,9 +281,7 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
         }}
       >
         {loading ? (
-          <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}>
-            <CircularProgress size={24} />
-          </Box>
+          <SidebarSkeleton />
         ) : (
           <Box>
             {/* Main Categories */}
@@ -294,23 +306,33 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
                       py: 1,
                       px: 2,
                       cursor: 'pointer',
+                      borderRadius: 1,
+                      mx: 1,
+                      my: 0.25,
+                      transition: 'all 0.2s ease',
                       '&:hover': {
-                        backgroundColor: alpha(theme.palette.text.secondary, 0.05),
+                        backgroundColor: theme.palette.action.hover,
                       },
                     }}
                   >
-                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, width: '100%' }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, width: '100%', position: 'relative', zIndex: 1 }}>
                       <Icon
                         icon={isExpanded ? UI_ICONS.chevronDown : UI_ICONS.chevronRight}
-                        width={16}
-                        height={16}
-                        style={{ color: theme.palette.text.secondary }}
+                        width={18}
+                        height={18}
+                        style={{ 
+                          color: theme.palette.text.secondary,
+                          transition: 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+                          transform: isExpanded ? 'rotate(0deg)' : 'rotate(0deg)',
+                        }}
                       />
                       <Icon
                         icon={config.icon}
                         width={16}
                         height={16}
-                        style={{ color: theme.palette.text.secondary }}
+                        style={{ 
+                          color: theme.palette.text.secondary,
+                        }}
                       />
                       <Typography
                         variant="body2"
@@ -318,22 +340,52 @@ const FlowBuilderSidebar: React.FC<FlowBuilderSidebarProps> = ({
                           flex: 1,
                           fontSize: '0.875rem',
                           color: theme.palette.text.primary,
-                          fontWeight: 500,
+                          fontWeight: isExpanded ? 600 : 500,
                         }}
                       >
                         {config.name}
                       </Typography>
+                      {hasItems && (
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            fontSize: '0.75rem',
+                            fontWeight: 400,
+                            color: theme.palette.text.secondary,
+                          }}
+                        >
+                          {config.name === 'Tools' 
+                            ? Object.keys(toolsGroupedByConnectorType).length
+                            : config.name === 'Knowledge'
+                            ? knowledgeCount
+                            : categoryTemplates.length}
+                        </Typography>
+                      )}
                     </Box>
                   </ListItem>
 
-                  {/* Category Content */}
-                  <Collapse in={isExpanded} timeout="auto" unmountOnExit>
+                  {/* Category Content with Animation */}
+                  <Collapse 
+                    in={isExpanded} 
+                    timeout={{
+                      enter: 400,
+                      exit: 300,
+                    }}
+                    easing={{
+                      enter: 'cubic-bezier(0.4, 0, 0.2, 1)',
+                      exit: 'cubic-bezier(0.4, 0, 0.2, 1)',
+                    }}
+                    unmountOnExit
+                  >
                     {config.name === 'Tools' ? (
-                      <SidebarToolsSection
-                        toolsGroupedByConnectorType={toolsGroupedByConnectorType}
+                      <SidebarToolsetsSection
                         expandedApps={expandedApps}
                         onAppToggle={handleAppToggle}
+                        toolsets={toolsets}
+                        refreshToolsets={refreshToolsets}
+                        loading={loading}
                         isBusiness={isBusiness}
+                        activeToolsetTypes={activeToolsetTypes}
                       />
                     ) : config.name === 'LLM Models' ? (
                       <List dense sx={{ py: 0 }}>

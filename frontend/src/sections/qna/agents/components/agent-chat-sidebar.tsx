@@ -38,10 +38,12 @@ import {
   IconButton,
   ListItemButton,
   CircularProgress,
+  Skeleton,
   Divider,
 } from '@mui/material';
 
 import axiosInstance from 'src/utils/axios';
+import { useWhiteLabel } from 'src/context/WhiteLabelContext';
 
 import { Agent } from 'src/types/agent';
 import ArchivedChatsDialog from 'src/sections/qna/chatbot/components/dialogs/archieve-chat-dialog';
@@ -54,6 +56,71 @@ interface AgentChatSidebarProps extends ChatSidebarProps {
   agent: Agent | null;
   activeConnectors: Connector[];
 }
+
+// Skeleton Loader for Conversations
+const ConversationsSkeleton: React.FC = () => {
+  const theme = useTheme();
+  const isDark = theme.palette.mode === 'dark';
+
+  return (
+    <Box sx={{ px: 2, py: 1 }}>
+      {/* Time Group Header Skeleton */}
+      <Skeleton
+        variant="text"
+        width={80}
+        height={24}
+        sx={{
+          mb: 1,
+          bgcolor: alpha(theme.palette.text.secondary, isDark ? 0.08 : 0.06),
+        }}
+      />
+
+      {/* Conversation Item Skeletons */}
+      {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((item) => (
+        <Box
+          key={item}
+          sx={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 1.5,
+            p: 1.5,
+            mb: 0.5,
+            borderRadius: 1.5,
+          }}
+        >
+          <Skeleton
+            variant="circular"
+            width={32}
+            height={32}
+            sx={{
+              bgcolor: alpha(theme.palette.primary.main, 0.1),
+              flexShrink: 0,
+            }}
+          />
+          <Box sx={{ flex: 1, minWidth: 0 }}>
+            <Skeleton
+              variant="text"
+              width="75%"
+              height={16}
+              sx={{
+                mb: 0.5,
+                bgcolor: alpha(theme.palette.text.primary, isDark ? 0.1 : 0.08),
+              }}
+            />
+            <Skeleton
+              variant="text"
+              width="50%"
+              height={14}
+              sx={{
+                bgcolor: alpha(theme.palette.text.secondary, isDark ? 0.08 : 0.06),
+              }}
+            />
+          </Box>
+        </Box>
+      ))}
+    </Box>
+  );
+};
 
 const AgentChatSidebar = ({
   onClose,
@@ -90,6 +157,7 @@ const AgentChatSidebar = ({
   const [archiveDialogOpen, setArchiveDialogOpen] = useState<boolean>(false);
   const theme = useTheme();
   const isDark = theme.palette.mode === 'dark';
+  const { displayName } = useWhiteLabel();
   const scrollableStyles = createScrollableContainerStyle(theme);
 
   // Memoize fetch function to prevent recreation on each render
@@ -164,9 +232,11 @@ const AgentChatSidebar = ({
     }
   }, [shouldRefresh, fetchConversations, onRefreshComplete]);
 
-  // Initial fetch and tab change effect
+  // Initial fetch and tab/agent change effect
   useEffect(() => {
     if (isMounted.current) {
+      // Clear stale conversations immediately so old agent's chats don't flash
+      setConversations([]);
       setPage(1);
       setInitialLoading(true);
       fetchConversations(1);
@@ -457,7 +527,7 @@ const AgentChatSidebar = ({
           }}
         >
           {activeTab === 'my'
-            ? 'Start a new conversation to begin chatting with PipesHub Agent'
+            ? `Start a new conversation to begin chatting with ${displayName} Agent`
             : 'When someone shares a conversation with you, it will appear here'}
         </Typography>
         {activeTab === 'my' && (
@@ -711,18 +781,7 @@ const AgentChatSidebar = ({
         onScroll={handleScroll}
       >
         {initialLoading ? (
-          <Box
-            sx={{
-              display: 'flex',
-              justifyContent: 'center',
-              alignItems: 'center',
-              minHeight: 200,
-              width: '100%',
-              py: 4,
-            }}
-          >
-            <CircularProgress size={36} />
-          </Box>
+          <ConversationsSkeleton />
         ) : Object.keys(groupedConversations).length === 0 ? (
           <EmptyState />
         ) : (
@@ -748,8 +807,36 @@ const AgentChatSidebar = ({
         )}
 
         {isLoading && !initialLoading && (
-          <Box display="flex" justifyContent="center" p={2}>
-            <CircularProgress size={24} />
+          <Box sx={{ px: 2, py: 1 }}>
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 1.5,
+                p: 1.5,
+                borderRadius: 1.5,
+              }}
+            >
+              <Skeleton
+                variant="circular"
+                width={32}
+                height={32}
+                sx={{
+                  bgcolor: alpha(theme.palette.primary.main, 0.1),
+                  flexShrink: 0,
+                }}
+              />
+              <Box sx={{ flex: 1, minWidth: 0 }}>
+                <Skeleton
+                  variant="text"
+                  width="60%"
+                  height={16}
+                  sx={{
+                    bgcolor: alpha(theme.palette.text.primary, theme.palette.mode === 'dark' ? 0.1 : 0.08),
+                  }}
+                />
+              </Box>
+            </Box>
           </Box>
         )}
       </Box>

@@ -7,7 +7,8 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "dev": "nodemon src/index.ts",
-    "lint": "eslint . --ext .ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
     "format": "prettier --write .",
     "test": "mocha",
     "slack": "nodemon src/integrations/slack-bot/src/index.ts"
@@ -37,17 +38,19 @@
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-prettier": "^5.2.1",
     "mocha": "^12.0.0-beta-2",
-    "multer": "^2.0.0",
     "nodemon": "^3.1.11",
     "prettier": "^3.4.2",
     "sinon": "^19.0.2",
     "ts-node": "^10.9.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.57.0"
   },
   "dependencies": {
     "@azure/msal-node": "^3.8.4",
     "@azure/storage-blob": "^12.25.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@node-saml/passport-saml": "^5.1.0",
+    "@pipeshub-ai/mcp": "^1.0.0",
     "@qdrant/js-client-rest": "^1.14.1",
     "@slack/bolt": "^4.6.0",
     "@tryfabric/mack": "^1.2.1",
@@ -60,7 +63,7 @@
     "arangojs": "^10.1.1",
     "async-mutex": "^0.5.0",
     "aws-sdk": "^2.1534.0",
-    "axios": "^1.12.0",
+    "axios": "^1.13.5",
     "axios-retry": "^4.5.0",
     "bcryptjs": "^3.0.2",
     "bullmq": "^5.56.1",
@@ -69,7 +72,7 @@
     "dotenv": "^16.4.7",
     "etcd3": "^1.1.2",
     "express": "^4.21.2",
-    "express-rate-limit": "^8.2.1",
+    "express-rate-limit": "^8.3.0",
     "express-session": "^1.18.2",
     "form-data": "^4.0.4",
     "google-auth-library": "^9.15.1",
@@ -77,16 +80,18 @@
     "helmet": "^8.0.0",
     "image-resize-compress": "^2.1.1",
     "inversify": "^6.2.1",
-    "ioredis": "^5.4.2",
+    "ioredis": "^5.9.2",
     "js-yaml": "^4.1.1",
     "jsonwebtoken": "^9.0.3",
     "jwk-to-pem": "^2.0.7",
     "jwks-rsa": "^3.1.0",
     "kafkajs": "^2.2.4",
+    "marked": "^16.4.2",
     "mongodb": "^6.14.2",
     "mongoose": "^8.9.2",
     "morgan": "^1.10.1",
     "msal-node": "^0.0.1-security",
+    "multer": "^2.0.2",
     "nodemailer": "^7.0.11",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
@@ -98,9 +103,11 @@
     "swagger-ui-express": "^5.0.1",
     "uuid": "^11.0.3",
     "winston": "^3.17.0",
+    "xss": "^1.0.15",
     "zod": "^3.24.1"
   },
   "overrides": {
-    "qs": "6.14.1"
+    "qs": "6.14.1",
+    "fast-xml-parser": "5.3.4"
   }
 }

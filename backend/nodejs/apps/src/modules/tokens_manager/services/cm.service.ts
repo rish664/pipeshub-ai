@@ -3,6 +3,7 @@ import { ARANGO_DB_NAME, MONGO_DB_NAME } from '../../../libs/enums/db.enum';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
 import { loadConfigurationManagerConfig } from '../../configuration_manager/config/config';
 import { configPaths } from '../../configuration_manager/paths/paths';
+import { DefaultMcpScopes } from '../../oauth_provider/config/scopes.config';
 import { normalizeUrl } from '../utils/utils';
 
 // Define interfaces for all service configurations
@@ -26,6 +27,7 @@ export const randomKeyGenerator = () => {
 
 export interface KafkaConfig {
   brokers: string[];
+  ssl?: boolean;
   sasl?: {
     mechanism: 'plain' | 'scram-sha-256' | 'scram-sha-512';
     username: string;
@@ -36,7 +38,9 @@ export interface KafkaConfig {
 export interface RedisConfig {
   host: string;
   port: number;
+  username?: string;
   password?: string;
+  tls?: boolean;
   db?: number;
 }
 
@@ -154,13 +158,14 @@ export class ConfigService {
     return null;
   }
 
-  // Kafka Configuration
+  // Kafka Configuration (supports standard Kafka and AWS MSK with SASL/SCRAM)
   public async getKafkaConfig(): Promise<KafkaConfig> {
     return this.getEncryptedConfig<KafkaConfig>(configPaths.broker.kafka, {
       brokers: process.env.KAFKA_BROKERS!.split(','),
+      ssl: process.env.KAFKA_SSL === 'true',
       ...(process.env.KAFKA_USERNAME && {
         sasl: {
-          mechanism: process.env.KAFKA_SASL_MECHANISM,
+          mechanism: (process.env.KAFKA_SASL_MECHANISM || 'scram-sha-512') as 'plain' | 'scram-sha-256' | 'scram-sha-512',
           username: process.env.KAFKA_USERNAME,
           password: process.env.KAFKA_PASSWORD!,
         },
@@ -175,7 +180,9 @@ export class ConfigService {
       {
         host: process.env.REDIS_HOST!,
         port: parseInt(process.env.REDIS_PORT!, 10),
+        username: process.env.REDIS_USERNAME,
         password: process.env.REDIS_PASSWORD,
+        tls: process.env.REDIS_TLS === 'true',
         db: parseInt(process.env.REDIS_DB || '0', 10),
       },
     );
@@ -374,10 +381,10 @@ export class ConfigService {
     // Preserve existing `auth` object if it exists, otherwise create a new one
     parsedUrl.connectors = {
       ...parsedUrl.connectors,
-      endpoint: normalizeUrl(parsedUrl.connectors?.endpoint) || normalizeUrl(process.env.CONNECTOR_BACKEND!),
+      endpoint: normalizeUrl(process.env.CONNECTOR_BACKEND!) || normalizeUrl(parsedUrl.connectors?.endpoint),
       publicEndpoint:
-        normalizeUrl(parsedUrl.connectors?.publicEndpoint) ||
-        normalizeUrl(process.env.CONNECTOR_PUBLIC_BACKEND!),
+        normalizeUrl(process.env.CONNECTOR_PUBLIC_BACKEND!) ||
+        normalizeUrl(parsedUrl.connectors?.publicEndpoint),
     };
 
     // Save the updated object back to configPaths.endpoint
@@ -406,7 +413,7 @@ export class ConfigService {
     // Preserve existing `auth` object if it exists, otherwise create a new one
     parsedUrl.indexing = {
       ...parsedUrl.indexing,
-      endpoint: normalizeUrl(parsedUrl.indexing?.endpoint) || normalizeUrl(process.env.INDEXING_BACKEND!),
+      endpoint: normalizeUrl(process.env.INDEXING_BACKEND!) || normalizeUrl(parsedUrl.indexing?.endpoint),
     };
 
     // Save the updated object back to configPaths.endpoint
@@ -474,8 +481,8 @@ export class ConfigService {
     parsedUrl.frontend = {
       ...parsedUrl.frontend,
       publicEndpoint:
-        normalizeUrl(parsedUrl.frontend?.publicEndpoint) ||
         normalizeUrl(process.env.FRONTEND_PUBLIC_URL!) ||
+        normalizeUrl(parsedUrl.frontend?.publicEndpoint) ||
         `http://localhost:${process.env.PORT ?? 3000}`,
     };
 
@@ -499,8 +506,8 @@ export class ConfigService {
     parsedUrl.queryBackend = {
       ...parsedUrl.queryBackend,
       endpoint:
-        normalizeUrl(parsedUrl.queryBackend?.endpoint) ||
         normalizeUrl(process.env.QUERY_BACKEND!) ||
+        normalizeUrl(parsedUrl.queryBackend?.endpoint) ||
         `http://localhost:8000`,
     };
 
@@ -624,6 +631,74 @@ export class ConfigService {
     }
 
     return parsedKeys.cookieSecret;
+  }
+
+  public async getOAuthBackendUrl(): Promise<string> {
+    // Assuming the OAuth backend is the same as the auth backend
+    // When oauth is served from different backend, this method should be overridden
+    return this.getAuthBackendUrl();
+  }
+
+  // OAuth Provider Configuration
+
+  /**
+   * Initialize OAuth issuer configuration in the config store.
+   * This should be called once during application startup/setup.
+   * Separating this from the getter prevents race conditions when
+   * multiple service instances start concurrently.
+   */
+  public async initializeOAuthIssuer(): Promise<void> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    const parsedUrl = JSON.parse(url);
+
+    // Only initialize if not already set
+    if (!parsedUrl.oauthProvider?.issuer) {
+      parsedUrl.oauthProvider = {
+        ...parsedUrl.oauthProvider,
+        issuer:
+          normalizeUrl(process.env.OAUTH_ISSUER!) ||
+          (process.env.NODE_ENV === 'development'
+            ? `http://localhost:${process.env.PORT ?? 3000}`
+            : await this.getFrontendUrl()),
+      };
+
+      await this.keyValueStoreService.set<string>(
+        configPaths.endpoint,
+        JSON.stringify(parsedUrl),
+      );
+    }
+  }
+
+  /**
+   * Get the OAuth issuer URL. This is a pure getter with no side effects.
+   * Call initializeOAuthIssuer() during application startup to seed the config.
+   */
+  public async getOAuthIssuer(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    const parsedUrl = JSON.parse(url);
+
+    // Return stored value, or fall back to env var, or default
+    return (
+      normalizeUrl(process.env.OAUTH_ISSUER!) ||
+      normalizeUrl(parsedUrl.oauthProvider?.issuer) ||
+      (process.env.NODE_ENV === 'development'
+        ? `http://localhost:${process.env.PORT ?? 3000}`
+        : await this.getFrontendUrl())
+    );
+  }
+
+  public async getMcpScopes(): Promise<string[]> {
+    const scopes = process.env.MCP_SCOPES;
+    if (!scopes) {
+      return DefaultMcpScopes;
+    }
+    return scopes.split(',').map((s) => s.trim()).filter(Boolean);
   }
 
   public async getRsAvailable(): Promise<string> {

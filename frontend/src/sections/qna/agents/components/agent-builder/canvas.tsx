@@ -1,5 +1,5 @@
 // src/sections/agents/components/flow-builder-canvas.tsx
-import React, { useRef, useCallback, useMemo } from 'react';
+import React, { useRef, useCallback, useMemo, memo, useEffect, useState } from 'react';
 import {
   ReactFlow,
   MiniMap,
@@ -34,8 +34,21 @@ import playIcon from '@iconify-icons/mdi/play';
 
 // Import the enhanced FlowNode component
 import FlowNode from './flow-node';
+import CustomEdge from './custom-edge';
 import { normalizeDisplayName } from '../../utils/agent';
 import type { AgentBuilderError, NodeTemplate } from '../../types/agent';
+
+// Define nodeTypes OUTSIDE component to prevent re-creation
+// This is critical for ReactFlow performance
+const createNodeTypes = (onDelete?: (nodeId: string) => void): NodeTypes => ({
+  flowNode: (props: any) => <FlowNode {...props} onDelete={onDelete} />,
+});
+
+// Define edgeTypes for custom edge styling
+const edgeTypes = {
+  default: CustomEdge,
+  smoothstep: CustomEdge,
+};
  
 interface FlowNodeData extends Record<string, unknown> {
   id: string;
@@ -68,6 +81,7 @@ interface FlowBuilderCanvasProps {
   onNodeEdit?: (nodeId: string, data: any) => void;
   onNodeDelete?: (nodeId: string) => void;
   onError?: (error: string | import('../../types/agent').AgentBuilderError) => void;
+  readOnly?: boolean;
 }
 
 // Enhanced Controls Component that uses ReactFlow context
@@ -95,21 +109,20 @@ const EnhancedControls: React.FC<{ colors: any }> = ({ colors }) => {
           size="small"
           onClick={() => zoomIn()}
           sx={{
-            width: 32,
-            height: 32,
-            margin: '2px',
+            width: 28,
+            height: 28,
+            margin: '1px',
             backgroundColor: 'transparent',
             color: colors.text.secondary,
-            borderRadius: 1.5,
-            transition: 'all 0.2s ease',
+            borderRadius: 0.5,
+            transition: 'all 0.15s ease',
             '&:hover': {
-              backgroundColor: alpha(colors.primary, 0.1),
-              color: colors.primary,
-              transform: 'scale(1.1)',
+              backgroundColor: colors.background.elevated,
+              color: colors.text.primary,
             },
           }}
         >
-          <Icon icon={zoomInIcon} width={16} height={16} />
+          <Icon icon={zoomInIcon} width={14} height={14} />
         </IconButton>
       </Tooltip>
       
@@ -118,21 +131,20 @@ const EnhancedControls: React.FC<{ colors: any }> = ({ colors }) => {
           size="small"
           onClick={() => zoomOut()}
           sx={{
-            width: 32,
-            height: 32,
-            margin: '2px',
+            width: 28,
+            height: 28,
+            margin: '1px',
             backgroundColor: 'transparent',
             color: colors.text.secondary,
-            borderRadius: 1.5,
-            transition: 'all 0.2s ease',
+            borderRadius: 0.5,
+            transition: 'all 0.15s ease',
             '&:hover': {
-              backgroundColor: alpha(colors.primary, 0.1),
-              color: colors.primary,
-              transform: 'scale(1.1)',
+              backgroundColor: colors.background.elevated,
+              color: colors.text.primary,
             },
           }}
         >
-          <Icon icon={zoomOutIcon} width={16} height={16} />
+          <Icon icon={zoomOutIcon} width={14} height={14} />
         </IconButton>
       </Tooltip>
 
@@ -141,21 +153,20 @@ const EnhancedControls: React.FC<{ colors: any }> = ({ colors }) => {
           size="small"
           onClick={() => fitView({ padding: 0.2 })}
           sx={{
-            width: 32,
-            height: 32,
-            margin: '2px',
+            width: 28,
+            height: 28,
+            margin: '1px',
             backgroundColor: 'transparent',
             color: colors.text.secondary,
-            borderRadius: 1.5,
-            transition: 'all 0.2s ease',
+            borderRadius: 0.5,
+            transition: 'all 0.15s ease',
             '&:hover': {
-              backgroundColor: alpha(colors.primary, 0.1),
-              color: colors.primary,
-              transform: 'scale(1.1)',
+              backgroundColor: colors.background.elevated,
+              color: colors.text.primary,
             },
           }}
         >
-          <Icon icon={fitScreenIcon} width={16} height={16} />
+          <Icon icon={fitScreenIcon} width={14} height={14} />
         </IconButton>
       </Tooltip>
 
@@ -164,21 +175,20 @@ const EnhancedControls: React.FC<{ colors: any }> = ({ colors }) => {
           size="small"
           onClick={() => fitView({ padding: 0.1, includeHiddenNodes: false })}
           sx={{
-            width: 32,
-            height: 32,
-            margin: '2px',
+            width: 28,
+            height: 28,
+            margin: '1px',
             backgroundColor: 'transparent',
             color: colors.text.secondary,
-            borderRadius: 1.5,
-            transition: 'all 0.2s ease',
+            borderRadius: 0.5,
+            transition: 'all 0.15s ease',
             '&:hover': {
-              backgroundColor: alpha(colors.primary, 0.1),
-              color: colors.primary,
-              transform: 'scale(1.1)',
+              backgroundColor: colors.background.elevated,
+              color: colors.text.primary,
             },
           }}
         >
-          <Icon icon={centerFocusIcon} width={16} height={16} />
+          <Icon icon={centerFocusIcon} width={14} height={14} />
         </IconButton>
       </Tooltip>
     </Controls>
@@ -204,41 +214,51 @@ const AgentBuilderCanvas: React.FC<FlowBuilderCanvasProps> = ({
   onNodeEdit,
   onNodeDelete,
   onError,
+  readOnly = false,
 }) => {
   const theme = useTheme();
   const isDark = theme.palette.mode === 'dark';
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
 
-  // Professional color scheme
-  const colors = {
-    primary: isDark ? '#6366f1' : '#4f46e5',
-    secondary: isDark ? '#8b5cf6' : '#7c3aed',
-    success: isDark ? '#10b981' : '#059669',
+  // Professional minimal color scheme - using theme colors
+  const colors = useMemo(() => ({
+    primary: theme.palette.text.secondary,
+    secondary: theme.palette.text.secondary,
+    success: theme.palette.text.secondary,
     background: {
-      main: isDark ? '#1a1a1a' : '#fafbfc', // Lighter dark background for better node visibility
-      paper: isDark ? '#262626' : '#ffffff', // Adjusted paper color
-      elevated: isDark ? '#333333' : '#f8fafc',
+      main: theme.palette.background.default,
+      paper: theme.palette.background.paper,
+      elevated: theme.palette.background.paper,
     },
     border: {
-      main: isDark ? '#404040' : '#e2e8f0',
-      subtle: isDark ? '#2a2a2a' : '#f1f5f9',
+      main: theme.palette.divider,
+      subtle: theme.palette.divider,
     },
     text: {
-      primary: isDark ? '#f8fafc' : '#0f172a',
-      secondary: isDark ? '#cbd5e1' : '#64748b',
+      primary: theme.palette.text.primary,
+      secondary: theme.palette.text.secondary,
     },
     isDark,
-  };
+  }), [isDark, theme]);
 
-  const FlowNodeWrapper = useCallback((props: any) => <FlowNode {...props} onDelete={onNodeDelete} />, [onNodeDelete]);
+  // Use a ref to always hold the latest onNodeDelete callback, avoiding stale closures
+  const onNodeDeleteRef = useRef(onNodeDelete);
+  useEffect(() => {
+    onNodeDeleteRef.current = onNodeDelete;
+  }, [onNodeDelete]);
 
-  const nodeTypes: NodeTypes = {
-    flowNode: FlowNodeWrapper,
-  };
+  // Create stable nodeTypes using a stable wrapper that reads from the ref
+  const stableOnDelete = useCallback((nodeId: string) => {
+    onNodeDeleteRef.current?.(nodeId);
+  }, []);
+
+  // Create stable nodeTypes object - only created once, uses stable callback via ref
+  const [nodeTypes] = useState<NodeTypes>(() => createNodeTypes(stableOnDelete));
 
   const handleDrop = useCallback(
     (event: React.DragEvent) => {
       event.preventDefault();
+      if (readOnly) return;
 
       if (!reactFlowWrapper.current) return;
 
@@ -253,6 +273,298 @@ const AgentBuilderCanvas: React.FC<FlowBuilderCanvasProps> = ({
       const allToolsStr = event.dataTransfer.getData('allTools');
       const toolCount = event.dataTransfer.getData('toolCount');
       
+      // Extract toolset-specific drag data (check both 'type' key and other keys)
+      const toolsetInstanceId = event.dataTransfer.getData('instanceId'); // NEW: instance identifier
+      const toolsetInstanceName = event.dataTransfer.getData('instanceName'); // NEW
+      const toolsetName = event.dataTransfer.getData('toolsetName');
+      let toolsetDisplayName = event.dataTransfer.getData('displayName');
+      // If displayName contains " - " (toolset - tool format), extract just the toolset name
+      if (toolsetDisplayName && toolsetDisplayName.includes(' - ')) {
+        toolsetDisplayName = toolsetDisplayName.split(' - ')[0].trim();
+      }
+      const toolsetIconPath = event.dataTransfer.getData('iconPath');
+      const toolsetCategory = event.dataTransfer.getData('category');
+      const toolsetType = event.dataTransfer.getData('type'); // 'toolset' or 'tool'
+      const toolFullName = event.dataTransfer.getData('fullName');
+      const toolName = event.dataTransfer.getData('toolName');
+      const toolDescription = event.dataTransfer.getData('description');
+      const isToolsetConfigured = event.dataTransfer.getData('isConfigured') === 'true';
+      const isToolsetAuthenticated = event.dataTransfer.getData('isAuthenticated') === 'true';
+      
+      
+      // Handle toolset drops (toolsets don't have templates, they're created dynamically)
+      if (type.startsWith('toolset-') || toolsetType === 'toolset') {
+        // Validate toolset is configured and authenticated
+        if (!isToolsetConfigured || !isToolsetAuthenticated) {
+          if (onError) {
+            const reason = !isToolsetConfigured ? 'not configured' : 'not authenticated';
+            onError(`${toolsetDisplayName || toolsetName} is ${reason}. Please configure it in settings before using.`);
+          }
+          return;
+        }
+        
+        if (!allToolsStr) {
+          if (onError) {
+            onError('No tools found for this toolset.');
+          }
+          return;
+        }
+        
+        try {
+          const allTools = JSON.parse(allToolsStr);
+          const selectedToolsStr = event.dataTransfer.getData('selectedTools');
+          const selectedTools = selectedToolsStr ? JSON.parse(selectedToolsStr) : allTools.map((t: any) => t.toolName || t.name);
+          
+          // Normalize tool structure (ToolsetNode expects { name, fullName, description, toolsetName })
+          const normalizeTool = (t: any) => ({
+            name: t.toolName || t.name || '',
+            fullName: t.fullName || `${toolsetName}.${t.toolName || t.name || ''}`,
+            description: t.description || '',
+            toolsetName: t.toolsetName || toolsetName,
+          });
+          
+          const normalizedTools = allTools.map(normalizeTool);
+          
+          // Check if a toolset node for this toolset already exists
+          const existingToolsetNode = nodes.find(
+            (n) => n.data.type.startsWith('toolset-') && 
+                   n.data.config?.toolsetName === toolsetName
+          );
+          
+          if (existingToolsetNode) {
+            // Merge tools into existing toolset node (add tools that don't exist)
+            const existingTools = existingToolsetNode.data.config?.tools || [];
+            const existingToolNames = new Set(existingTools.map((t: any) => t.fullName || t.name));
+            
+            const newTools = normalizedTools.filter(
+              (t: any) => !existingToolNames.has(t.fullName) && !existingToolNames.has(t.name)
+            );
+            
+            if (newTools.length > 0) {
+              setNodes((nds) =>
+                nds.map((node) =>
+                  node.id === existingToolsetNode.id
+                    ? {
+                        ...node,
+                        data: {
+                          ...node.data,
+                          config: {
+                            ...node.data.config,
+                            tools: [...existingTools, ...newTools],
+                            selectedTools: [
+                              ...(node.data.config?.selectedTools || []),
+                              ...newTools.map((t: any) => t.name),
+                            ],
+                            // Update availableTools to include all tools
+                            availableTools: normalizedTools,
+                          },
+                        },
+                      }
+                    : node
+                )
+              );
+            }
+            return;
+          }
+          
+          // No existing toolset node, create a new one
+          const position = {
+            x: event.clientX - reactFlowBounds.left - 130,
+            y: event.clientY - reactFlowBounds.top - 40,
+          };
+          
+          const newNode: Node<FlowNodeData> = {
+            id: `toolset-${toolsetName}-${Date.now()}`,
+            type: 'flowNode',
+            position,
+            data: {
+              id: `toolset-${toolsetName}-${Date.now()}`,
+              type: `toolset-${toolsetName}`,
+              label: normalizeDisplayName(toolsetDisplayName || toolsetName),
+              description: `${toolsetDisplayName || toolsetName} with ${toolCount || normalizedTools.length} tools`,
+              icon: toolsetIconPath || '/assets/icons/toolsets/collections-gray.svg',
+              category: 'toolset',
+              config: {
+                instanceId: toolsetInstanceId || undefined,   // NEW
+                instanceName: toolsetInstanceName || undefined, // NEW
+                toolsetName,
+                displayName: toolsetDisplayName || toolsetName,
+                iconPath: toolsetIconPath || '/assets/icons/toolsets/collections-gray.svg',
+                category: toolsetCategory || 'app',
+                tools: normalizedTools,
+                availableTools: normalizedTools,
+                selectedTools: selectedTools.map((t: string) => {
+                  // Convert toolName to name if needed
+                  const tool = normalizedTools.find((nt: any) => nt.toolName === t || nt.name === t);
+                  return tool ? tool.name : t;
+                }),
+                isConfigured: isToolsetConfigured,
+                isAuthenticated: isToolsetAuthenticated,
+              },
+              inputs: [],
+              outputs: ['output'],
+              isConfigured: true,
+            },
+          };
+          setNodes((nds) => [...nds, newNode]);
+          return;
+        } catch (e) {
+          console.error('Failed to parse toolset data:', e);
+          if (onError) {
+            onError('Failed to parse toolset data. Please try again.');
+          }
+          return;
+        }
+      }
+      
+      // Handle individual tool drops from toolsets - create or update toolset node
+      // Check if this is a tool from a toolset (has toolsetName in drag data)
+      // Construct toolFullName if it's missing
+      const constructedToolFullName = toolFullName || (toolsetName && toolName ? `${toolsetName}.${toolName}` : '');
+      const isToolsetTool = toolsetType === 'tool' && toolsetName && (constructedToolFullName || toolName);
+      
+      if (isToolsetTool) {
+        // Validate toolset is configured and authenticated
+        if (!isToolsetConfigured || !isToolsetAuthenticated) {
+          if (onError) {
+            const reason = !isToolsetConfigured ? 'not configured' : 'not authenticated';
+            onError(`The "${toolsetDisplayName || toolsetName}" toolset is ${reason}. Please configure it in settings before using this tool.`);
+          }
+          return;
+        }
+        
+        // Use constructed fullName
+        const finalToolFullName = constructedToolFullName || `${toolsetName}.${toolName}`;
+        
+        // Get all tools from the toolset (from drag data)
+        let allAvailableTools: any[] = [];
+        if (allToolsStr) {
+          try {
+            allAvailableTools = JSON.parse(allToolsStr);
+          } catch (e) {
+            console.error('Failed to parse allTools from drag data:', e);
+          }
+        }
+        
+        // If allTools is empty, create a minimal structure with the dropped tool
+        if (allAvailableTools.length === 0) {
+          allAvailableTools = [{
+            toolName: toolName || '',
+            fullName: finalToolFullName,
+            toolsetName,
+            description: toolDescription || '',
+            appName: toolsetName,
+          }];
+        }
+        
+        // Normalize tool structure (ToolsetNode expects { name, fullName, description, toolsetName })
+        const normalizeTool = (t: any) => ({
+          name: t.toolName || t.name || '',
+          fullName: t.fullName || `${toolsetName}.${t.toolName || t.name || ''}`,
+          description: t.description || '',
+          toolsetName: t.toolsetName || toolsetName,
+        });
+        
+        // Normalize all available tools
+        const normalizedAvailableTools = allAvailableTools.map(normalizeTool);
+        
+        // Find the dropped tool in available tools
+        const droppedTool = normalizedAvailableTools.find(
+          (t: any) => t.fullName === finalToolFullName || t.name === toolName
+        ) || normalizeTool({
+          toolName: toolName || '',
+          fullName: finalToolFullName,
+          toolsetName,
+          description: toolDescription || '',
+        });
+        
+        // Check if a toolset node for this toolset already exists
+        const existingToolsetNode = nodes.find(
+          (n) => n.data.type.startsWith('toolset-') && 
+                 n.data.config?.toolsetName === toolsetName
+        );
+        
+        if (existingToolsetNode) {
+          // Add the tool to the existing toolset node if it's not already there
+          const existingTools = existingToolsetNode.data.config?.tools || [];
+          const toolAlreadyExists = existingTools.some(
+            (t: any) => t.fullName === droppedTool.fullName || t.name === droppedTool.name
+          );
+          
+          if (!toolAlreadyExists) {
+            setNodes((nds) =>
+              nds.map((node) =>
+                node.id === existingToolsetNode.id
+                  ? {
+                      ...node,
+                      data: {
+                        ...node.data,
+                        config: {
+                          ...node.data.config,
+                          tools: [...existingTools, droppedTool],
+                          selectedTools: [
+                            ...(node.data.config?.selectedTools || []),
+                            droppedTool.name,
+                          ],
+                          // Update availableTools if we have more tools now
+                          availableTools: normalizedAvailableTools.length > 0 
+                            ? normalizedAvailableTools 
+                            : node.data.config?.availableTools || [],
+                        },
+                      },
+                    }
+                  : node
+              )
+            );
+          }
+          return;
+        }
+        
+        // No existing toolset node, create a new one with only the dropped tool
+        const position = {
+          x: event.clientX - reactFlowBounds.left - 130,
+          y: event.clientY - reactFlowBounds.top - 40,
+        };
+        
+        const newNode: Node<FlowNodeData> = {
+          id: `toolset-${toolsetName}-${Date.now()}`,
+          type: 'flowNode',
+          position,
+          data: {
+            id: `toolset-${toolsetName}-${Date.now()}`,
+            type: `toolset-${toolsetName}`,
+            label: normalizeDisplayName(toolsetDisplayName || toolsetName),
+            description: `${toolsetDisplayName || toolsetName} toolset`,
+            icon: toolsetIconPath || '/assets/icons/toolsets/collections-gray.svg',
+            category: 'toolset',
+            config: {
+              instanceId: toolsetInstanceId || undefined,   // NEW
+              instanceName: toolsetInstanceName || undefined, // NEW
+              toolsetName,
+              displayName: toolsetDisplayName || toolsetName,
+              iconPath: toolsetIconPath || '/assets/icons/toolsets/collections-gray.svg',
+              category: toolsetCategory || 'app',
+              // Only the dropped tool is initially selected
+              tools: [droppedTool],
+              // All available tools from the toolset (for adding more)
+              availableTools: normalizedAvailableTools.length > 0 
+                ? normalizedAvailableTools 
+                : [droppedTool],
+              selectedTools: [droppedTool.name],
+              isConfigured: isToolsetConfigured,
+              isAuthenticated: isToolsetAuthenticated,
+            },
+            inputs: [],
+            outputs: ['output'],
+            isConfigured: true,
+          },
+        };
+        setNodes((nds) => [...nds, newNode]);
+        return;
+      }
+      
+      // For non-toolset drops, find the template
+
       const template = nodeTemplates.find((t) => t.type === type);
       if (!template) return;
 
@@ -467,7 +779,7 @@ const AgentBuilderCanvas: React.FC<FlowBuilderCanvasProps> = ({
 
       setNodes((nds) => [...nds, newNode]);
     },
-    [setNodes, nodeTemplates, nodes, onError, configuredConnectors, activeAgentConnectors]
+    [setNodes, nodeTemplates, nodes, onError, configuredConnectors, activeAgentConnectors, readOnly]
   );
 
   return (
@@ -483,7 +795,6 @@ const AgentBuilderCanvas: React.FC<FlowBuilderCanvasProps> = ({
         }),
         width: sidebarOpen ? `calc(100% - ${sidebarWidth}px)` : '100%',
         height: '100%',
-        // backgroundColor: colors.background.main,
       }}
     >
       {/* Enhanced React Flow Canvas */}
@@ -532,14 +843,15 @@ const AgentBuilderCanvas: React.FC<FlowBuilderCanvasProps> = ({
         <ReactFlow
           nodes={nodes}
           edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          onDrop={handleDrop}
-          onDragOver={onDragOver}
+          onNodesChange={readOnly ? undefined : onNodesChange}
+          onEdgesChange={readOnly ? undefined : onEdgesChange}
+          onConnect={readOnly ? undefined : onConnect}
+          onDrop={readOnly ? undefined : handleDrop}
+          onDragOver={readOnly ? undefined : onDragOver}
           onNodeClick={onNodeClick}
-          onEdgeClick={onEdgeClick}
+          onEdgeClick={readOnly ? undefined : onEdgeClick}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
           fitView
           fitViewOptions={{
             padding: 0.1,
@@ -554,91 +866,47 @@ const AgentBuilderCanvas: React.FC<FlowBuilderCanvasProps> = ({
           snapGrid={[25, 25]}
           defaultEdgeOptions={{
             style: {
-              strokeWidth: 3,
-              stroke: colors.primary,
+              strokeWidth: 1.5,
+              stroke: isDark ? '#4a4a4a' : '#d0d0d0',
               cursor: 'pointer',
-              filter: 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.15))',
             },
             type: 'smoothstep',
             animated: false,
             interactionWidth: 30,
-            // Remove arrowheads for cleaner tree appearance
           }}
           style={{
-            // backgroundColor: colors.background.main,
             width: '100%',
             height: '100%',
           }}
           panOnScroll
-          selectionOnDrag
-          panOnDrag={[1, 2]}
+          selectionOnDrag={!readOnly}
+          panOnDrag={readOnly ? true : [1, 2]}
           selectNodesOnDrag={false}
+          nodesDraggable={!readOnly}
+          nodesConnectable={!readOnly}
           proOptions={{ hideAttribution: true }}
         >
           {/* Enhanced Controls */}
           <EnhancedControls colors={colors} />
 
-          {/* Enhanced Background */}
+          {/* Professional Background Pattern */}
           <Background 
             variant={BackgroundVariant.Dots} 
-            size={2}
-            gap={20}
+            size={0.8}
+            gap={24}
             style={{
               opacity: isDark ? 0.3 : 0.5,
             }}
           />
-
-
-          {/* Status Panel */}
-          <Panel position="top-left">
-            <Paper
-              sx={{
-                px: 2,
-                py: 1,
-                backdropFilter: 'blur(10px)',
-                border: `1px solid ${colors.border.main}`,
-                borderRadius: 2,
-                boxShadow: isDark 
-                  ? `0 4px 16px rgba(0, 0, 0, 0.3)`
-                  : `0 4px 16px rgba(15, 23, 42, 0.06)`,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 1.5,
-              }}
-            >
-              <Box
-                sx={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: '50%',
-                  backgroundColor: colors.success,
-                  boxShadow: `0 0 8px ${alpha(colors.success, 0.6)}`,
-                }}
-              />
-              <Typography
-                variant="caption"
-                sx={{
-                  fontSize: '0.75rem',
-                  fontWeight: 600,
-                  color: colors.text.primary,
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.05em',
-                }}
-              >
-                Agent Builder
-              </Typography>
-              <Typography
-                variant="caption"
-                sx={{
-                  fontSize: '0.7rem',
-                  color: colors.text.secondary,
-                  ml: 0.5,
-                }}
-              >
-                {nodes.length} nodes, {edges.length} connections
-              </Typography>
-            </Paper>
-          </Panel>
+          <Background 
+            variant={BackgroundVariant.Lines} 
+            gap={100}
+            size={1}
+            color={isDark ? alpha(theme.palette.text.secondary, 0.03) : alpha(theme.palette.text.secondary, 0.05)}
+            style={{
+              opacity: 1,
+            }}
+          />
         </ReactFlow>
       </Box>
     </Box>

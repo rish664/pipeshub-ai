@@ -4,15 +4,6 @@ from pydantic import BaseModel
 from typing_extensions import TypedDict
 
 
-class AnswerWithMetadata(BaseModel):
-    """Schema for the answer with metadata"""
-    answer: str
-    reason: str
-    confidence: Literal["Very High", "High", "Medium", "Low"]
-    answerMatchType: Literal["Derived From Blocks", "Exact Match", "Fuzzy Match", "Inferred", "Other"]
-    blockNumbers: List[int]
-
-
 class AnswerWithMetadataDict(TypedDict):
     """Schema for the answer with metadata"""
     answer: str
@@ -28,7 +19,6 @@ class AnswerWithMetadataJSON(BaseModel):
     confidence: Literal["Very High", "High", "Medium", "Low"]
     answerMatchType: Literal["Exact Match", "Derived From Blocks", "Derived From User Info", "Enhanced With Full Record"]
     blockNumbers: List[str]
-
 
 qna_prompt = """
 <task>
@@ -222,25 +212,13 @@ qna_prompt_instructions_1 = """
   Context for Current Query:
 """
 
-qna_prompt_context = """
-<record>
-      - Record Id: {{ record_id }}
-      - Record Name: {{ record_name }}
-      - Record Summary with metadata:
-        * Summary: {{ semantic_metadata.summary }}
-        * Category: {{ semantic_metadata.categories }}
-        * Sub-categories:
-          - Level 1: {{ semantic_metadata.sub_category_level_1 }}
-          - Level 2: {{ semantic_metadata.sub_category_level_2 }}
-          - Level 3: {{ semantic_metadata.sub_category_level_3 }}
-        * Topics: {{ semantic_metadata.topics }}
-      - Record blocks (sorted):
-"""
 
-qna_prompt_context_for_tool = """<record>
-- Record Id: {{ record_id }}
-- Record Name: {{ record_name }}
-- Record blocks (sorted):
+
+qna_prompt_context = """<record>
+{% if context_metadata %}
+{{ context_metadata }}
+{% endif %}
+Record blocks (sorted):
 """
 
 qna_prompt_instructions_2 = """
@@ -424,12 +402,6 @@ Your answer: """
 #       - Record blocks (sorted):
 # """
 
-# qna_prompt_context_for_tool = """<record>
-# - Record Id: {{ record_id }}
-# - Record Name: {{ record_name }}
-# - Record blocks (sorted):
-# """
-
 # qna_prompt_instructions_2 = """
 # <instructions>
 #   NOTE:
@@ -579,12 +551,7 @@ Your answer: """
 #       - Record blocks (sorted):
 # """
 
-# qna_prompt_context_for_tool = """
-# <record>
-#       - Record Id: {{ record_id }}
-#       - Record Name: {{ record_name }}
-#       - Record blocks (sorted):
-# """
+
 
 # qna_prompt_instructions_2 = """
 # <instructions>

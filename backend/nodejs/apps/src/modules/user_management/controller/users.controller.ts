@@ -48,12 +48,58 @@ export class UserController {
     @inject('Logger') private logger: Logger,
     @inject('EntitiesEventProducer')
     private eventService: EntitiesEventProducer,
-  ) {}
+  ) { }
 
   async getAllUsers(
     req: AuthenticatedUserRequest,
     res: Response,
   ): Promise<void> {
+    const { blocked } = req.query;
+    if (blocked === 'true') {
+
+      const blockedUsers = await UserCredentials.aggregate([
+        {
+          $match: {
+            orgId: req.user?.orgId,
+            isBlocked: true,
+            isDeleted: false,
+          },
+        },
+        {
+          $lookup: {
+            from: 'users',
+            let: { credUserId: '$userId' },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $eq: ['$_id', { $toObjectId: '$$credUserId' }],
+                  },
+                },
+              },
+            ],
+            as: 'userProfile',
+          },
+        },
+        { $unwind: '$userProfile' },
+        {
+          $project: {
+            _id: '$userProfile._id',
+            email: '$userProfile.email',
+            orgId: '$userProfile.orgId',
+            fullName: '$userProfile.fullName',
+            hasLoggedIn: '$userProfile.hasLoggedIn',
+            slug: '$userProfile.slug',
+            createdAt: '$userProfile.createdAt',
+            updatedAt: '$userProfile.updatedAt',
+          },
+        },
+      ]);
+
+      res.status(200).json(blockedUsers);
+      return;
+    }
+
     const users = await Users.find({
       orgId: req.user?.orgId,
       isDeleted: false,
@@ -136,7 +182,7 @@ export class UserController {
     const orgId = req.user?.orgId;
     try {
       // Check if email should be included based on environment variable
-      const hideEmail = process.env.HIDE_EMAIL === 'true'; 
+      const hideEmail = process.env.HIDE_EMAIL === 'true';
 
       const user = await Users.findOne({
         _id: userId,
@@ -159,6 +205,56 @@ export class UserController {
       next(error);
     }
   }
+
+  async unblockUser(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      const userId = req.params.id;
+      const orgId = req.user?.orgId;
+
+      if (!userId) {
+        throw new BadRequestError(
+          'userId must be provided',
+        );
+      }
+
+      if (!orgId) {
+        throw new BadRequestError(
+          'orgId must be provided',
+        );
+      }
+
+      const credential = await UserCredentials.findOneAndUpdate(
+        {
+          userId,
+          orgId,
+          isBlocked: true,
+          isDeleted: false,
+        },
+        { $set: { isBlocked: false, wrongCredentialCount: 0 } },
+        { new: true }
+      );
+
+      if (!credential) {
+        throw new BadRequestError(
+          'User not found or not blocked',
+        );
+
+      }
+
+      res.status(200).json({
+        message: "User unblocked successfully",
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+
+
 
   async getUserEmailByUserId(
     req: AuthenticatedUserRequest,
@@ -338,6 +434,144 @@ export class UserController {
     return newUser.toObject();
   }
 
+  /**
+   * Generic Just-In-Time user provisioning for OAuth providers (Google, Microsoft, Azure AD, OAuth)
+   * Creates user, adds to everyone group, and publishes creation event
+   */
+  async provisionJitUser(
+    email: string,
+    userDetails: { firstName?: string; lastName?: string; fullName: string },
+    orgId: string,
+    provider: 'google' | 'microsoft' | 'azureAd' | 'oauth',
+    logger: Logger,
+  ) {
+    logger.info(`Auto-provisioning user from ${provider}`, { email, orgId });
+    const user = await Users.findOne({
+      email,
+      orgId,
+      isDeleted: true,
+    });
+    if (user) {
+      throw new BadRequestError('User account deleted by admin. Please contact your admin to restore your account.');
+    }
+
+    const newUser = new Users({
+      email,
+      ...userDetails,
+      orgId,
+      hasLoggedIn: false,
+      isDeleted: false,
+    });
+
+    await newUser.save();
+
+    // Add to everyone group
+    await UserGroups.updateOne(
+      { orgId, type: 'everyone', isDeleted: false },
+      { $addToSet: { users: newUser._id } },
+    );
+
+    // Publish user creation event
+    try {
+      await this.eventService.start();
+      await this.eventService.publishEvent({
+        eventType: EventType.NewUserEvent,
+        timestamp: Date.now(),
+        payload: {
+          orgId: orgId.toString(),
+          userId: newUser._id,
+          fullName: newUser.fullName,
+          email: newUser.email,
+          syncAction: SyncAction.Immediate,
+        } as UserAddedEvent,
+      });
+    } catch (eventError) {
+      logger.error('Failed to publish user creation event', {
+        error: eventError,
+        userId: newUser._id,
+      });
+    } finally {
+      await this.eventService.stop();
+    }
+
+    logger.info(`User auto-provisioned successfully via ${provider}`, {
+      userId: newUser._id,
+      email,
+    });
+
+    return newUser.toObject();
+  }
+
+  /**
+   * Extract user details from Google ID token payload
+   */
+  extractGoogleUserDetails(payload: any, email: string) {
+    const firstName = payload?.given_name;
+    const lastName = payload?.family_name;
+    const displayName = payload?.name;
+
+    const fullName =
+      displayName ||
+      [firstName, lastName].filter(Boolean).join(' ') ||
+      email.split('@')[0];
+
+    return {
+      firstName: firstName || undefined,
+      lastName: lastName || undefined,
+      fullName,
+    };
+  }
+
+  /**
+   * Extract user details from Microsoft/Azure AD decoded token
+   */
+  extractMicrosoftUserDetails(decodedToken: any, email: string) {
+    const firstName = decodedToken?.given_name;
+    const lastName = decodedToken?.family_name;
+    const displayName = decodedToken?.name;
+
+    const fullName =
+      displayName ||
+      [firstName, lastName].filter(Boolean).join(' ') ||
+      email.split('@')[0];
+
+    return {
+      firstName: firstName || undefined,
+      lastName: lastName || undefined,
+      fullName,
+    };
+  }
+
+  /**
+   * Extract user details from OAuth userInfo response
+   */
+  extractOAuthUserDetails(userInfo: any, email: string) {
+    // Common OAuth/OIDC claims
+    const firstName =
+      userInfo?.given_name ||
+      userInfo?.first_name ||
+      userInfo?.firstName;
+    const lastName =
+      userInfo?.family_name ||
+      userInfo?.last_name ||
+      userInfo?.lastName;
+    const displayName =
+      userInfo?.name ||
+      userInfo?.displayName ||
+      userInfo?.preferred_username;
+
+    const fullName =
+      displayName ||
+      [firstName, lastName].filter(Boolean).join(' ') ||
+      email.split('@')[0];
+
+    return {
+      firstName: firstName || undefined,
+      lastName: lastName || undefined,
+      fullName,
+    };
+  }
+
   async updateUser(
     req: AuthenticatedUserRequest,
     res: Response,
@@ -416,7 +650,7 @@ export class UserController {
         // Only update email if it's different from the current email
         const currentEmail = user.email?.toLowerCase().trim();
         const newEmail = email?.toLowerCase().trim();
-        
+
         if (currentEmail !== newEmail) {
           // Email is being changed - validate uniqueness
           const existingUser = await Users.findOne({
@@ -431,7 +665,7 @@ export class UserController {
           user.email = email;
         }
       }
-    
+
       await user.save();
 
       await this.eventService.start();
@@ -1283,15 +1517,15 @@ export class UserController {
       if (!userId) {
         throw new BadRequestError('User ID is required');
       }
-      
+
       const { page, limit, search } = req.query;
-      
+
       // Validate search parameter for XSS and format specifiers
       if (search) {
         try {
           validateNoXSS(String(search), 'search parameter');
           validateNoFormatSpecifiers(String(search), 'search parameter');
-          
+
           if (String(search).length > 1000) {
             throw new BadRequestError('Search parameter too long (max 1000 characters)');
           }
@@ -1301,7 +1535,7 @@ export class UserController {
           );
         }
       }
-      
+
       const queryParams = new URLSearchParams();
       if (page) queryParams.append('page', String(page));
       if (limit) queryParams.append('limit', String(limit));

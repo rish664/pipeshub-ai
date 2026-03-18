@@ -93,6 +93,18 @@ const feedbackSchema = new Schema<IFeedback>(
   { _id: false },
 );
 
+// Schema for reference data items (IDs for follow-up queries)
+const referenceDataItemSchema = new Schema(
+  {
+    name: { type: String, required: false },  // Display name
+    id: { type: String, required: false },    // Technical ID (numeric ID, UUID, etc.) - Optional
+    type: { type: String },                  // Item type (e.g., "jira_project", "jira_issue")
+    key: { type: String },                   // Short key/code (e.g., "PA" for Jira project) - CRITICAL for JQL
+    accountId: { type: String },             // Jira user accountId - needed for assignee/reporter JQL
+  },
+  { _id: false },
+);
+
 const messageSchema = new Schema<IMessage>(
   {
     messageType: {
@@ -120,7 +132,10 @@ const messageSchema = new Schema<IMessage>(
       modelName: { type: String },
       modelProvider: { type: String },
       chatMode: { type: String, default: 'quick' },
+      modelFriendlyName: { type: String },
     },
+    // Reference data for follow-up queries (stores IDs from tool responses)
+    referenceData: [referenceDataItemSchema],
   },
   { timestamps: true },
 );
@@ -158,6 +173,7 @@ const conversationSchema = new Schema<IConversation>(
       modelName: { type: String },
       modelProvider: { type: String },
       chatMode: { type: String, default: 'quick' },
+      modelFriendlyName: { type: String },
     },
     // Errors array to track errors during conversation
     conversationErrors: [

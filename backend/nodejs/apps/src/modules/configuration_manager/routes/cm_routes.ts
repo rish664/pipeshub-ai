@@ -4,8 +4,6 @@ import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import {
   createAIModelsConfig,
   createGoogleWorkspaceCredentials,
-  createKafkaConfig,
-  createRedisConfig,
   createSmtpConfig,
   createStorageConfig,
   getAIModelsConfig,
@@ -13,10 +11,8 @@ import {
   getGoogleAuthConfig,
   getGoogleWorkspaceOauthConfig,
   getGoogleWorkspaceCredentials,
-  getKafkaConfig,
   getMicrosoftAuthConfig,
   getOAuthConfig,
-  getRedisConfig,
   getSmtpConfig,
   getSsoAuthConfig,
   getStorageConfig,
@@ -26,14 +22,8 @@ import {
   setOAuthConfig,
   setSsoAuthConfig,
   setGoogleWorkspaceOauthConfig,
-  createArangoDbConfig,
-  getArangoDbConfig,
-  createMongoDbConfig,
-  getMongoDbConfig,
   deleteGoogleWorkspaceCredentials,
   getGoogleWorkspaceBusinessCredentials,
-  getQdrantConfig,
-  createQdrantConfig,
   getFrontendUrl,
   setFrontendUrl,
   getConnectorPublicUrl,
@@ -61,13 +51,15 @@ import {
   getAvailablePlatformFeatureFlags,
   getCustomSystemPrompt,
   setCustomSystemPrompt,
+  getSlackBotConfigs,
+  createSlackBotConfig,
+  updateSlackBotConfig,
+  deleteSlackBotConfig,
 } from '../controller/cm_controller';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
 import { ValidationMiddleware } from '../../../libs/middlewares/validation.middleware';
 import {
-  redisConfigSchema,
   smtpConfigSchema,
-  kafkaConfigSchema,
   aiModelsConfigSchema,
   storageValidationSchema,
   azureAdConfigSchema,
@@ -75,9 +67,6 @@ import {
   oauthConfigSchema,
   ssoConfigSchema,
   googleWorkspaceConfigSchema,
-  mongoDBConfigSchema,
-  arangoDBConfigSchema,
-  qdrantConfigSchema,
   platformSettingsSchema,
   urlSchema,
   metricsCollectionPushIntervalSchema,
@@ -91,20 +80,18 @@ import {
   atlassianCredentialsSchema,
   onedriveCredentialsSchema,
   sharepointCredentialsSchema,
+  createSlackBotConfigSchema,
+  updateSlackBotConfigSchema,
+  deleteSlackBotConfigSchema,
 } from '../validator/validators';
 import { FileProcessorFactory } from '../../../libs/middlewares/file_processor/fp.factory';
 import { FileProcessingType } from '../../../libs/middlewares/file_processor/fp.constant';
 import { metricsMiddleware } from '../../../libs/middlewares/prometheus.middleware';
-import {
-  checkArangoHealth,
-  checkKafkaHealth,
-  checkMongoHealth,
-  checkQdrantHealth,
-  checkRedisHealth,
-} from '../middlewares/health.middleware';
 
 import { userAdminCheck } from '../../user_management/middlewares/userAdminCheck';
 import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
+import { requireScopes } from '../../../libs/middlewares/require-scopes.middleware';
+import { OAuthScopeNames } from '../../../libs/enums/oauth-scopes.enum';
 import { AppConfig } from '../../tokens_manager/config/config';
 import {
   AuthenticatedUserRequest,
@@ -142,6 +129,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/storageConfig',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(storageValidationSchema),
@@ -157,6 +145,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/storageConfig',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getStorageConfig(keyValueStoreService),
@@ -180,6 +169,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/smtpConfig',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(smtpConfigSchema),
@@ -205,6 +195,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/connectors/atlassian/config',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -218,6 +209,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/connectors/atlassian/config',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(atlassianCredentialsSchema),
@@ -245,6 +237,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/connectors/onedrive/config',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -271,6 +264,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/connectors/sharepoint/config',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -310,6 +304,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/connectors/sharepoint/config',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(sharepointCredentialsSchema),
@@ -324,6 +319,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/connectors/onedrive/config',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(onedriveCredentialsSchema),
@@ -344,6 +340,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/smtpConfig',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getSmtpConfig(keyValueStoreService),
@@ -353,6 +350,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/authConfig/azureAd',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getAzureAdAuthConfig(keyValueStoreService),
@@ -368,6 +366,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/authConfig/azureAd',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(azureAdConfigSchema),
@@ -377,6 +376,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/authConfig/microsoft',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getMicrosoftAuthConfig(keyValueStoreService),
@@ -391,6 +391,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/authConfig/microsoft',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(azureAdConfigSchema),
@@ -400,6 +401,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/authConfig/google',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getGoogleAuthConfig(keyValueStoreService),
@@ -414,6 +416,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/authConfig/google',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(googleAuthConfigSchema),
@@ -423,6 +426,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/authConfig/sso',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getSsoAuthConfig(keyValueStoreService),
@@ -436,6 +440,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/authConfig/sso',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(ssoConfigSchema),
@@ -446,6 +451,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/authConfig/oauth',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getOAuthConfig(keyValueStoreService),
@@ -461,102 +467,18 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/authConfig/oauth',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(oauthConfigSchema),
     setOAuthConfig(keyValueStoreService),
   );
 
-  router.post(
-    '/mongoDBConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    ValidationMiddleware.validate(mongoDBConfigSchema),
-    checkMongoHealth,
-    createMongoDbConfig(keyValueStoreService),
-  );
-
-  router.get(
-    '/mongoDBConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    getMongoDbConfig(keyValueStoreService),
-  );
-
-  router.post(
-    '/arangoDBConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    ValidationMiddleware.validate(arangoDBConfigSchema),
-    checkArangoHealth,
-    createArangoDbConfig(keyValueStoreService),
-  );
-
-  router.get(
-    '/arangoDBConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    getArangoDbConfig(keyValueStoreService),
-  );
-
-  // keyValueStore config routes
-  /**
-   * POST /keyValueStoreConfig
-   * Creates or updates key-value store configuration in the key-value store
-   * Requires authentication
-   * @param {Object} req.body.keyValueStoreConfig - Key-value store configuration object to store
-   * @returns {Object} The stored configuration object
-   */
-  router.post(
-    '/redisConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    ValidationMiddleware.validate(redisConfigSchema),
-    checkRedisHealth,
-    createRedisConfig(keyValueStoreService),
-  );
-
-  /**
-   * GET /keyValueStoreConfig
-   * Retrieves the current key-value store configuration from key-value store
-   * Requires authentication
-   * @returns {Object} The stored configuration object or null if not found
-   */
-  router.get(
-    '/redisConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    getRedisConfig(keyValueStoreService),
-  );
-
-  router.post(
-    '/qdrantConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    ValidationMiddleware.validate(qdrantConfigSchema),
-    checkQdrantHealth,
-    createQdrantConfig(keyValueStoreService),
-  );
-
-  router.get(
-    '/qdrantConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    getQdrantConfig(keyValueStoreService),
-  );
-
   // Platform settings
   router.post(
     '/platform/settings',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(platformSettingsSchema),
@@ -566,6 +488,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/platform/settings',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getPlatformSettings(keyValueStoreService),
@@ -574,15 +497,59 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/platform/feature-flags/available',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getAvailablePlatformFeatureFlags(),
+  );
+
+  // Slack Bot configuration
+  router.get(
+    '/slack-bot',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    getSlackBotConfigs(keyValueStoreService),
+  );
+  router.get(
+    '/internal/slack-bot',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    metricsMiddleware(container),
+    getSlackBotConfigs(keyValueStoreService),
+  );
+
+  router.post(
+    '/slack-bot',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(createSlackBotConfigSchema),
+    createSlackBotConfig(keyValueStoreService),
+  );
+
+  router.put(
+    '/slack-bot/:configId',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(updateSlackBotConfigSchema),
+    updateSlackBotConfig(keyValueStoreService),
+  );
+
+  router.delete(
+    '/slack-bot/:configId',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(deleteSlackBotConfigSchema),
+    deleteSlackBotConfig(keyValueStoreService),
   );
 
   // Custom System Prompt routes
   router.get(
     '/prompts/system',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getCustomSystemPrompt(keyValueStoreService),
@@ -591,42 +558,12 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.put(
     '/prompts/system',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     setCustomSystemPrompt(keyValueStoreService),
   );
 
-  // message broker config routes
-  /**
-   * POST /messageBrokerConfig
-   * Creates or updates message broker configuration in the key-value store
-   * Requires authentication
-   * @param {Object} req.body.messageBrokerConfig - Message broker configuration object to store
-   * @returns {Object} The stored configuration object
-   */
-  router.post(
-    '/kafkaConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    ValidationMiddleware.validate(kafkaConfigSchema),
-    checkKafkaHealth,
-    createKafkaConfig(keyValueStoreService),
-  );
-
-  /**
-   * GET /messageBrokerConfig
-   * Retrieves the current message broker configuration from key-value store
-   * Requires authentication
-   * @returns {Object} The stored configuration object or null if not found
-   */
-  router.get(
-    '/kafkaConfig',
-    authMiddleware.authenticate,
-    userAdminCheck,
-    metricsMiddleware(container),
-    getKafkaConfig(keyValueStoreService),
-  );
 
   // Google Workspace Config Routes
   /**
@@ -639,6 +576,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/connectors/googleWorkspaceCredentials',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ...FileProcessorFactory.createJSONUploadProcessor({
@@ -698,6 +636,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/connectors/googleWorkspaceCredentials',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -760,6 +699,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/connectors/googleWorkspaceOauthConfig',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getGoogleWorkspaceOauthConfig(keyValueStoreService),
@@ -768,6 +708,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/connectors/googleWorkspaceOauthConfig',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(googleWorkspaceConfigSchema),
@@ -818,6 +759,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/aiModelsConfig',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(aiModelsConfigSchema),
@@ -833,6 +775,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/aiModelsConfig',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getAIModelsConfig(keyValueStoreService),
@@ -853,6 +796,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/ai-models',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getAIModelsProviders(keyValueStoreService),
@@ -868,6 +812,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/ai-models/:modelType',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(modelTypeSchema),
@@ -883,6 +828,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/ai-models/available/:modelType',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     metricsMiddleware(container),
     ValidationMiddleware.validate(modelTypeSchema),
     getAvailableModelsByType(keyValueStoreService),
@@ -896,6 +842,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/ai-models/providers',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(addProviderRequestSchema),
@@ -912,6 +859,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.put(
     '/ai-models/providers/:modelType/:modelKey',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(updateProviderRequestSchema),
@@ -928,6 +876,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.delete(
     '/ai-models/providers/:modelType/:modelKey',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(deleteProviderSchema),
@@ -944,6 +893,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.put(
     '/ai-models/default/:modelType/:modelKey',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(updateDefaultModelSchema),
@@ -953,6 +903,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/frontendPublicUrl',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     metricsMiddleware(container),
     getFrontendUrl(keyValueStoreService),
   );
@@ -960,6 +911,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/frontendPublicUrl',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     ValidationMiddleware.validate(urlSchema),
     metricsMiddleware(container),
@@ -973,6 +925,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/connectorPublicUrl',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     metricsMiddleware(container),
     getConnectorPublicUrl(keyValueStoreService),
   );
@@ -980,6 +933,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.post(
     '/connectorPublicUrl',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     ValidationMiddleware.validate(urlSchema),
     metricsMiddleware(container),
@@ -990,6 +944,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.put(
     '/metricsCollection/toggle',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     ValidationMiddleware.validate(metricsCollectionToggleSchema),
     metricsMiddleware(container),
@@ -1007,6 +962,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.get(
     '/metricsCollection',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
     userAdminCheck,
     metricsMiddleware(container),
     getMetricsCollection(keyValueStoreService),
@@ -1015,6 +971,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.patch(
     '/metricsCollection/pushInterval',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     ValidationMiddleware.validate(metricsCollectionPushIntervalSchema),
     metricsMiddleware(container),
@@ -1024,6 +981,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   router.patch(
     '/metricsCollection/serverUrl',
     authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
     ValidationMiddleware.validate(metricsCollectionRemoteServerSchema),
     metricsMiddleware(container),

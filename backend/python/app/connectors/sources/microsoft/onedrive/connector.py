@@ -15,7 +15,7 @@ from msgraph.generated.models.group import Group
 from msgraph.generated.models.subscription import Subscription
 
 from app.config.configuration_service import ConfigurationService
-from app.config.constants.arangodb import MimeTypes, OriginTypes
+from app.config.constants.arangodb import MimeTypes, OriginTypes, ProgressStatus
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.core.base.connector.connector_service import BaseConnector
 from app.connectors.core.base.data_processor.data_source_entities_processor import (
@@ -34,6 +34,7 @@ from app.connectors.core.registry.connector_builder import (
     ConnectorBuilder,
     ConnectorScope,
     DocumentationLink,
+    SyncStrategy,
 )
 from app.connectors.core.registry.filters import (
     FilterCategory,
@@ -55,12 +56,12 @@ from app.models.entities import (
     AppUser,
     AppUserGroup,
     FileRecord,
-    IndexingStatus,
     Record,
+    RecordGroup,
     RecordGroupType,
     RecordType,
 )
-from app.models.permission import EntityType, Permission
+from app.models.permission import EntityType, Permission, PermissionType
 from app.utils.streaming import create_stream_record_response, stream_content
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
@@ -143,7 +144,7 @@ class OneDriveCredentials:
             default_value=True
         ))
         .add_conditional_display("redirectUri", "hasAdminConsent", "equals", False)
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(True)
         .with_agent_support(True)
@@ -169,7 +170,7 @@ class OneDriveConnector(BaseConnector):
 
         # Batch processing configuration
         self.batch_size = 100
-        self.max_concurrent_batches = 3
+        self.max_concurrent_batches = 1 # set to 1 for now to avoid write write conflicts for small number of records
 
         self.rate_limiter = AsyncLimiter(50, 1)  # 50 requests per second
         self.sync_filters: FilterCollection = FilterCollection()
@@ -386,7 +387,6 @@ class OneDriveConnector(BaseConnector):
         """
         permissions = []
 
-
         for perm in msgraph_permissions:
             try:
                 # Handle user permissions
@@ -591,7 +591,7 @@ class OneDriveConnector(BaseConnector):
                         shared_disabled = record_update.record.is_shared and not self.indexing_filters.is_enabled(IndexingFilterKey.SHARED, default=True)
 
                         if files_disabled or shared_disabled:
-                            record_update.record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                            record_update.record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
 
 
                         yield (record_update.record, record_update.new_permissions or [], record_update)
@@ -707,7 +707,8 @@ class OneDriveConnector(BaseConnector):
     async def _sync_user_groups(self) -> None:
         """
         Unified user group synchronization.
-        Uses Graph Delta API for BOTH initial full sync and subsequent incremental syncs.
+        - First sync: Uses standard /groups API for clean current state
+        - Subsequent syncs: Uses Graph Delta API for incremental changes
         """
         try:
             sync_point_key = generate_record_sync_point_key(
@@ -717,96 +718,233 @@ class OneDriveConnector(BaseConnector):
             )
             sync_point = await self.user_group_sync_point.read_sync_point(sync_point_key)
 
-            # 1. Determine starting URL
-            # Default to fresh delta start
-            url = "https://graph.microsoft.com/v1.0/groups/delta"
-            # If we have a saved state, prefer nextLink (resuming interrupted sync) or deltaLink (incremental sync)
-            if sync_point:
-                 url = sync_point.get('nextLink') or sync_point.get('deltaLink') or url
+            delta_link = sync_point.get('deltaLink') if sync_point else None
 
-            self.logger.info("Starting user group sync...")
+            if delta_link is None:
+                self.logger.info("No sync point found, performing initial full sync...")
 
-            while True:
-                # 2. Fetch page of results
-                result = await self.msgraph_client.get_groups_delta_response(url)
-                groups = result.get('groups', [])
+                # IMPORTANT: Get delta link BEFORE full sync to avoid missing changes
+                # that occur during the sync
+                delta_link = await self._get_initial_delta_link()
 
-                self.logger.info(f"Fetched page with {len(groups)} groups")
+                # Perform the full sync
+                await self._perform_initial_full_sync()
 
-                # 3. Process each group in the current page
-                for group in groups:
-                    # A) Check for DELETION marker
-                    if hasattr(group, 'additional_data') and group.additional_data and '@removed' in group.additional_data:
-                         self.logger.info(f"[DELTA ACTION] 🗑️ REMOVE Group: {group.id}")
-                         await self.handle_delete_group(group.id)
-                         continue
-
-
-                    # B) Process ADD/UPDATE
-                    # Note: For a brand new initial sync, everything will fall into this bucket.
-                    self.logger.info(f"[DELTA ACTION] ✅ ADD/UPDATE Group: {getattr(group, 'display_name', 'N/A')} ({group.id})")
-                    await self.handle_group_create(group)
-
-                    # C) Trigger member sync for this group
-                    # C) Check for specific MEMBER changes in this delta
-                    member_changes = group.additional_data.get('members@delta', [])
-
-                    if member_changes:
-                         self.logger.info(f"    -> [ACTION] 👥 Processing {len(member_changes)} member changes for group: {group.id}")
-
-                    for member_change in member_changes:
-                        user_id = member_change.get('id')
-
-                        # 1. Fetch email (needed for both add and remove in your current processor)
-                        email = await self.msgraph_client.get_user_email(user_id)
-
-                        if not email:
-                            self.logger.warning(f"Could not find email for user ID {user_id}, skipping member change processing.")
-                            continue
-
-                        # 2. Handle based on change type
-                        if '@removed' in member_change:
-                            self.logger.info(f"    -> [ACTION] 👤⛔ REMOVING member: {email} ({user_id}) from group {group.id}")
-                            await self.data_entities_processor.on_user_group_member_removed(
-                                external_group_id=group.id,
-                                user_email=email,
-                                connector_id=self.connector_id
-                            )
-                        else:
-                            self.logger.info(f"    -> [ACTION] 👤✨ ADDING member: {email} ({user_id}) to group {group.id}")
-
-                # 4. Handle pagination and completion
-                if result.get('next_link'):
-                    # More data available, update URL for next loop iteration
-                    url = result.get('next_link')
-
-                    # Save intermediate 'nextLink' for resumability during a very long initial sync.
-                    await self.user_group_sync_point.update_sync_point(sync_point_key, {"nextLink": url, "deltaLink": None})
-
-                elif result.get('delta_link'):
-                    # End of current data stream. Save the delta_link for the NEXT run.
+                # Only save the delta link if full sync succeeded
+                if delta_link:
                     await self.user_group_sync_point.update_sync_point(
                         sync_point_key,
-                        {"nextLink": None, "deltaLink": result.get('delta_link')}
+                        {"nextLink": None, "deltaLink": delta_link}
                     )
-                    self.logger.info("User group sync cycle completed, delta link saved for next run.")
-                    break
+                    self.logger.info("Initial sync completed and delta link saved for future syncs")
                 else:
-                    # Fallback ensuring loop terminates if API returns neither link (unlikely standard behavior)
-                    self.logger.warning("Received response with neither next_link nor delta_link.")
-                    break
+                    self.logger.warning("Initial sync completed but no delta link was obtained")
+            else:
+                self.logger.info("Sync point found, performing incremental delta sync...")
+                await self._perform_delta_sync(delta_link, sync_point_key)
 
         except Exception as e:
-            self.logger.error(f"❌ Error in unified user group sync: {e}", exc_info=True)
+            self.logger.error(f"❌ Error in user group sync: {e}", exc_info=True)
             raise
 
-    async def handle_group_create(self, group: Group) -> None:
+
+    async def _get_initial_delta_link(self) -> Optional[str]:
+        """
+        Consumes the delta API to obtain a deltaLink checkpoint.
+        Called BEFORE initial full sync to ensure no changes are missed.
+
+        Returns:
+            The deltaLink string, or None if unable to obtain one.
+        """
+        self.logger.info("Obtaining delta link checkpoint before full sync...")
+
+        url = "https://graph.microsoft.com/v1.0/groups/delta"
+
+        try:
+            while True:
+                result = await self.msgraph_client.get_groups_delta_response(url)
+
+                # We ignore the data - just consuming to get the deltaLink
+                groups_count = len(result.get('groups', []))
+                self.logger.debug(f"Delta initialization: skipping page with {groups_count} groups")
+
+                if result.get('next_link'):
+                    url = result.get('next_link')
+                elif result.get('delta_link'):
+                    self.logger.info("Delta link obtained successfully")
+                    return result.get('delta_link')
+                else:
+                    self.logger.warning("Delta initialization: no next_link or delta_link received")
+                    return None
+        except Exception as e:
+            self.logger.error(f"❌ Error obtaining initial delta link: {e}", exc_info=True)
+            return None
+
+
+    async def _perform_initial_full_sync(self) -> None:
+        """
+        Performs initial full sync using the standard /groups API.
+        Gets current state of all groups and their members.
+        """
+        self.logger.info("Starting initial full user group synchronization")
+
+        groups = await self.msgraph_client.get_all_user_groups()
+
+        # Process all groups concurrently using asyncio.gather
+        results = await asyncio.gather(
+            *[self._process_single_group(group) for group in groups],
+            return_exceptions=True
+        )
+
+        # Filter out None results (failed groups) and exceptions
+        group_with_members = []
+        for result in results:
+            if isinstance(result, Exception):
+                self.logger.error(f"❌ Error processing group: {result}", exc_info=True)
+            elif result is not None:
+                group_with_members.append(result)
+
+        if group_with_members:
+            await self.data_entities_processor.on_new_user_groups(group_with_members)
+
+        self.logger.info(f"Initial full sync completed: processed {len(groups)} user groups")
+
+    async def _process_single_group(self, group) -> Optional[Tuple[AppUserGroup, List[AppUser]]]:
+        """
+        Processes a single group and returns a tuple of (user_group, app_users).
+        Returns None if processing fails.
+        """
+        try:
+            members = await self.msgraph_client.get_group_members(group.id)
+
+            user_group = AppUserGroup(
+                source_user_group_id=group.id,
+                app_name=self.connector_name,
+                connector_id=self.connector_id,
+                name=group.display_name,
+                description=group.description,
+                source_created_at=group.created_date_time.timestamp() if group.created_date_time else get_epoch_timestamp_in_ms(),
+            )
+
+            app_users = []
+            for member in members:
+                odata_type = getattr(member, 'odata_type', None) or (member.additional_data or {}).get('@odata.type', '')
+
+                if '#microsoft.graph.user' in odata_type:
+                    app_user = self._create_app_user_from_member(member)
+                    if app_user:
+                        app_users.append(app_user)
+                elif '#microsoft.graph.group' in odata_type:
+                    nested_users = await self._get_users_from_nested_group(member)
+                    app_users.extend(nested_users)
+                else:
+                    self.logger.debug(f"Skipping member type '{odata_type}' for member {member.id}")
+
+            return (user_group, app_users)
+
+        except Exception as e:
+            self.logger.error(f"❌ Error processing group {group.display_name}: {e}", exc_info=True)
+            return None
+
+
+    async def _perform_delta_sync(self, url: str, sync_point_key: str) -> None:
+        """
+        Performs incremental sync using the Graph Delta API.
+        Processes only changes since the last sync.
+        """
+
+        if not url:
+            self.logger.warning("No valid URL in sync point, falling back to full delta sync")
+            url = "https://graph.microsoft.com/v1.0/groups/delta"
+
+        self.logger.info("Starting incremental delta sync...")
+
+        while True:
+            result = await self.msgraph_client.get_groups_delta_response(url)
+            groups = result.get('groups', [])
+
+            self.logger.info(f"Fetched delta page with {len(groups)} group changes")
+
+            for group in groups:
+                # Handle group DELETION
+                if hasattr(group, 'additional_data') and group.additional_data and '@removed' in group.additional_data:
+                    self.logger.info(f"[DELTA] 🗑️ REMOVE Group: {group.id}")
+                    success = await self.handle_delete_group(group.id)
+                    if not success:
+                        self.logger.error(f"❌ Error handling group delete for {group.id}")
+                    continue
+
+                # Handle ADD/UPDATE
+                self.logger.info(f"[DELTA] ✅ ADD/UPDATE Group: {getattr(group, 'display_name', 'N/A')} ({group.id})")
+                success = await self.handle_group_create(group)
+                if not success:
+                    self.logger.error(f"❌ Error handling group create for {group.id}")
+                    continue
+
+                # Handle MEMBER changes
+                member_changes = (group.additional_data or {}).get('members@delta', [])
+
+                if member_changes:
+                    self.logger.info(f"    -> [DELTA] 👥 Processing {len(member_changes)} member changes for group: {group.id}")
+
+                for member_change in member_changes:
+                    await self._process_member_change(group.id, member_change)
+
+            # Handle pagination and completion
+            if result.get('next_link'):
+                url = result.get('next_link')
+                await self.user_group_sync_point.update_sync_point(
+                    sync_point_key,
+                    {"nextLink": url, "deltaLink": None}
+                )
+            elif result.get('delta_link'):
+                await self.user_group_sync_point.update_sync_point(
+                    sync_point_key,
+                    {"nextLink": None, "deltaLink": result.get('delta_link')}
+                )
+                self.logger.info("Delta sync completed, delta link saved for next run")
+                break
+            else:
+                self.logger.warning("Received response with neither next_link nor delta_link")
+                break
+
+
+    async def _process_member_change(self, group_id: str, member_change: dict) -> None:
+        """
+        Processes a single member change from the delta response.
+        """
+        user_id = member_change.get('id')
+        email = await self.msgraph_client.get_user_email(user_id)
+
+        if not email:
+            return
+
+        if '@removed' in member_change:
+            self.logger.info(f"    -> [DELTA] 👤⛔ REMOVING member: {email} ({user_id}) from group {group_id}")
+            success = await self.data_entities_processor.on_user_group_member_removed(
+                external_group_id=group_id,
+                user_email=email,
+                connector_id=self.connector_id
+            )
+            if not success:
+                self.logger.error(f"❌ Error removing member {email} from group {group_id}")
+        else:
+            self.logger.info(f"    -> [DELTA] 👤✨ ADDING member: {email} ({user_id}) to group {group_id}")
+
+    async def handle_group_create(self, group: Group) -> bool:
         """
         Handles the creation or update of a single user group.
         Fetches members and sends to data processor.
+
+        Supported member types:
+        - User: Added directly
+        - Group (nested): Fetch its users and add them (only one level deep)
+        - Device, Service Principal, Org Contact: Ignored
+
+        Returns:
+            True if group creation/update was successful, False otherwise.
         """
         try:
-
             # 1. Fetch latest members for this group
             members = await self.msgraph_client.get_group_members(group.id)
 
@@ -820,48 +958,125 @@ class OneDriveConnector(BaseConnector):
                 source_created_at=group.created_date_time.timestamp() if group.created_date_time else get_epoch_timestamp_in_ms(),
             )
 
-            # 3. Create AppUser entities for members
+            # 3. Create AppUser entities for members (filter by type)
             app_users = []
             for member in members:
-                app_user = AppUser(
-                    app_name=self.connector_name,
-                    source_user_id=member.id,
-                    email=member.mail or member.user_principal_name,
-                    full_name=member.display_name,
-                    source_created_at=member.created_date_time.timestamp() if member.created_date_time else get_epoch_timestamp_in_ms(),
-                    connector_id=self.connector_id,
-                )
-                app_users.append(app_user)
+                # Check the odata type to determine member type
+                odata_type = getattr(member, 'odata_type', None) or (member.additional_data or {}).get('@odata.type', '')
+
+                if '#microsoft.graph.user' in odata_type:
+                    # Direct user member
+                    app_user = self._create_app_user_from_member(member)
+                    if app_user:
+                        app_users.append(app_user)
+
+                elif '#microsoft.graph.group' in odata_type:
+                    # Nested group - fetch its users (one level deep only)
+                    nested_users = await self._get_users_from_nested_group(member)
+                    app_users.extend(nested_users)
+
+                else:
+                    self.logger.debug(f"Skipping member type '{odata_type}' for member {member.id}")
 
             # 4. Send to processor (wrapped in list as expected by on_new_user_groups)
             await self.data_entities_processor.on_new_user_groups([(user_group, app_users)])
 
-            self.logger.info(f"Processed group creation/update for: {group.display_name}")
+            self.logger.info(f"Processed group creation/update for: {group.display_name} with {len(app_users)} user members")
+            return True
 
         except Exception as e:
             self.logger.error(f"❌ Error handling group create for {getattr(group, 'id', 'unknown')}: {e}", exc_info=True)
+            return False
 
-    async def handle_delete_group(self, group_id: str) -> None:
+
+    async def _get_users_from_nested_group(self, nested_group) -> List[AppUser]:
+        """
+        Fetches users from a nested group (one level deep only).
+
+        Args:
+            nested_group: A group member object from Microsoft Graph API
+
+        Returns:
+            List of AppUser entities from the nested group
+        """
+        nested_group_name = getattr(nested_group, 'display_name', nested_group.id)
+        self.logger.info(f"Processing nested group member: {nested_group_name}")
+
+        app_users = []
+
+        try:
+            nested_members = await self.msgraph_client.get_group_members(nested_group.id)
+
+            for nested_member in nested_members:
+                nested_odata_type = getattr(nested_member, 'odata_type', None) or (nested_member.additional_data or {}).get('@odata.type', '')
+
+                if '#microsoft.graph.user' in nested_odata_type:
+                    app_user = self._create_app_user_from_member(nested_member)
+                    if app_user:
+                        app_users.append(app_user)
+                else:
+                    self.logger.debug(f"Skipping non-user member '{nested_odata_type}' in nested group {nested_group_name}")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch members from nested group {nested_group_name}: {e}")
+
+        return app_users
+
+
+    def _create_app_user_from_member(self, member) -> Optional[AppUser]:
+        """
+        Helper method to create an AppUser from a Graph API user member.
+
+        Args:
+            member: A user object from Microsoft Graph API
+
+        Returns:
+            AppUser if successful, None if user has no valid email
+        """
+        email = getattr(member, 'mail', None) or getattr(member, 'user_principal_name', None)
+
+        if not email:
+            self.logger.warning(f"User {member.id} has no email or user_principal_name, skipping")
+            return None
+
+        return AppUser(
+            app_name=self.connector_name,
+            source_user_id=member.id,
+            email=email,
+            full_name=getattr(member, 'display_name', None),
+            source_created_at=member.created_date_time.timestamp() if hasattr(member, 'created_date_time') and member.created_date_time else get_epoch_timestamp_in_ms(),
+            connector_id=self.connector_id,
+        )
+
+    async def handle_delete_group(self, group_id: str) -> bool:
         """
         Handles the deletion of a single user group.
         Calls the data processor to remove it from the database.
 
         Args:
             group_id: The external ID of the group to be deleted.
+
+        Returns:
+            True if group deletion was successful, False otherwise.
         """
         try:
             self.logger.info(f"Handling group deletion for: {group_id}")
 
             # Call the data entities processor to handle the deletion logic
-            await self.data_entities_processor.on_user_group_deleted(
+            success = await self.data_entities_processor.on_user_group_deleted(
                 external_group_id=group_id,
                 connector_id=self.connector_id
             )
 
-            self.logger.info(f"Successfully processed group deletion for: {group_id}")
+            if not success:
+                self.logger.error(f"❌ Error handling group delete for {group_id}")
+                return False
+
+            return True
 
         except Exception as e:
             self.logger.error(f"❌ Error handling group delete for {group_id}: {e}", exc_info=True)
+            return False
 
     async def _run_sync_with_yield(self, user_id: str) -> None:
         """
@@ -877,6 +1092,49 @@ class OneDriveConnector(BaseConnector):
             root_url = f"/users/{user_id}/drive/root/delta"
             sync_point_key = generate_record_sync_point_key(RecordType.DRIVE.value, "users", user_id)
             sync_point = await self.drive_delta_sync_point.read_sync_point(sync_point_key)
+
+            # Create RecordGroup if sync_point doesn't exist (first sync)
+            if not sync_point:
+                try:
+                    # Get user drive information
+                    drive = await self.msgraph_client.get_user_drive(user_id)
+                    # Get user info (email and display name)
+                    user_info = await self.msgraph_client.get_user_info(user_id)
+
+                    if user_info:
+                        # Create RecordGroup for the user's OneDrive
+                        display_name = user_info.get('display_name')
+                        user_email = user_info.get('email', user_id)
+
+                        if display_name:
+                            record_group_name = f"{display_name}'s OneDrive"
+                        else:
+                            record_group_name = f"OneDrive - {user_email}"
+
+                        record_group = RecordGroup(
+                            external_group_id=drive.id,
+                            name=record_group_name,
+                            group_type=RecordGroupType.DRIVE,
+                            connector_name=self.connector_name,
+                            connector_id=self.connector_id,
+                            web_url=getattr(drive, 'web_url', None),
+                            description=f"OneDrive for {display_name or user_email}",
+                        )
+
+                        owner_permission = Permission(
+                            email=user_email,
+                            type=PermissionType.OWNER,
+                            entity_type=EntityType.USER
+                        )
+
+                        # Save the RecordGroup
+                        await self.data_entities_processor.on_new_record_groups([(record_group, [owner_permission])])
+                        self.logger.info(f"Created RecordGroup for user {user_id} with drive ID {drive.id}")
+                    else:
+                        self.logger.warning(f"Could not fetch user info for {user_id}, skipping RecordGroup creation")
+                except Exception as e:
+                    self.logger.error(f"Error creating RecordGroup for user {user_id}: {e}", exc_info=True)
+                    # Continue with sync even if RecordGroup creation fails
 
             url = sync_point.get('deltaLink') or sync_point.get('nextLink') if sync_point else None
             if not url:
@@ -961,37 +1219,73 @@ class OneDriveConnector(BaseConnector):
             users: List of users to process
         """
         try:
-            # Get all active users
             all_active_users = await self.data_entities_processor.get_all_active_users()
             active_user_emails = {active_user.email.lower() for active_user in all_active_users}
 
-            # Filter users to sync
-            users_to_sync = [
+            # Filter users to sync (only active users)
+            active_users = [
                 user for user in users
                 if user.email and user.email.lower() in active_user_emails
             ]
 
-            self.logger.info(f"Processing {len(users_to_sync)} active users out of {len(users)} total users")
+            self.logger.info(f"Found {len(active_users)} active users out of {len(users)} total users")
+
+            # Further filter to only users with OneDrive provisioned
+            users_to_sync = []
+            for user in active_users:
+                if await self._user_has_onedrive(user.source_user_id):
+                    users_to_sync.append(user)
+                else:
+                    self.logger.info(f"Skipping user {user.email}: No OneDrive license or drive not provisioned")
+
+            self.logger.info(f"Processing {len(users_to_sync)} users with OneDrive out of {len(active_users)} active users")
 
             # Process users in concurrent batches
             for i in range(0, len(users_to_sync), self.max_concurrent_batches):
                 batch = users_to_sync[i:i + self.max_concurrent_batches]
 
-                # Run sync for batch of users concurrently
                 sync_tasks = [
                     self._run_sync_with_yield(user.source_user_id)
                     for user in batch
                 ]
 
                 await asyncio.gather(*sync_tasks, return_exceptions=True)
-
-                # Small delay between batches to prevent overwhelming the API
                 await asyncio.sleep(1)
 
             self.logger.info("Completed processing all user batches")
 
         except Exception as e:
             self.logger.error(f"❌ Error processing users in batches: {e}")
+            raise
+
+    async def _user_has_onedrive(self, user_id: str) -> bool:
+        """
+        Check if a user has OneDrive provisioned.
+
+        Args:
+            user_id: The user identifier
+
+        Returns:
+            True if user has OneDrive, False otherwise
+        """
+        try:
+            await self.msgraph_client.get_user_drive(user_id)
+            return True
+        except Exception as e:
+            error_message = str(e).lower()
+            error_code = ""
+
+            # Extract error code if it's an ODataError
+            if hasattr(e, 'error') and hasattr(e.error, 'code'):
+                error_code = e.error.code.lower() if e.error.code else ""
+
+            if any(indicator in error_message or indicator in error_code for indicator in [
+                "resourcenotfound",
+                "itemnotfound",
+                "request_resourcenotfound",
+                "404"
+            ]):
+                return False
             raise
 
     async def _detect_and_handle_permission_changes(self) -> None:

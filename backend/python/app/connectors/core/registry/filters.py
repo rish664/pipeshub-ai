@@ -227,12 +227,14 @@ class SyncFilterKey(str, Enum):
     SITE_NAMES = "site_names"
     CHANNEL_IDS = "channel_ids"
     BOOK_IDS = "book_ids"
+    GROUP_IDS = "group_ids"
 
     # Content filters
     CONTENT_STATUS = "content_status"
     FILE_EXTENSIONS = "file_extensions"
     MAX_FILE_SIZE = "max_file_size"
     PAGE_IDS = "page_ids"
+    DRIVE_IDS = "drive_ids"
     PAGE_NAMES = "page_names"
     BLOGPOST_IDS = "blogpost_ids"
 
@@ -259,6 +261,7 @@ class IndexingFilterKey(str, Enum):
 
     # Content types
     PAGES = "pages"
+    DATABASES = "databases"
     BLOGPOSTS = "blogposts"
     FILES = "files"
     DOCUMENTS = "documents"
@@ -267,6 +270,10 @@ class IndexingFilterKey(str, Enum):
     MESSAGES = "messages"
     ISSUES = "issues"
     TICKETS = "tickets"
+    GROUP_CONVERSATIONS = "group_conversations"
+    WEBPAGES = "webpages"
+    IMAGES = "images"
+    VIDEOS = "videos"
 
     # Child content types (generic)
     COMMENTS = "comments"
@@ -280,7 +287,11 @@ class IndexingFilterKey(str, Enum):
     ISSUE_COMMENTS = "issue_comments"
     ISSUE_ATTACHMENTS = "issue_attachments"
 
+    # Knowledge base
+    KNOWLEDGE_BASE = "knowledge_base"
+
     SHARED = "shared"
+    SHARED_WITH_ME = "shared_with_me"
 
 
 # Type to operators mapping (for validation and UI)
@@ -357,11 +368,7 @@ class FilterField:
     option_source_type: OptionSourceType = OptionSourceType.MANUAL
 
     def __post_init__(self) -> None:
-        """Set default values based on filter_type and validate configuration"""
-        if self.default_value is None:
-            self.default_value = self._get_default_for_type()
-        if self.default_operator is None:
-            self.default_operator = self._get_default_operator()
+        """Validate configuration"""
 
         # Auto-detect option_source_type if not explicitly set
         if self.option_source_type == OptionSourceType.MANUAL:
@@ -470,6 +477,21 @@ class Filter(BaseModel):
                         return data  # Will be caught in validation
                 else:
                     filter_type = filter_type_str
+
+                # Handle legacy operators (backward compatibility)
+                operator_migrations = {
+                    'equals': {
+                        FilterType.BOOLEAN: 'is',
+                        FilterType.NUMBER: 'equal',
+                        FilterType.STRING: 'is',
+                    }
+                }
+
+                if isinstance(operator_str, str) and operator_str in operator_migrations:
+                    migration_map = operator_migrations[operator_str]
+                    if filter_type in migration_map:
+                        operator_str = migration_map[filter_type]
+                        data['operator'] = operator_str
 
                 # Convert operator string to enum
                 if isinstance(operator_str, str):
@@ -792,7 +814,7 @@ class FilterCollection(BaseModel):
 
         Use for indexing filters:
             if not indexing_filters.is_enabled(IndexingFilterKey.PAGES):
-                record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
 
         Note: For non-boolean filters, this uses Python's truthiness rules:
             - Lists: True if non-empty

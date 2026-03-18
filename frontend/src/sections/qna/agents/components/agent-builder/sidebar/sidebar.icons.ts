@@ -9,7 +9,7 @@ import chevronRightIcon from '@iconify-icons/mdi/chevron-right';
 import searchIcon from '@iconify-icons/mdi/magnify';
 import clearIcon from '@iconify-icons/mdi/close';
 import inputOutputIcon from '@iconify-icons/mdi/swap-horizontal';
-import settingsIcon from '@iconify-icons/mdi/cog-outline';
+import settingsIcon from '@iconify-icons/mdi/open-in-new';
 import alertCircleIcon from '@iconify-icons/mdi/alert-circle-outline';
 import connectorIcon from '@iconify-icons/mdi/database-plus';
 
@@ -95,6 +95,7 @@ import calculatorIcon from '@iconify-icons/mdi/calculator';
 import googleDocsIcon from '@iconify-icons/logos/google';
 import googleMeetIcon from '@iconify-icons/logos/google-meet';
 import notionIcon from '@iconify-icons/logos/notion';
+import authenticatedIcon from '@iconify-icons/mdi/shield-check-outline';
 
 /**
  * Export all UI icons
@@ -108,6 +109,7 @@ export const UI_ICONS = {
   settings: settingsIcon,
   alertCircle: alertCircleIcon,
   connector: connectorIcon,
+  authenticated: authenticatedIcon,
 } as const;
 
 /**

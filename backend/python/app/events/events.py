@@ -1,9 +1,8 @@
-import asyncio
 import hashlib
-from io import BytesIO
+import os
+from typing import Any, AsyncGenerator, Dict
 from uuid import uuid4
 
-import aiohttp
 import fitz
 
 from app.config.configuration_service import ConfigurationService
@@ -14,145 +13,52 @@ from app.config.constants.arangodb import (
     MimeTypes,
     ProgressStatus,
 )
-from app.config.constants.http_status_code import HttpStatusCode
 from app.modules.parsers.pdf.ocr_handler import OCRStrategy
-from app.utils.jwt import generate_jwt
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 
 class EventProcessor:
-    def __init__(self, logger, processor, arango_service, config_service: ConfigurationService = None) -> None:
+    def __init__(self, logger, processor, graph_provider: IGraphDBProvider, config_service: ConfigurationService = None) -> None:
         self.logger = logger
         self.logger.info("🚀 Initializing EventProcessor")
         self.processor = processor
-        self.arango_service = arango_service
+        self.graph_provider = graph_provider
         self.config_service = config_service
 
 
 
-    async def _download_from_signed_url(
-        self, signed_url: str, record_id: str, doc: dict
-    ) -> bytes:
+    async def mark_record_status(self, doc: dict, status: ProgressStatus) -> None:
         """
-        Download file from signed URL with exponential backoff retry
-
-        Args:
-            signed_url: The signed URL to download from
-            record_id: Record ID for logging
-            doc: Document object for status updates
-
-        Returns:
-            bytes: The downloaded file content
+        Mark the record status to IN_PROGRESS
         """
-        chunk_size = 1024 * 1024 * 3  # 3MB chunks
-        max_retries = 3
-        base_delay = 1  # Start with 1 second delay
+        try:
+            record_id = doc.get("_key", "unknown")
 
-        timeout = aiohttp.ClientTimeout(
-            total=1200,  # 20 minutes total
-            connect=120,  # 2 minutes for initial connection
-            sock_read=1200,  # 20 minutes per chunk read
-        )
+            doc.update(
+                {
+                    "indexingStatus": status.value,
+                    "extractionStatus": status.value,
+                }
+            )
 
-        # Generate JWT token for authentication if config_service is available
-        headers = {}
-        if self.config_service:
-            try:
-                org_id = doc.get("orgId")
-                if org_id:
-                    jwt_payload = {
-                        "orgId": org_id,
-                        "scopes": ["connector:signedUrl"],
-                    }
-                    jwt_token = await generate_jwt(self.config_service, jwt_payload)
-                    headers["Authorization"] = f"Bearer {jwt_token}"
-                    self.logger.debug(f"Generated JWT token for downloading signed URL for record {record_id}")
-            except Exception as e:
-                self.logger.warning(f"Failed to generate JWT token for signed URL download: {e}")
+            docs = [doc]
+            await self.graph_provider.batch_upsert_nodes(
+                docs, CollectionNames.RECORDS.value
+            )
 
-        for attempt in range(max_retries):
-            delay = base_delay * (2**attempt)  # Exponential backoff
-            file_buffer = BytesIO()
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    try:
-                        async with session.get(signed_url, headers=headers) as response:
-                            if response.status != HttpStatusCode.SUCCESS.value:
-                                raise aiohttp.ClientError(
-                                    f"Failed to download file: {response.status}"
-                                )
+            self.logger.info(
+                f"🔍 Record {record_id}: Successfully updated status to {status.value}"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"❌ Record {doc.get('_key', 'unknown')}: Failed to mark record status "
+                f"to {status.value}: {repr(e)}"
+            )
+            if status == ProgressStatus.EMPTY:
+                raise Exception(f"Failed to mark record status to EMPTY: {repr(e)}") from e
 
-                            content_length = response.headers.get("Content-Length")
-                            if content_length:
-                                self.logger.info(
-                                    f"Expected file size: {int(content_length) / (1024*1024):.2f} MB"
-                                )
 
-                            last_logged_size = 0
-                            total_size = 0
-                            log_interval = chunk_size
-
-                            self.logger.info("Starting chunked download...")
-                            try:
-                                async for chunk in response.content.iter_chunked(
-                                    chunk_size
-                                ):
-                                    file_buffer.write(chunk)
-                                    total_size += len(chunk)
-                                    if total_size - last_logged_size >= log_interval:
-                                        self.logger.debug(
-                                            f"Total size so far: {total_size / (1024*1024):.2f} MB"
-                                        )
-                                        last_logged_size = total_size
-                            except IOError as io_err:
-                                raise aiohttp.ClientError(
-                                    f"IO error during chunk download: {str(io_err)}"
-                                )
-
-                            file_content = file_buffer.getvalue()
-                            self.logger.info(
-                                f"✅ Download complete. Total size: {total_size / (1024*1024):.2f} MB"
-                            )
-                            return file_content
-
-                    except aiohttp.ServerDisconnectedError as sde:
-                        raise aiohttp.ClientError(f"Server disconnected: {str(sde)}")
-                    except aiohttp.ClientConnectorError as cce:
-                        raise aiohttp.ClientError(f"Connection error: {str(cce)}")
-
-            except (aiohttp.ClientError, asyncio.TimeoutError, IOError) as e:
-                error_type = type(e).__name__
-                self.logger.warning(
-                    f"Download attempt {attempt + 1} failed with {error_type}: {str(e)}. "
-                    f"Retrying in {delay} seconds..."
-                )
-
-                if attempt == max_retries - 1:  # Last attempt failed
-                    self.logger.error(
-                        f"❌ All download attempts failed for record {record_id}. "
-                        f"Error type: {error_type}, Details: {repr(e)}"
-                    )
-                    doc.update(
-                        {
-                            "indexingStatus": ProgressStatus.FAILED.value,
-                            "extractionStatus": ProgressStatus.FAILED.value,
-                            "reason": (
-                                f"Download failed after {max_retries} attempts. "
-                                f"Error: {error_type} - {str(e)}. File id: {record_id}"
-                            ),
-                        }
-                    )
-                    await self.arango_service.batch_upsert_nodes(
-                        [doc], CollectionNames.RECORDS.value
-                    )
-                    raise Exception(
-                        f"Download failed after {max_retries} attempts. "
-                        f"Error: {error_type} - {str(e)}. File id: {record_id}"
-                    )
-                await asyncio.sleep(delay)
-            finally:
-                if not file_buffer.closed:
-                    file_buffer.close()
 
     async def _check_duplicate_by_md5(
         self,
@@ -181,16 +87,16 @@ class EventProcessor:
             md5_checksum = hashlib.md5(content).hexdigest()
             doc.update({"md5Checksum": md5_checksum})
             self.logger.info(f"🚀 Calculated md5_checksum: {md5_checksum} for record type: {record_type}")
-            await self.arango_service.batch_upsert_nodes([doc], CollectionNames.RECORDS.value)
+            await self.graph_provider.batch_upsert_nodes([doc], CollectionNames.RECORDS.value)
 
         if not md5_checksum:
             return False
 
-        duplicate_records = await self.arango_service.find_duplicate_records(
-            doc.get('_key'),
-            md5_checksum,
-            record_type,
-            size_in_bytes
+        duplicate_records = await self.graph_provider.find_duplicate_records(
+            record_key=doc.get('_key'),
+            md5_checksum=md5_checksum,
+            record_type=record_type,
+            size_in_bytes=size_in_bytes
         )
 
         duplicate_records = [r for r in duplicate_records if r is not None]
@@ -218,12 +124,11 @@ class EventProcessor:
                 "extractionStatus": processed_duplicate.get("extractionStatus"),
                 "lastExtractionTimestamp": get_epoch_timestamp_in_ms(),
             })
-            await self.arango_service.batch_upsert_nodes([doc], CollectionNames.RECORDS.value)
-
+            await self.graph_provider.batch_upsert_nodes([doc], CollectionNames.RECORDS.value)
             # Copy all relationships from the processed duplicate to this document
-            await self.arango_service.copy_document_relationships(
+            await self.graph_provider.copy_document_relationships(
                 processed_duplicate.get("_key"),
-                doc.get("_key")
+                doc.get("_key") or doc.get("id")
             )
             return True  # Duplicate handled
 
@@ -240,15 +145,16 @@ class EventProcessor:
             doc.update({
                 "indexingStatus": ProgressStatus.QUEUED.value,
             })
-            await self.arango_service.batch_upsert_nodes([doc], CollectionNames.RECORDS.value)
+            await self.graph_provider.batch_upsert_nodes([doc], CollectionNames.RECORDS.value)
             return True  # Marked as queued
 
         self.logger.info(f"🚀 No duplicate found, proceeding with processing for {doc.get('_key')}")
         return False  # No duplicate found, proceed with processing
 
-    async def on_event(self, event_data: dict) -> None:
+    async def on_event(self, event_data: dict) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Process events received from Kafka consumer
+        Process events received from Kafka consumer, yielding phase completion events.
+
         Args:
             event_data: Dictionary containing:
                 - event_type: Type of event (create, update, delete)
@@ -257,6 +163,11 @@ class EventProcessor:
                 - signed_url: Signed URL to download the file
                 - connector_name: Name of the connector
                 - metadata_route: Route to get metadata
+
+        Yields:
+            Dict with 'event' key:
+            - {'event': 'parsing_complete', 'data': {...}}
+            - {'event': 'indexing_complete', 'data': {...}}
         """
         try:
             # Extract event type and record ID
@@ -273,73 +184,25 @@ class EventProcessor:
                 self.logger.error("❌ No record ID provided in event data")
                 return
 
-            record = await self.arango_service.get_document(
+            record = await self.graph_provider.get_document(
                 record_id, CollectionNames.RECORDS.value
             )
 
+
             if virtual_record_id is None:
                 virtual_record_id = record.get("virtualRecordId")
-
-            # For both create and update events, we need to process the document
-            if event_type == EventTypes.REINDEX_RECORD.value:
-                # For updates, first delete existing embeddings
-                self.logger.info(
-                    f"""🔄 Deleting existing embeddings for record {record_id} for event {event_type}"""
-                )
-                await self.processor.indexing_pipeline.delete_embeddings(record_id, virtual_record_id)
-
-            # Update indexing status to IN_PROGRESS
 
             doc = dict(record)
 
             # Extract necessary data
             record_version = event_data.get("version", 0)
-            signed_url = event_data.get("signedUrl")
             connector = event_data.get("connectorName", "")
             extension = event_data.get("extension", "unknown")
             mime_type = event_data.get("mimeType", "unknown")
             origin = event_data.get("origin", "CONNECTOR" if connector != "" else "UPLOAD")
             record_name = event_data.get("recordName", f"Untitled-{record_id}")
 
-            if mime_type == "text/gmail_content":
-                if virtual_record_id is None:
-                    virtual_record_id = str(uuid4())
-
-                # MD5 deduplication for Gmail messages
-                html_content = event_data.get("body")
-                if html_content:
-                    try:
-                        if await self._check_duplicate_by_md5(html_content, doc):
-                            self.logger.info("Duplicate Gmail message detected, skipping processing")
-                            return
-
-                    except Exception as e:
-                        self.logger.error(f"❌ Error in Gmail MD5/duplicate processing: {repr(e)}")
-                        raise
-
-                if event_type == EventTypes.UPDATE_RECORD.value:
-                    virtual_record_id = str(uuid4())
-
-                self.logger.info("🚀 Processing Gmail Message")
-                result = await self.processor.process_gmail_message(
-                    recordName=record_name,
-                    recordId=record_id,
-                    version=record_version,
-                    source=connector,
-                    orgId=org_id,
-                    html_content=html_content,
-                    virtual_record_id = virtual_record_id
-                )
-
-                return result
-
-            if signed_url:
-                self.logger.debug("Signed URL received")
-                file_content = await self._download_from_signed_url(
-                    signed_url, record_id, doc
-                )
-            else:
-                file_content = event_data.get("buffer")
+            file_content = event_data.get("buffer")
 
             self.logger.debug(f"file_content type: {type(file_content)} length: {len(file_content)}")
 
@@ -349,10 +212,14 @@ class EventProcessor:
             try:
                 if await self._check_duplicate_by_md5(file_content, doc):
                     self.logger.info("Duplicate record detected, skipping processing")
+                    yield {"event": "parsing_complete", "data": {"record_id": record_id}}
+                    yield {"event": "indexing_complete", "data": {"record_id": record_id}}
                     return
             except Exception as e:
                 self.logger.error(f"❌ Error in MD5/duplicate processing: {repr(e)}")
                 raise
+
+            await self.mark_record_status(doc, ProgressStatus.IN_PROGRESS)
 
             if event_type == EventTypes.UPDATE_RECORD.value:
                 virtual_record_id = str(uuid4())
@@ -362,57 +229,61 @@ class EventProcessor:
 
             if mime_type == MimeTypes.GOOGLE_SLIDES.value:
                 self.logger.info("🚀 Processing Google Slides")
-                result = await self.processor.process_pptx_document(
+                async for event in self.processor.process_pptx_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     pptx_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
-                return result
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
+                return
 
             if mime_type == MimeTypes.GOOGLE_DOCS.value:
                 self.logger.info("🚀 Processing Google Docs")
-                result = await self.processor.process_docx_document(
+                async for event in self.processor.process_docx_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     docx_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
-                return result
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
+                return
 
             if mime_type == MimeTypes.GOOGLE_SHEETS.value:
                 self.logger.info("🚀 Processing Google Sheets")
-                result = await self.processor.process_excel_document(
+                async for event in self.processor.process_excel_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     excel_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
-                return result
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
+                return
 
             if mime_type == MimeTypes.HTML.value:
-                result = await self.processor.process_html_document(
+                async for event in self.processor.process_html_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     html_binary=file_content,
-                    virtual_record_id = virtual_record_id,
-                )
-                return result
+                    virtual_record_id=virtual_record_id,
+                ):
+                    yield event
+                return
 
             if mime_type == MimeTypes.PLAIN_TEXT.value:
-                result = await self.processor.process_txt_document(
+                async for event in self.processor.process_txt_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
@@ -423,8 +294,36 @@ class EventProcessor:
                     recordType=record_type,
                     connectorName=connector,
                     origin=origin
-                )
-                return result
+                ):
+                    yield event
+                return
+
+            if mime_type == MimeTypes.BLOCKS.value:
+                self.logger.info("🚀 Processing Blocks Container")
+                async for event in self.processor.process_blocks(
+                    recordName=record_name,
+                    recordId=record_id,
+                    version=record_version,
+                    source=connector,
+                    orgId=org_id,
+                    blocks_data=file_content,
+                    virtual_record_id=virtual_record_id,
+                ):
+                    yield event
+                return
+
+            if mime_type == MimeTypes.GMAIL.value:
+                async for event in self.processor.process_gmail_message(
+                    recordName=record_name,
+                    recordId=record_id,
+                    version=record_version,
+                    source=connector,
+                    orgId=org_id,
+                    html_content=file_content,
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
+                return
 
             if extension == ExtensionTypes.PDF.value or mime_type == MimeTypes.PDF.value:
                 # Check if document needs OCR before using docling
@@ -437,149 +336,200 @@ class EventProcessor:
                         ocr_pages = [OCRStrategy.needs_ocr(page, self.logger) for page in temp_doc]
                         needs_ocr = sum(ocr_pages) >= len(ocr_pages) * 0.5 if ocr_pages else False
 
-                    self.logger.info(f"📊 OCR requirement: {'YES - Using OCR handler' if needs_ocr else 'NO - Using Docling'}")
+                    self.logger.info(f"📊 OCR requirement: {'YES - Using OCR handler' if needs_ocr else 'NO - Using layout parser'}")
                 except Exception as e:
-                    self.logger.warning(f"⚠️ Error checking OCR need: {str(e)}, defaulting to Docling")
+                    self.logger.warning(f"⚠️ Error checking OCR need: {str(e)}, defaulting to layout parser")
                     needs_ocr = False
 
                 if needs_ocr:
                     # Skip docling and use OCR handler directly
-                    self.logger.info("🤖 PDF needs OCR, skipping Docling")
-                    result = await self.processor.process_pdf_document_with_ocr(
+                    self.logger.info("🤖 PDF needs OCR, skipping layout parser")
+                    async for event in self.processor.process_pdf_document_with_ocr(
                         recordName=record_name,
                         recordId=record_id,
                         version=record_version,
                         source=connector,
                         orgId=org_id,
                         pdf_binary=file_content,
-                        virtual_record_id = virtual_record_id
-                    )
+                        virtual_record_id=virtual_record_id
+                    ):
+                        yield event
                 else:
+                    use_pymupdf = os.environ.get("ENABLE_PYMUPDF_PROCESSOR", "false").lower() == "true"
+                    if use_pymupdf:
+                        self.logger.info("📄 Using PyMuPDF+OpenCV processor (ENABLE_PYMUPDF_PROCESSOR=true)")
+                        try:
+                            async for event in self.processor.process_pdf_with_pymupdf(
+                                recordName=record_name,
+                                recordId=record_id,
+                                pdf_binary=file_content,
+                                virtual_record_id=virtual_record_id
+                            ):
+                                yield event
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ PyMuPDF+OpenCV processing failed, falling back to OCR: {e}")
+                            async for event in self.processor.process_pdf_document_with_ocr(
+                                recordName=record_name,
+                                recordId=record_id,
+                                version=record_version,
+                                source=connector,
+                                orgId=org_id,
+                                pdf_binary=file_content,
+                                virtual_record_id=virtual_record_id
+                            ):
+                                yield event
+                    else:
                     # Use docling for PDFs that don't need OCR
-                    result = await self.processor.process_pdf_with_docling(
-                        recordName=record_name,
-                        recordId=record_id,
-                        pdf_binary=file_content,
-                        virtual_record_id = virtual_record_id
-                    )
-                    if result is False:
-                        result = await self.processor.process_pdf_document_with_ocr(
+                        docling_failed = False
+                        async for event in self.processor.process_pdf_with_docling(
                             recordName=record_name,
                             recordId=record_id,
-                            version=record_version,
-                            source=connector,
-                            orgId=org_id,
                             pdf_binary=file_content,
-                            virtual_record_id = virtual_record_id
-                        )
+                            virtual_record_id=virtual_record_id
+                        ):
+                            if event.get("event") == "docling_failed":
+                                docling_failed = True
+                            else:
+                                yield event
+
+                        if docling_failed:
+                            async for event in self.processor.process_pdf_document_with_ocr(
+                                recordName=record_name,
+                                recordId=record_id,
+                                version=record_version,
+                                source=connector,
+                                orgId=org_id,
+                                pdf_binary=file_content,
+                                virtual_record_id=virtual_record_id
+                            ):
+                                yield event
 
             elif extension == ExtensionTypes.DOCX.value or mime_type == MimeTypes.DOCX.value:
-                result = await self.processor.process_docx_document(
+                async for event in self.processor.process_docx_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     docx_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
 
             elif extension == ExtensionTypes.DOC.value or mime_type == MimeTypes.DOC.value:
-                result = await self.processor.process_doc_document(
+                async for event in self.processor.process_doc_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     doc_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
+
             elif extension == ExtensionTypes.XLSX.value or mime_type == MimeTypes.XLSX.value:
-                result = await self.processor.process_excel_document(
+                async for event in self.processor.process_excel_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     excel_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
+
             elif extension == ExtensionTypes.XLS.value or mime_type == MimeTypes.XLS.value:
-                result = await self.processor.process_xls_document(
+                async for event in self.processor.process_xls_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     xls_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
+
             elif extension == ExtensionTypes.CSV.value or mime_type == MimeTypes.CSV.value:
-                result = await self.processor.process_csv_document(
+                async for event in self.processor.process_delimited_document(
                     recordName=record_name,
                     recordId=record_id,
-                    version=record_version,
-                    source=connector,
-                    orgId=org_id,
-                    csv_binary=file_content,
-                    virtual_record_id = virtual_record_id,
-                    origin=origin,
-                )
+                    file_binary=file_content,
+                    virtual_record_id=virtual_record_id,
+                ):
+                    yield event
+
+            elif extension == ExtensionTypes.TSV.value or mime_type == MimeTypes.TSV.value:
+                async for event in self.processor.process_delimited_document(
+                    recordName=record_name,
+                    recordId=record_id,
+                    file_binary=file_content,
+                    virtual_record_id=virtual_record_id,
+                    extension=ExtensionTypes.TSV.value
+                ):
+                    yield event
 
             elif extension == ExtensionTypes.HTML.value or mime_type == MimeTypes.HTML.value:
-                result = await self.processor.process_html_document(
+                async for event in self.processor.process_html_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     html_binary=file_content,
-                    virtual_record_id = virtual_record_id,
-                )
+                    virtual_record_id=virtual_record_id,
+                ):
+                    yield event
 
             elif extension == ExtensionTypes.PPTX.value or mime_type == MimeTypes.PPTX.value:
-                result = await self.processor.process_pptx_document(
+                async for event in self.processor.process_pptx_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     pptx_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
 
             elif extension == ExtensionTypes.PPT.value or mime_type == MimeTypes.PPT.value:
-                result = await self.processor.process_ppt_document(
+                async for event in self.processor.process_ppt_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     ppt_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
 
             elif extension == ExtensionTypes.MD.value or mime_type == MimeTypes.MARKDOWN.value:
-                result = await self.processor.process_md_document(
+                async for event in self.processor.process_md_document(
                     recordName=record_name,
                     recordId=record_id,
                     md_binary=file_content,
-                    virtual_record_id = virtual_record_id
-                )
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
 
             elif extension == ExtensionTypes.MDX.value or mime_type == MimeTypes.MDX.value:
-                result = await self.processor.process_mdx_document(
+                async for event in self.processor.process_mdx_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
                     source=connector,
                     orgId=org_id,
                     mdx_content=file_content,
-                    virtual_record_id = virtual_record_id
-                )
+                    virtual_record_id=virtual_record_id
+                ):
+                    yield event
 
             elif extension == ExtensionTypes.TXT.value or mime_type == MimeTypes.PLAIN_TEXT.value:
-                result = await self.processor.process_txt_document(
+                async for event in self.processor.process_txt_document(
                     recordName=record_name,
                     recordId=record_id,
                     version=record_version,
@@ -590,7 +540,8 @@ class EventProcessor:
                     recordType=record_type,
                     connectorName=connector,
                     origin=origin
-                )
+                ):
+                    yield event
 
             elif (
                  extension in {
@@ -609,11 +560,12 @@ class EventProcessor:
                 }
             ):
                 # Route image files to the image processor
-                result = await self.processor.process_image(
+                async for event in self.processor.process_image(
                     record_id,
                     file_content,
                     virtual_record_id,
-                )
+                ):
+                    yield event
 
             else:
                 raise Exception(f"Unsupported file extension: {extension}")
@@ -621,7 +573,6 @@ class EventProcessor:
             self.logger.info(
                 f"✅ Successfully processed document for record {record_id}"
             )
-            return result
 
         except Exception as e:
             # Let the error bubble up to Kafka consumer

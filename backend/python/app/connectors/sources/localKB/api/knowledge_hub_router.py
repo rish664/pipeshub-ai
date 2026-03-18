@@ -5,14 +5,15 @@ from typing import Any, Dict, List, Optional, Set, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from app.api.middlewares.auth import require_scopes
+from app.config.constants.arangodb import ProgressStatus
+from app.config.constants.service import OAuthScopes
 from app.connectors.sources.localKB.api.knowledge_hub_models import (
     IncludeOption,
-    IndexingStatusFilter,
     KnowledgeHubErrorResponse,
     KnowledgeHubNodesResponse,
     NodeType,
     OriginType,
-    RecordTypeFilter,
     SortField,
     SortOrder,
 )
@@ -20,9 +21,10 @@ from app.connectors.sources.localKB.handlers.knowledge_hub_service import (
     KnowledgeHubService,
 )
 from app.containers.connector import ConnectorAppContainer
+from app.models.entities import RecordType
 
 knowledge_hub_router = APIRouter(
-    prefix="/api/v2/knowledge-hub",
+    prefix="/api/v1/knowledge-hub",
     tags=["Knowledge Hub"]
 )
 
@@ -46,11 +48,9 @@ async def get_knowledge_hub_service(request: Request) -> KnowledgeHubService:
     graph_provider = request.app.state.graph_provider
     return KnowledgeHubService(logger=logger, graph_provider=graph_provider)
 
-
 def _get_enum_values(enum_class) -> Set[str]:
     """Get all valid values from an enum class."""
     return {e.value for e in enum_class}
-
 
 def _validate_enum_values(
     values: Optional[List[str]],
@@ -68,7 +68,6 @@ def _validate_enum_values(
     valid = [v for v in values if v in valid_values]
     return valid if valid else None
 
-
 def _parse_comma_separated_str(value: Optional[str]) -> Optional[List[str]]:
     """Parses a comma-separated string into a list of strings, filtering out empty items."""
     if not value:
@@ -81,10 +80,16 @@ def _parse_comma_separated_str(value: Optional[str]) -> Optional[List[str]]:
         )
     return items if items else None
 
+# Collection app ID format: knowledgeBase_<orgId> (allowed for parent_id when parent_type is app)
+_KNOWLEDGE_BASE_APP_ID_PATTERN = re.compile(r'^knowledgeBase_[a-zA-Z0-9_-]+$')
+
 
 def _validate_uuid_format(value: Optional[str], field_name: str) -> None:
-    """Validate UUID format for IDs"""
+    """Validate UUID format for IDs, or knowledgeBase_<orgId> for Collection app."""
     if not value:
+        return
+
+    if _KNOWLEDGE_BASE_APP_ID_PATTERN.match(value):
         return
 
     uuid_pattern = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', re.IGNORECASE)
@@ -93,7 +98,6 @@ def _validate_uuid_format(value: Optional[str], field_name: str) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid UUID format for {field_name}: {value}"
         )
-
 
 def _parse_date_range(value: Optional[str]) -> Optional[Dict[str, Optional[int]]]:
     """Parse and validate date range from query parameter"""
@@ -119,7 +123,7 @@ def _parse_date_range(value: Optional[str]) -> Optional[Dict[str, Optional[int]]
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Invalid timestamp value: {val}"
-                    )
+                    ) from None
 
     # Validate gte <= lte
     if 'gte' in result and 'lte' in result and result['gte'] > result['lte']:
@@ -129,7 +133,6 @@ def _parse_date_range(value: Optional[str]) -> Optional[Dict[str, Optional[int]]
         )
 
     return result if result else None
-
 
 def _parse_size_range(value: Optional[str]) -> Optional[Dict[str, Optional[int]]]:
     """Parse and validate size range from query parameter"""
@@ -161,7 +164,7 @@ def _parse_size_range(value: Optional[str]) -> Optional[Dict[str, Optional[int]]
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Invalid size value: {val}"
-                    )
+                    ) from None
 
     # Validate gte <= lte
     if 'gte' in result and 'lte' in result and result['gte'] > result['lte']:
@@ -180,29 +183,30 @@ def _parse_size_range(value: Optional[str]) -> Optional[Dict[str, Optional[int]]
         400: {"model": KnowledgeHubErrorResponse},
         500: {"model": KnowledgeHubErrorResponse},
     },
+    dependencies=[Depends(require_scopes(OAuthScopes.KB_READ))],
 )
 async def get_knowledge_hub_root_nodes(
     request: Request,
     only_containers: bool = Query(False, description="Only return nodes with children (for sidebar)"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     limit: int = Query(50, ge=1, le=200, description="Items per page"),
-    sort_by: str = Query("name", description="Sort field: name, createdAt, updatedAt, size, type"),
-    sort_order: str = Query("asc", description="Sort order: asc or desc"),
+    sort_by: str = Query("updatedAt", description="Sort field: name, createdAt, updatedAt, size, type"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
     q: Optional[str] = Query(None, description="Full-text search query"),
     node_types: Optional[str] = Query(None, description="Comma-separated node types"),
     record_types: Optional[str] = Query(None, description="Comma-separated record types"),
-    origins: Optional[str] = Query(None, description="Comma-separated origins: KB, CONNECTOR"),
+    origins: Optional[str] = Query(None, description="Comma-separated origins: COLLECTION, CONNECTOR"),
     connector_ids: Optional[str] = Query(None, description="Comma-separated connector instance IDs"),
-    kb_ids: Optional[str] = Query(None, description="Comma-separated KB IDs"),
     indexing_status: Optional[str] = Query(None, description="Comma-separated indexing statuses"),
     created_at: Optional[str] = Query(None, description="Created date range: gte:timestamp,lte:timestamp"),
     updated_at: Optional[str] = Query(None, description="Updated date range: gte:timestamp,lte:timestamp"),
     size: Optional[str] = Query(None, description="Size range: gte:bytes,lte:bytes"),
+    flattened: bool = Query(False, description="Return flattened view with all nested children (even without filters)"),
     include: Optional[str] = Query(None, description="Comma-separated includes: breadcrumbs, counts, availableFilters, permissions"),
     knowledge_hub_service: KnowledgeHubService = Depends(get_knowledge_hub_service),
 ) -> Union[KnowledgeHubNodesResponse, Dict[str, Any]]:
     """
-    Get root level nodes (KBs and Apps) or search across all nodes.
+    Get root level nodes (Apps) or search across all nodes.
 
     For browsing children of a specific node, use:
     GET /nodes/{parent_type}/{parent_id}
@@ -222,11 +226,11 @@ async def get_knowledge_hub_root_nodes(
         record_types=record_types,
         origins=origins,
         connector_ids=connector_ids,
-        kb_ids=kb_ids,
         indexing_status=indexing_status,
         created_at=created_at,
         updated_at=updated_at,
         size=size,
+        flattened=flattened,
         include=include,
     )
 
@@ -238,6 +242,7 @@ async def get_knowledge_hub_root_nodes(
         400: {"model": KnowledgeHubErrorResponse},
         500: {"model": KnowledgeHubErrorResponse},
     },
+    dependencies=[Depends(require_scopes(OAuthScopes.KB_READ))],
 )
 async def get_knowledge_hub_children_nodes(
     request: Request,
@@ -246,27 +251,27 @@ async def get_knowledge_hub_children_nodes(
     only_containers: bool = Query(False, description="Only return nodes with children (for sidebar)"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     limit: int = Query(50, ge=1, le=200, description="Items per page"),
-    sort_by: str = Query("name", description="Sort field: name, createdAt, updatedAt, size, type"),
-    sort_order: str = Query("asc", description="Sort order: asc or desc"),
+    sort_by: str = Query("updatedAt", description="Sort field: name, createdAt, updatedAt, size, type"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
     q: Optional[str] = Query(None, description="Full-text search query"),
     node_types: Optional[str] = Query(None, description="Comma-separated node types"),
     record_types: Optional[str] = Query(None, description="Comma-separated record types"),
-    origins: Optional[str] = Query(None, description="Comma-separated origins: KB, CONNECTOR"),
+    origins: Optional[str] = Query(None, description="Comma-separated origins: COLLECTION, CONNECTOR"),
     connector_ids: Optional[str] = Query(None, description="Comma-separated connector instance IDs"),
-    kb_ids: Optional[str] = Query(None, description="Comma-separated KB IDs"),
     indexing_status: Optional[str] = Query(None, description="Comma-separated indexing statuses"),
     created_at: Optional[str] = Query(None, description="Created date range: gte:timestamp,lte:timestamp"),
     updated_at: Optional[str] = Query(None, description="Updated date range: gte:timestamp,lte:timestamp"),
     size: Optional[str] = Query(None, description="Size range: gte:bytes,lte:bytes"),
+    flattened: bool = Query(False, description="Return flattened view with all nested children (even without filters)"),
     include: Optional[str] = Query(None, description="Comma-separated includes: breadcrumbs, counts, availableFilters, permissions"),
     knowledge_hub_service: KnowledgeHubService = Depends(get_knowledge_hub_service),
 ) -> Union[KnowledgeHubNodesResponse, Dict[str, Any]]:
     """
     Get children of a specific node.
 
-    parent_type must be one of: app, kb, recordGroup, folder, record
+    parent_type must be one of: app, recordGroup, folder, record
     """
-    valid_types = {"app", "kb", "recordGroup", "folder", "record"}
+    valid_types = {"app", "recordGroup", "folder", "record"}
     if parent_type not in valid_types:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -287,11 +292,11 @@ async def get_knowledge_hub_children_nodes(
         record_types=record_types,
         origins=origins,
         connector_ids=connector_ids,
-        kb_ids=kb_ids,
         indexing_status=indexing_status,
         created_at=created_at,
         updated_at=updated_at,
         size=size,
+        flattened=flattened,
         include=include,
     )
 
@@ -311,11 +316,11 @@ async def _handle_get_nodes(
     record_types: Optional[str],
     origins: Optional[str],
     connector_ids: Optional[str],
-    kb_ids: Optional[str],
     indexing_status: Optional[str],
     created_at: Optional[str],
     updated_at: Optional[str],
     size: Optional[str],
+    flattened: bool,
     include: Optional[str],
 ) -> Union[KnowledgeHubNodesResponse, Dict[str, Any]]:
     """Shared handler for both root and children node retrieval."""
@@ -352,7 +357,6 @@ async def _handle_get_nodes(
         parsed_record_types = _parse_comma_separated_str(record_types)
         parsed_origins = _parse_comma_separated_str(origins)
         parsed_connector_ids = _parse_comma_separated_str(connector_ids)
-        parsed_kb_ids = _parse_comma_separated_str(kb_ids)
         parsed_indexing_status = _parse_comma_separated_str(indexing_status)
         parsed_include = _parse_comma_separated_str(include)
 
@@ -361,14 +365,14 @@ async def _handle_get_nodes(
             parsed_node_types, _get_enum_values(NodeType), "node_types"
         )
         parsed_record_types = _validate_enum_values(
-            parsed_record_types, _get_enum_values(RecordTypeFilter), "record_types"
+            parsed_record_types, _get_enum_values(RecordType), "record_types"
         )
         parsed_origins = _validate_enum_values(
             parsed_origins, _get_enum_values(OriginType), "origins"
         )
-        # connector_ids and kb_ids are dynamic, no enum validation needed
+        # connector_ids is dynamic, no enum validation needed
         parsed_indexing_status = _validate_enum_values(
-            parsed_indexing_status, _get_enum_values(IndexingStatusFilter), "indexing_status"
+            parsed_indexing_status, _get_enum_values(ProgressStatus), "indexing_status"
         )
         parsed_include = _validate_enum_values(
             parsed_include, _get_enum_values(IncludeOption), "include"
@@ -403,11 +407,11 @@ async def _handle_get_nodes(
             record_types=parsed_record_types,
             origins=parsed_origins,
             connector_ids=parsed_connector_ids,
-            kb_ids=parsed_kb_ids,
             indexing_status=parsed_indexing_status,
             created_at=parsed_created_at,
             updated_at=parsed_updated_at,
             size=parsed_size,
+            flattened=flattened,
             include=parsed_include,
         )
 
@@ -435,5 +439,5 @@ async def _handle_get_nodes(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Unexpected error: {str(e)}"
-        )
+        ) from e
 

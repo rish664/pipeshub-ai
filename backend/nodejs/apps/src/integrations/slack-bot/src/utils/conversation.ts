@@ -3,23 +3,21 @@ import { Conversation } from './db';
 interface SaveToDatabaseParams {
   threadId: string;
   conversationId: string;
+  botId: string;
   email: string;
 }
 
 export const saveToDatabase = async ({
   threadId,
   conversationId,
+  botId,
   email,
 }: SaveToDatabaseParams): Promise<void> => {
   try {
     await Conversation.updateOne(
-      { threadId, email },
+      { threadId, botId, email },
       { $set: { conversationId } },
       { upsert: true },
-    );
-
-    console.log(
-      `Saved to DB: threadId=${threadId}, conversationId=${conversationId}`,
     );
   } catch (error) {
     console.error('Error saving to database:', error);
@@ -29,15 +27,12 @@ export const saveToDatabase = async ({
 
 export const getFromDatabase = async (
   threadId: string,
+  botId: string,
   email: string,
 ): Promise<string | null> => {
   try {
-    const record = await Conversation.findOne({ threadId, email });
+    const record = await Conversation.findOne({ threadId, botId, email });
     if (record) {
-      console.log(
-        `Fetched from DB: threadId=${threadId}, conversationId=${record.conversationId}`,
-      );
-
       return record.conversationId;
     } else {
       console.log(`No record found for threadId=${threadId}`);

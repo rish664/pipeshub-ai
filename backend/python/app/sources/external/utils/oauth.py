@@ -1,13 +1,13 @@
-# ruff: noqa
-
 import base64
+import hashlib
 import os
 import secrets
+import string
 import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -17,22 +17,23 @@ import requests
 class GenericOAuth2Client:
     """Generic OAuth2 client that can be used with any OAuth2 provider.
 
-    Supports both "header" (Basic Auth) and "body" (POST body) authentication methods
-    for token exchange, making it compatible with various OAuth providers like:
+    Supports "header" (Basic Auth), "body" (POST body), and "pkce" (PKCE public
+    client) authentication methods for token exchange:
     - Bitbucket, Zoom, Google (header method)
     - Slack, Discord, Facebook (body method)
+    - Databricks U2M (pkce method — public client, no client_secret)
     """
 
     def __init__(
         self,
         client_id: str,
-        client_secret: str,
         auth_endpoint: str,
         token_endpoint: str,
         redirect_uri: str,
+        client_secret: Optional[str] = None,
         scope_delimiter: str = " ",
-        auth_method: str = "header",  # Options: 'header' (Basic Auth) or 'body'
-    ):
+        auth_method: str = "header",  # Options: 'header', 'body', 'pkce'
+    ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.auth_endpoint = auth_endpoint
@@ -40,6 +41,23 @@ class GenericOAuth2Client:
         self.redirect_uri = redirect_uri
         self.scope_delimiter = scope_delimiter
         self.auth_method = auth_method
+        self._code_verifier: Optional[str] = None
+
+        if self.auth_method in ('header', 'body') and not self.client_secret:
+            raise ValueError(f"client_secret is required for auth_method '{self.auth_method}'")
+
+    @staticmethod
+    def _generate_pkce() -> tuple:
+        """Generate PKCE code_verifier and code_challenge (S256).
+
+        Returns:
+            Tuple of (code_verifier, code_challenge)
+        """
+        allowed = string.ascii_letters + string.digits + "-._~"
+        code_verifier = "".join(secrets.choice(allowed) for _ in range(64))
+        digest = hashlib.sha256(code_verifier.encode()).digest()
+        code_challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+        return code_verifier, code_challenge
 
     def get_authorization_url(self, state: str, scopes: Optional[List[str]] = None) -> str:
         """Generates the URL to open in the browser.
@@ -61,6 +79,11 @@ class GenericOAuth2Client:
         if scopes:
             params["scope"] = self.scope_delimiter.join(scopes)
 
+        if self.auth_method == "pkce":
+            self._code_verifier, code_challenge = self._generate_pkce()
+            params["code_challenge"] = code_challenge
+            params["code_challenge_method"] = "S256"
+
         return f"{self.auth_endpoint}?{urlencode(params)}"
 
     def exchange_code_for_token(self, code: str) -> Dict[str, Any]:
@@ -80,6 +103,8 @@ class GenericOAuth2Client:
             "code": code,
             "redirect_uri": self.redirect_uri,
         }
+        if self.auth_method == "pkce" and self._code_verifier:
+            data["code_verifier"] = self._code_verifier
         return self._make_token_request(data)
 
     def refresh_token(self, refresh_token: str) -> Dict[str, Any]:
@@ -117,15 +142,19 @@ class GenericOAuth2Client:
             "Accept": "application/json",
         }
 
-        if self.auth_method == "header":
+        if self.auth_method == "pkce":
+            # "PKCE Public Client" (Used by Databricks U2M)
+            # Only client_id in body, no secret — security via code_verifier
+            data["client_id"] = self.client_id
+        elif self.auth_method == "header":
             # "Basic Auth" (Used by Bitbucket, Zoom, Google)
-            creds = f"{self.client_id}:{self.client_secret}"
+            creds = f"{self.client_id}:{self.client_secret or ''}"
             b64_creds = base64.b64encode(creds.encode()).decode()
             headers["Authorization"] = f"Basic {b64_creds}"
         else:
             # "Post Body" (Used by Slack, Discord, Facebook)
             data["client_id"] = self.client_id
-            data["client_secret"] = self.client_secret
+            data["client_secret"] = self.client_secret or ""
 
         try:
             response = requests.post(self.token_endpoint, data=data, headers=headers)
@@ -148,24 +177,23 @@ class GenericOAuth2Client:
 
 class OAuthHTTPServer(HTTPServer):
     """Custom HTTPServer that encapsulates OAuth callback state.
-    
     This class stores the authentication result state, making it thread-safe
     and allowing multiple concurrent OAuth flows without race conditions.
     """
-    
-    def __init__(self, server_address, RequestHandlerClass):
+
+    def __init__(self, server_address, RequestHandlerClass) -> None:
         super().__init__(server_address, RequestHandlerClass)
         # Initialize state for this server instance
-        self.auth_result = {"code": None, "state": None, "error": None}
+        self.auth_result: Dict[str, Optional[str]] = {"code": None, "state": None, "error": None}
 
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
     """HTTP request handler for OAuth callback redirects."""
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         """Handle GET requests from OAuth provider redirect."""
         # Access state from the server instance
-        auth_result = self.server.auth_result
+        auth_result = cast("OAuthHTTPServer", self.server).auth_result
         query = parse_qs(urlparse(self.path).query)
 
         if "code" in query:
@@ -178,14 +206,14 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
         else:
             self._send_response("Invalid response.", color="red")
 
-    def _send_response(self, message: str, color: str = "green"):
+    def _send_response(self, message: str, color: str = "green") -> None:
         """Send HTML response to browser."""
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(f"<h1 style='color:{color}'>{message}</h1>".encode())
+        _ = self.wfile.write(f"<h1 style='color:{color}'>{message}</h1>".encode())
 
-    def log_message(self, format, *args):
+    def log_message(self, format, *args) -> None:
         """Silence logging to reduce noise."""
         pass
 
@@ -210,10 +238,10 @@ def start_server(port: int = 8080) -> OAuthHTTPServer:
 
 def perform_oauth_flow(
     client_id: str,
-    client_secret: str,
     auth_endpoint: str,
     token_endpoint: str,
     redirect_uri: str,
+    client_secret: Optional[str] = None,
     scopes: Optional[List[str]] = None,
     scope_delimiter: str = " ",
     auth_method: str = "header",
@@ -232,13 +260,13 @@ def perform_oauth_flow(
 
     Args:
         client_id: OAuth client ID
-        client_secret: OAuth client secret
         auth_endpoint: OAuth authorization endpoint URL
         token_endpoint: OAuth token endpoint URL
         redirect_uri: OAuth redirect URI (must match registered callback)
+        client_secret: OAuth client secret (optional for PKCE public clients)
         scopes: Optional list of OAuth scopes
         scope_delimiter: Delimiter for scopes (default: " ")
-        auth_method: Authentication method - "header" or "body" (default: "header")
+        auth_method: Authentication method - "header", "body", or "pkce"
         port: Local server port (default: 8080)
         timeout: Maximum seconds to wait for callback (default: 60)
 
@@ -253,10 +281,10 @@ def perform_oauth_flow(
     # Initialize client
     client = GenericOAuth2Client(
         client_id=client_id,
-        client_secret=client_secret,
         auth_endpoint=auth_endpoint,
         token_endpoint=token_endpoint,
         redirect_uri=redirect_uri,
+        client_secret=client_secret,
         scope_delimiter=scope_delimiter,
         auth_method=auth_method,
     )
@@ -267,44 +295,53 @@ def perform_oauth_flow(
     # Start server & open browser
     # Each server instance has its own isolated auth_result state
     server = start_server(port)
-    auth_url = client.get_authorization_url(state=state, scopes=scopes)
 
-    print(f"Opening Browser: {auth_url}")
-    webbrowser.open(auth_url)
+    try:
+        auth_url = client.get_authorization_url(state=state, scopes=scopes)
 
-    # Wait for callback
-    # Access state from the server instance (thread-safe)
-    print("Waiting for callback...")
-    for _ in range(timeout * 2):  # Check every 0.5 seconds
-        if server.auth_result["code"] or server.auth_result["error"]:
-            break
-        time.sleep(0.5)
+        print("Opening Browser")
+        _ = webbrowser.open(auth_url)
 
-    # Verify & Exchange
-    if server.auth_result["error"]:
-        raise ValueError(f"Authorization Failed: {server.auth_result['error']}")
-    elif not server.auth_result["code"]:
-        raise TimeoutError("Timeout: No callback received within the timeout period.")
-    elif server.auth_result["state"] != state:
-        # CRITICAL SECURITY CHECK
-        raise ValueError(
-            f"SECURITY ALERT: State mismatch! Expected {state}, got {server.auth_result['state']}"
-        )
-    else:
-        print("✅ Authorization Code Received. Exchanging for Token...")
+        # Wait for callback
+        # Access state from the server instance (thread-safe)
+        print("Waiting for callback...")
+        for _ in range(timeout * 2):  # Check every 0.5 seconds
+            if server.auth_result["code"] or server.auth_result["error"]:
+                break
+            time.sleep(0.5)
+
+        # Verify & Exchange
+        if server.auth_result["error"]:
+            raise ValueError(f"Authorization Failed: {server.auth_result['error']}")
+        elif not server.auth_result["code"]:
+            raise TimeoutError("Timeout: No callback received within the timeout period.")
+        elif server.auth_result["state"] != state:
+            # CRITICAL SECURITY CHECK
+            raise ValueError(
+                f"SECURITY ALERT: State mismatch! Expected {state}, got {server.auth_result['state']}"
+            )
+        else:
+            print("✅ Authorization Code Received. Exchanging for Token...")
+            try:
+                return client.exchange_code_for_token(code=server.auth_result["code"])
+            except requests.exceptions.RequestException as e:
+                raise requests.exceptions.RequestException(
+                    f"Token Exchange Failed: {e}"
+                ) from e
+    finally:
+        # Close the server socket to release the port.
+        # Note: do NOT call server.shutdown() here — it blocks forever
+        # when handle_request() was used instead of serve_forever().
         try:
-            token_response = client.exchange_code_for_token(code=server.auth_result["code"])
-            print("🎉 SUCCESS! Token obtained.")
-            return token_response
-        except requests.exceptions.RequestException as e:
-            raise requests.exceptions.RequestException(
-                f"Token Exchange Failed: {e}"
-            ) from e
+            server.server_close()
+            print("🔒 OAuth server closed, port released.")
+        except Exception:
+            pass
 
 
 # --- 4. Main Execution (Configuration & Logic) ---
 
-def main():
+def main() -> None:
     """Standalone execution example for generic OAuth2 flow.
 
     Reads configuration from environment variables:
@@ -322,14 +359,6 @@ def main():
     client_secret = os.getenv("OAUTH_CLIENT_SECRET")
     auth_url = os.getenv("OAUTH_AUTH_URL")
     token_url = os.getenv("OAUTH_TOKEN_URL")
-    redirect_uri = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:8080/callback")
-
-    # Parse scopes from environment variable
-    scopes_str = os.getenv("OAUTH_SCOPES", "")
-    scope_delimiter = os.getenv("OAUTH_SCOPE_DELIMITER", " ")
-    scopes = [s.strip() for s in scopes_str.split(scope_delimiter)] if scopes_str else None
-
-    auth_method = os.getenv("OAUTH_AUTH_METHOD", "header")
 
     if not client_id or not client_secret:
         print("❌ Error: Missing Required Environment Variables")
@@ -342,17 +371,6 @@ def main():
         return
 
     try:
-        token_response = perform_oauth_flow(
-            client_id=client_id,
-            client_secret=client_secret,
-            auth_endpoint=auth_url,
-            token_endpoint=token_url,
-            redirect_uri=redirect_uri,
-            scopes=scopes,
-            scope_delimiter=scope_delimiter,
-            auth_method=auth_method,
-        )
-
         print("\n🎉 SUCCESS! Token Response:")
         print("\n💡 You can now use the 'access_token' from the response above.")
     except Exception as e:

@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback, forwardRef } from 'react';
 import {
   Paper,
   Box,
@@ -53,15 +53,19 @@ interface FiltersSectionProps {
   readOnly?: boolean; // If true, show read-only view (no editing)
 }
 
-const FiltersSection: React.FC<FiltersSectionProps> = ({
-  connectorConfig,
-  formData,
-  formErrors,
-  onFieldChange,
-  onRemoveFilter,
-  connectorId,
-  readOnly = false,
-}) => {
+const FiltersSection = forwardRef<HTMLDivElement, FiltersSectionProps>(
+  (
+    {
+      connectorConfig,
+      formData,
+      formErrors,
+      onFieldChange,
+      onRemoveFilter,
+      connectorId,
+      readOnly = false,
+    },
+    ref
+  ) => {
   const theme = useTheme();
   const isDark = theme.palette.mode === 'dark';
   const [addMenuAnchor, setAddMenuAnchor] = useState<{ [key: string]: HTMLElement | null }>({});
@@ -1001,18 +1005,16 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
     };
   }, []);
 
-  // Initialize indexing filters with default values on mount
   useEffect(() => {
     if (!connectorConfig) return;
 
     const indexingSchema = connectorConfig.config.filters?.indexing?.schema;
-    if (!indexingSchema?.fields) return;
+    const syncSchema = connectorConfig.config.filters?.sync?.schema;
 
-    // Initialize each indexing filter field with its default value if not already set
-    indexingSchema.fields.forEach((field) => {
+    // Initialize indexing filters
+    indexingSchema?.fields?.forEach((field) => {
       const existingValue = formData[field.name];
       
-      // Only initialize if not already set in formData
       if (existingValue === undefined || existingValue === null) {
         let defaultValue: FilterValue;
         if (field.defaultValue !== undefined) {
@@ -1037,7 +1039,42 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
         });
       }
     });
-  // Only run once when connectorConfig is first available
+
+    // Initialize sync filters (only those with explicit defaults)
+    let hasExplicitDefaults = false;
+    syncSchema?.fields?.forEach((field) => {
+      const existingValue = formData[field.name];
+      
+      if (existingValue === undefined || existingValue === null) {
+        if ((field.defaultOperator === null || field.defaultOperator === undefined) &&
+            (field.defaultValue === null || field.defaultValue === undefined)) {
+          return;
+        }
+        
+        hasExplicitDefaults = true;
+        let defaultValue: FilterValue;
+        const defaultOperator = field.defaultOperator || '';
+
+        if (defaultOperator.startsWith('last_')) {
+          defaultValue = null;
+        } else if (field.defaultValue !== undefined && field.defaultValue !== null) {
+          defaultValue = field.defaultValue;
+        } else {
+          return;
+        }
+
+        onFieldChange('filters', field.name, {
+          operator: defaultOperator,
+          value: defaultValue,
+          type: field.filterType,
+        });
+      }
+    });
+
+    // Auto-expand sync accordion if any defaults were initialized
+    if (hasExplicitDefaults) {
+      setExpandedAccordions((prev) => ({ ...prev, sync: true }));
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectorConfig?.name]);
 
@@ -1047,7 +1084,7 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
   const syncFilters = filters?.sync;
   const indexingFilters = filters?.indexing;
 
-  // Get the manual sync field from indexing filters
+  // Get the manual indexing field from indexing filters
   const manualSyncField = indexingFilters?.schema?.fields?.find(
     (field) => field.name === 'enable_manual_sync'
   );
@@ -1079,11 +1116,8 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
   }
 
 
-  /**
-   * Get default value for a filter field based on its type
-   */
   const getDefaultFilterValue = (field: FilterSchemaField): FilterValue => {
-    if (field.defaultValue !== undefined) {
+    if (field.defaultValue !== undefined && field.defaultValue !== null) {
       return field.defaultValue;
     }
     
@@ -1109,23 +1143,20 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
     
     if (!field) return;
     
-    // Expand accordion first if it's closed
-    const isCurrentlyExpanded = expandedAccordions[filterType] ?? false;
-    if (!isCurrentlyExpanded) {
+    if (!expandedAccordions[filterType]) {
       setExpandedAccordions((prev) => ({ ...prev, [filterType]: true }));
     }
     
-    // Initialize filter with default values
     const defaultValue = getDefaultFilterValue(field);
+    const defaultOperator = field.defaultOperator ?? 
+      (field.operators && field.operators.length > 0 ? field.operators[0] : '');
     
-    // Add the filter
     onFieldChange('filters', fieldName, {
-      operator: field.defaultOperator || '',
+      operator: defaultOperator,
       value: defaultValue,
       type: field.filterType,
     });
     
-    // Close menu after a brief delay to allow accordion expansion to be visible
     setTimeout(() => {
       setAddMenuAnchor((prev) => ({ ...prev, [filterType]: null }));
     }, 150);
@@ -1159,9 +1190,9 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
       // Exclude enable_manual_sync from indexing filters accordion
       (field) => filterType !== 'indexing' || field.name !== 'enable_manual_sync'
     );
-    const activeFilterNames = Object.keys(formData).filter(
-      (key) => formData[key] !== undefined && formData[key] !== null
-    );
+    // Only consider filters with a valid operator as "active" (consistent with getActiveFilters)
+    // This ensures filters with invalid defaults don't get stuck in limbo
+    const activeFilterNames = Object.keys(formData).filter((key) => !!formData[key]?.operator);
     
     return availableFields.filter((field) => !activeFilterNames.includes(field.name));
   };
@@ -2218,7 +2249,7 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
                   borderRadius: 0.75,
                 }}
               >
-                Add Filter
+                Add Filters
               </Button>
             )}
           </Box>
@@ -2314,7 +2345,7 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
                         },
                       }}
                     >
-                      Add Filter
+                      Add Filters
                     </Button>
                   )}
                 </Box>
@@ -2375,6 +2406,7 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
 
   return (
     <Box 
+      ref={ref}
       sx={{ 
         display: 'flex', 
         flexDirection: 'column', 
@@ -2382,7 +2414,7 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
         height: '100%',
       }}
     >
-      {/* Manual Sync Control - Only show if the connector has indexing filters */}
+      {/* Manual Indexing Control - Only show if the connector has indexing filters */}
       {hasIndexingFilters && manualSyncField && (
         <Paper
           elevation={0}
@@ -2749,6 +2781,8 @@ const FiltersSection: React.FC<FiltersSectionProps> = ({
       </Alert>
     </Box>
   );
-};
+});
+
+FiltersSection.displayName = 'FiltersSection';
 
 export default FiltersSection;

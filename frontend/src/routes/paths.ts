@@ -49,10 +49,17 @@ export const paths = {
       details: (id: string) => `${ROOTS.DASHBOARD}/workflows/${id}`,
       edit: (id: string) => `${ROOTS.DASHBOARD}/workflows/${id}/edit`,
     },
+    collections: {
+      root: `${ROOTS.DASHBOARD}collections`,
+    },
+    knowledgeSearch: {
+      root: `${ROOTS.DASHBOARD}knowledge-search`,
+    },
     knowledgebase: {
       root: `${ROOTS.DASHBOARD}knowledge-base/details`,
       search: `${ROOTS.DASHBOARD}knowledge-base/search`,
     },
+    allRecords: `${ROOTS.DASHBOARD}all-records`,
     copilot: {
       root: `${ROOTS.DASHBOARD}copilot`,
     },
@@ -65,5 +72,33 @@ export const paths = {
       flowEdit: (agentKey: string) => `${ROOTS.DASHBOARD}agents/${agentKey}/flow`,
       conversation: (agentKey: string, conversationKey: string) => `${ROOTS.DASHBOARD}agent/${agentKey}/conv/${conversationKey}`,
     },
+    // Account settings (OAuth 2.0 apps live under company-settings or individual)
+    account: {
+      companySettings: {
+        settings: {
+          oauth2: {
+            root: '/account/company-settings/settings/oauth2',
+            new: '/account/company-settings/settings/oauth2/new',
+            app: (appId: string) => `/account/company-settings/settings/oauth2/${appId}`,
+          },
+        },
+      },
+      individual: {
+        settings: {
+          oauth2: {
+            root: '/account/individual/settings/oauth2',
+            new: '/account/individual/settings/oauth2/new',
+            app: (appId: string) => `/account/individual/settings/oauth2/${appId}`,
+          },
+        },
+      },
+    },
   },
 };
+
+/** Resolve OAuth 2.0 paths from current pathname (company-settings vs individual). */
+export function getOAuth2Paths(pathname: string) {
+  return pathname.startsWith('/account/company-settings')
+    ? paths.dashboard.account.companySettings.settings.oauth2
+    : paths.dashboard.account.individual.settings.oauth2;
+}

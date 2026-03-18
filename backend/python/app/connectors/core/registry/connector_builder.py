@@ -16,6 +16,7 @@ from app.connectors.core.registry.filters import (
     FilterField,
     FilterOption,
     FilterType,
+    MultiselectOperator,
     OptionSourceType,
 )
 from app.connectors.core.registry.oauth_config_registry import get_oauth_config_registry
@@ -26,6 +27,12 @@ class ConnectorScope(str, Enum):
     """Connector scope types."""
     PERSONAL = "personal"
     TEAM = "team"
+
+class SyncStrategy(str, Enum):
+    """Sync strategy types."""
+    MANUAL = "MANUAL"
+    SCHEDULED = "SCHEDULED"
+    WEBHOOK = "WEBHOOK"
 
 
 class ConnectorConfigBuilder:
@@ -42,6 +49,7 @@ class ConnectorConfigBuilder:
             "supportsSync": True,
             "supportsAgent": True,
             "documentationLinks": [],
+            "hideConnector": False,
             "auth": {
                 "supportedAuthTypes": ["OAUTH"],
                 "schemas": {},  # Per-auth-type schemas: {"OAUTH": {"fields": []}, "API_TOKEN": {"fields": []}}
@@ -52,8 +60,8 @@ class ConnectorConfigBuilder:
                 "conditionalDisplay": {}
             },
             "sync": {
-                "supportedStrategies": ["MANUAL"],
-                "selectedStrategy": "MANUAL",
+                "supportedStrategies": [SyncStrategy.MANUAL.value],
+                "selectedStrategy": SyncStrategy.MANUAL.value,
                 "webhookConfig": {
                     "supported": False,
                     "webhookUrl": "",
@@ -112,6 +120,11 @@ class ConnectorConfigBuilder:
     def with_agent_support(self, supported: bool = True) -> 'ConnectorConfigBuilder':
         """Enable or disable agent support"""
         self.config["supportsAgent"] = supported
+        return self
+
+    def with_hide_connector(self, hide: bool = True) -> 'ConnectorConfigBuilder':
+        """Set whether to hide the connector from the UI"""
+        self.config["hideConnector"] = hide
         return self
 
     def add_documentation_link(self, link: DocumentationLink) -> 'ConnectorConfigBuilder':
@@ -217,10 +230,10 @@ class ConnectorConfigBuilder:
 
         return self
 
-    def with_sync_strategies(self, strategies: List[str], selected: str = "MANUAL") -> 'ConnectorConfigBuilder':
+    def with_sync_strategies(self, strategies: List[SyncStrategy], selected: SyncStrategy = SyncStrategy.MANUAL) -> 'ConnectorConfigBuilder':
         """Configure sync strategies"""
-        self.config["sync"]["supportedStrategies"] = strategies
-        self.config["sync"]["selectedStrategy"] = selected
+        self.config["sync"]["supportedStrategies"] = [strategy.value for strategy in strategies]
+        self.config["sync"]["selectedStrategy"] = selected.value
         return self
 
     def with_webhook_config(self, supported: bool = True, events: Optional[List[str]] = None) -> 'ConnectorConfigBuilder':
@@ -229,7 +242,7 @@ class ConnectorConfigBuilder:
         if events:
             self.config["sync"]["webhookConfig"]["events"] = events
         if supported and "WEBHOOK" not in self.config["sync"]["supportedStrategies"]:
-            self.config["sync"]["supportedStrategies"].append("WEBHOOK")
+            self.config["sync"]["supportedStrategies"].append(SyncStrategy.WEBHOOK.value)
         return self
 
     def with_scheduled_config(self, supported: bool = True, interval_minutes: int = 60) -> 'ConnectorConfigBuilder':
@@ -237,7 +250,7 @@ class ConnectorConfigBuilder:
         if supported:
             self.config["sync"]["scheduledConfig"]["intervalMinutes"] = interval_minutes
             if "SCHEDULED" not in self.config["sync"]["supportedStrategies"]:
-                self.config["sync"]["supportedStrategies"].append("SCHEDULED")
+                self.config["sync"]["supportedStrategies"].append(SyncStrategy.SCHEDULED.value)
         return self
 
     def add_sync_custom_field(self, field: CustomField) -> 'ConnectorConfigBuilder':
@@ -250,7 +263,8 @@ class ConnectorConfigBuilder:
             "required": field.required,
             "defaultValue": field.default_value,
             "validation": {},
-            "isSecret": field.is_secret
+            "isSecret": field.is_secret,
+            "nonEditable": field.non_editable
         }
 
         if field.options:
@@ -312,6 +326,7 @@ class ConnectorBuilder:
         self.config_builder = ConnectorConfigBuilder()
         self.connector_scopes: List[ConnectorScope] = []
         self._oauth_configs: Dict[str, OAuthConfig] = {}  # Store OAuth configs for auto-registration
+        self.connector_info: Optional[str] = None
 
     def in_group(self, app_group: str) -> 'ConnectorBuilder':
         """Set the app group"""
@@ -396,6 +411,11 @@ class ConnectorBuilder:
         self.app_categories = categories
         return self
 
+    def with_info(self, info: str) -> 'ConnectorBuilder':
+        """Set connector info that will be displayed on the frontend connector page"""
+        self.connector_info = info
+        return self
+
     def configure(self, config_func: Callable[[ConnectorConfigBuilder], ConnectorConfigBuilder]) -> 'ConnectorBuilder':
         """Configure the connector using a configuration function"""
         self.config_builder = config_func(self.config_builder)
@@ -466,7 +486,8 @@ class ConnectorBuilder:
             app_description=self.app_description,
             app_categories=self.app_categories,
             config=config,
-            connector_scopes=self.connector_scopes
+            connector_scopes=self.connector_scopes,
+            connector_info=self.connector_info
         )
 
     def _validate_required_auth_fields(self, config: Dict[str, Any]) -> None:
@@ -589,16 +610,24 @@ class CommonFields:
         )
 
     @staticmethod
-    def api_token(token_name: str = "API Token", placeholder: str = "") -> AuthField:
-        """Standard API token field"""
+    def api_token(token_name: str = "API Token", placeholder: str = "", field_name: Optional[str] = None, required: bool = True) -> AuthField:
+        """Standard API token field
+
+        Args:
+            token_name: Display name for the token field
+            placeholder: Placeholder text for the input field
+            field_name: Optional custom field name (defaults to "apiToken")
+            required: Whether the field is required (defaults to True)
+        """
         return AuthField(
-            name="apiToken",
+            name=field_name or "apiToken",
             display_name=token_name,
             placeholder=placeholder or f"Enter your {token_name}",
             description=f"The {token_name} from your application settings",
             field_type="PASSWORD",
             max_length=2000,
-            is_secret=True
+            is_secret=True,
+            required=required
         )
 
     @staticmethod
@@ -652,15 +681,24 @@ class CommonFields:
         )
 
     @staticmethod
-    def file_extension_filter(options_endpoint: Optional[str] = None) -> FilterField:
-        """Standard file extension filter"""
+    def file_extension_filter(
+        description: Optional[str] = None,
+        display_name: str = "File Extensions",
+        options_endpoint: Optional[str] = None,
+    ) -> FilterField:
+        """
+        Standard file extension filter (static multiselect).
+
+        Note: options_endpoint is reserved for a future dynamic-options implementation.
+        """
         return FilterField(
             name="file_extensions",
-            display_name="Sync Files with Extensions",
+            display_name=display_name,
             filter_type=FilterType.MULTISELECT,
             category=FilterCategory.SYNC,
-            description="Sync files with specific extensions",
-            default_value=True,
+            description=description
+            or "Filter files by extension (e.g., pdf, docx, txt). Leave empty to sync all files.",
+            default_operator=MultiselectOperator.IN.value,
             option_source_type=OptionSourceType.STATIC,
             options=[
                 FilterOption(id=ext.value, label=f".{ext.value}")
@@ -714,10 +752,10 @@ class CommonFields:
 
     @staticmethod
     def enable_manual_sync_filter() -> FilterField:
-        """Standard manual sync control filter (master switch for indexing)"""
+        """Standard manual indexing control filter (master switch for indexing)"""
         return FilterField(
             name="enable_manual_sync",
-            display_name="Enable Manual Sync",
+            display_name="Enable Manual Indexing",
             filter_type=FilterType.BOOLEAN,
             category=FilterCategory.INDEXING,
             description="Disable automatic indexing for all synced records.",

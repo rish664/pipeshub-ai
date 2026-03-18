@@ -375,6 +375,8 @@ export const GridView: React.FC<GridViewProps> = ({
         return 'success';
       case 'IN_PROGRESS':
         return 'info';
+      case 'PROCESSING':
+        return 'info';
       case 'FAILED':
         return 'error';
       case 'NOT_STARTED':
@@ -391,6 +393,8 @@ export const GridView: React.FC<GridViewProps> = ({
         return 'info';
       case 'ENABLE_MULTIMODAL_MODELS':
         return 'info';
+      case 'CONNECTOR_DISABLED':
+        return 'warning';
       default:
         return 'default';
     }
@@ -403,7 +407,7 @@ export const GridView: React.FC<GridViewProps> = ({
       case 'FILE_TYPE_NOT_SUPPORTED':
         return 'Not Supported';
       case 'AUTO_INDEX_OFF':
-        return 'Manual Sync';
+        return 'Manual Indexing';
       case 'EMPTY':
         return 'Empty';
       case 'ENABLE_MULTIMODAL_MODELS':
@@ -412,6 +416,8 @@ export const GridView: React.FC<GridViewProps> = ({
         return 'Not Started';
       case 'IN_PROGRESS':
         return 'In Progress';
+      case 'PROCESSING':
+        return 'Processing';
       case 'PAUSED':
         return 'Paused';
       case 'QUEUED':
@@ -437,7 +443,8 @@ export const GridView: React.FC<GridViewProps> = ({
       type: isFolder ? 'folder' : 'file',
       extension: item.extension || item.fileRecord?.extension,
       mimeType: item.fileRecord?.mimeType,
-      sizeInBytes: item.sizeInBytes || item.fileRecord?.sizeInBytes,
+      // Using ?? (nullish coalescing) to correctly handle 0 as a valid file size
+      sizeInBytes: item.sizeInBytes ?? item.fileRecord?.sizeInBytes,
       updatedAt: item.updatedAtTimestamp || item.updatedAt || item.sourceLastModifiedTimestamp,
       createdAt: item.createdAtTimestamp || item.createdAt || item.sourceCreatedAtTimestamp,
       indexingStatus: item.indexingStatus,
@@ -607,25 +614,42 @@ export const GridView: React.FC<GridViewProps> = ({
                         {/* Status and origin chips */}
                         <Stack direction="row" spacing={0.5} alignItems="center">
                           {itemData.indexingStatus && (
-                            <Chip
-                              label={getStatusLabel(itemData.indexingStatus)}
-                              size="small"
-                              color={getStatusColor(itemData.indexingStatus) as any}
-                              variant="outlined"
+                            <Box
                               sx={{
-                                fontSize: '0.65rem',
-                                height: 20,
-                                fontWeight: 500,
-                                borderRadius: 1,
-                                '& .MuiChip-label': {
-                                  px: 0.75,
-                                },
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 0.5,
                               }}
-                            />
+                            >
+                              {(itemData.indexingStatus === 'PROCESSING' || (itemData as any).isProcessing) && (
+                                <CircularProgress
+                                  size={12}
+                                  thickness={4}
+                                  sx={{
+                                    color: theme.palette.info.main,
+                                  }}
+                                />
+                              )}
+                              <Chip
+                                label={getStatusLabel(itemData.indexingStatus)}
+                                size="small"
+                                color={getStatusColor(itemData.indexingStatus) as any}
+                                variant="outlined"
+                                sx={{
+                                  fontSize: '0.65rem',
+                                  height: 20,
+                                  fontWeight: 500,
+                                  borderRadius: 1,
+                                  '& .MuiChip-label': {
+                                    px: 0.75,
+                                  },
+                                }}
+                              />
+                            </Box>
                           )}
                           {itemData.origin && itemData.origin !== 'UPLOAD' && (
-                            <Chip
-                              label={itemData.origin}
+                              <Chip
+                              label={itemData.origin === 'COLLECTION' || itemData.origin === 'KB' ? 'Collection' : itemData.origin}
                               size="small"
                               variant="filled"
                               sx={{

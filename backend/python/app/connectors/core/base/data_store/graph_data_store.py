@@ -2,9 +2,7 @@ from contextlib import asynccontextmanager
 from logging import Logger
 from typing import AsyncContextManager, Dict, List, Optional
 
-from app.config.constants.arangodb import (
-    CollectionNames,
-)
+from app.config.constants.arangodb import CollectionNames
 from app.connectors.core.base.data_store.data_store import (
     DataStoreProvider,
     TransactionStore,
@@ -19,6 +17,7 @@ from app.models.entities import (
     Domain,
     FileRecord,
     Org,
+    Person,
     Record,
     RecordGroup,
     User,
@@ -56,6 +55,9 @@ class GraphTransactionStore(TransactionStore):
 
     async def get_record_by_external_id(self, connector_id: str, external_id: str) -> Optional[Record]:
         return await self.graph_provider.get_record_by_external_id(connector_id, external_id, transaction=self.txn)
+
+    async def get_record_by_external_revision_id(self, connector_id: str, external_revision_id: str) -> Optional[Record]:
+        return await self.graph_provider.get_record_by_external_revision_id(connector_id, external_revision_id, transaction=self.txn)
 
     async def get_records_by_status(self, org_id: str, connector_id: str, status_filters: List[str], limit: Optional[int] = None, offset: int = 0) -> List[Record]:
         """Get records by status. Returns properly typed Record instances."""
@@ -118,11 +120,27 @@ class GraphTransactionStore(TransactionStore):
     async def delete_edges_to(self, to_id: str, to_collection: str, collection: str) -> None:
         return await self.graph_provider.delete_edges_to(to_id, to_collection, collection, transaction=self.txn)
 
+    async def delete_parent_child_edge_to_record(self, record_id: str) -> int:
+        """Delete PARENT_CHILD edges pointing to a specific target record"""
+        return await self.graph_provider.delete_parent_child_edge_to_record(record_id, transaction=self.txn)
+
     async def delete_edges_to_groups(self, from_id: str, from_collection: str, collection: str) -> None:
         return await self.graph_provider.delete_edges_to_groups(from_id, from_collection, collection, transaction=self.txn)
 
     async def delete_edges_between_collections(self, from_id: str, from_collection: str, edge_collection: str, to_collection: str) -> None:
         return await self.graph_provider.delete_edges_between_collections(from_id, from_collection, edge_collection, to_collection, transaction=self.txn)
+
+    async def delete_edges_by_relationship_types(
+        self,
+        from_id: str,
+        from_collection: str,
+        collection: str,
+        relationship_types: List[str]
+    ) -> int:
+        """Delete edges by relationship types from a record."""
+        return await self.graph_provider.delete_edges_by_relationship_types(
+            from_id, from_collection, collection, relationship_types, transaction=self.txn
+        )
 
     async def delete_nodes_and_edges(self, keys: List[str], collection: str) -> None:
         return await self.graph_provider.delete_nodes_and_edges(keys, collection, graph_name="knowledgeGraph", transaction=self.txn)
@@ -146,6 +164,9 @@ class GraphTransactionStore(TransactionStore):
 
     async def get_user_groups(self, connector_id: str, org_id: str) -> List[AppUserGroup]:
         return await self.graph_provider.get_user_groups(connector_id, org_id, transaction=self.txn)
+
+    async def batch_upsert_people(self, people: List[Person]) -> None:
+        return await self.graph_provider.batch_upsert_people(people, transaction=self.txn)
 
     async def create_user_group_hierarchy(
         self,
@@ -262,6 +283,10 @@ class GraphTransactionStore(TransactionStore):
         """Get record by Jira issue key (e.g., PROJ-123) by searching weburl pattern."""
         return await self.graph_provider.get_record_by_issue_key(connector_id, issue_key, transaction=self.txn)
 
+    async def get_record_by_weburl(self, weburl: str, org_id: Optional[str] = None) -> Optional[Record]:
+        """Get record by weburl (exact match)."""
+        return await self.graph_provider.get_record_by_weburl(weburl, org_id, transaction=self.txn)
+
     async def get_records_by_parent(
         self,
         connector_id: str,
@@ -272,6 +297,13 @@ class GraphTransactionStore(TransactionStore):
         return await self.graph_provider.get_records_by_parent(
             connector_id, parent_external_record_id, record_type, transaction=self.txn
         )
+
+    async def get_record_path(self, record_id: str) -> Optional[str]:
+        """Get full hierarchical path for a record by traversing parent-child edges."""
+        return await self.graph_provider.get_record_path(record_id, transaction=self.txn)
+    async def get_app_creator_user(self, connector_id:str) ->Optional[User]:
+        """Get the creator user for a connector/app by connectorId."""
+        return await self.graph_provider.get_app_creator_user(connector_id,transaction=self.txn)
 
     async def batch_upsert_records(self, records: List[Record]) -> None:
         """
@@ -356,13 +388,25 @@ class GraphTransactionStore(TransactionStore):
         await self.graph_provider.rollback_transaction(self.txn)
         self.logger.debug(f"✅ Transaction {self.txn} rolled back")
 
-    async def create_record_relation(self, from_record_id: str, to_record_id: str, relation_type: str) -> None:
+    async def create_record_relation(
+        self,
+        from_record_id: str,
+        to_record_id: str,
+        relation_type: str
+    ) -> None:
         """
         Create a relation edge between two records.
 
         Delegates to graph_provider for implementation.
+
+        Args:
+            from_record_id: Source record ID
+            to_record_id: Target record ID
+            relation_type: Type of relation (e.g., "BLOCKS", "CLONES", etc.)
         """
-        return await self.graph_provider.create_record_relation(from_record_id, to_record_id, relation_type, transaction=self.txn)
+        return await self.graph_provider.create_record_relation(
+            from_record_id, to_record_id, relation_type, transaction=self.txn
+        )
     async def create_record_group_relation(self, record_id: str, record_group_id: str) -> None:
         """
         Create BELONGS_TO edge from record to record group.
@@ -380,6 +424,18 @@ class GraphTransactionStore(TransactionStore):
         return await self.graph_provider.create_inherit_permissions_relation_record_group(
             record_id, record_group_id, transaction=self.txn
         )
+
+    async def delete_inherit_permissions_relation_record_group(self, record_id: str, record_group_id: str) -> None:
+        """
+        Delete INHERIT_PERMISSIONS edge from record to record group.
+        Called when a record's inherit_permissions is False, to remove a previously created edge (e.g. from placeholder).
+
+        Delegates to graph_provider for implementation.
+        """
+        return await self.graph_provider.delete_inherit_permissions_relation_record_group(
+            record_id, record_group_id, transaction=self.txn
+        )
+
     async def create_inherit_permissions_relation_record(self, child_record_id: str, parent_record_id: str) -> None:
         record_edge = {
                     "from_id": child_record_id,
@@ -511,6 +567,10 @@ class GraphTransactionStore(TransactionStore):
     async def batch_create_edges(self, edges: List[Dict], collection: str) -> None:
         return await self.graph_provider.batch_create_edges(edges, collection=collection, transaction=self.txn)
 
+    async def batch_create_entity_relations(self, edges: List[Dict]) -> None:
+        """Batch create entity relation edges with edgeType in UPSERT match condition."""
+        return await self.graph_provider.batch_create_entity_relations(edges, transaction=self.txn)
+
     async def get_edges_to_node(self, node_id: str, edge_collection: str) -> List[Dict]:
         """Get all edges pointing to a specific node"""
         return await self.graph_provider.get_edges_to_node(node_id, edge_collection, transaction=self.txn)
@@ -550,6 +610,20 @@ class GraphTransactionStore(TransactionStore):
             collection, field, value, transaction=self.txn
         )
 
+    async def get_nodes_by_filters(
+        self,
+        collection: str,
+        filters: Dict,
+        return_fields: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """Get nodes from a collection matching multiple field filters."""
+        return await self.graph_provider.get_nodes_by_filters(
+            collection=collection,
+            filters=filters,
+            return_fields=return_fields,
+            transaction=self.txn
+        )
+
 
 class GraphDataStore(DataStoreProvider):
     """
@@ -573,12 +647,12 @@ class GraphDataStore(DataStoreProvider):
 
         """
         # Begin transaction - returns transaction ID (str) for HTTP provider
-        self.logger.info("🔄 Beginning transaction...")
+        self.logger.debug("🔄 Beginning transaction...")
         txn = await self.graph_provider.begin_transaction(
             read=read_collections,
             write=write_collections
         )
-        self.logger.info(f"✅ Transaction started with ID: {txn}")
+        self.logger.debug(f"✅ Transaction started with ID: {txn}")
 
         tx_store = GraphTransactionStore(self.graph_provider, txn)
 
@@ -587,12 +661,9 @@ class GraphDataStore(DataStoreProvider):
         except Exception as e:
             self.logger.error(f"❌ Transaction error, rolling back: {str(e)}")
             await tx_store.rollback()
-            self.logger.info(f"🔄 Transaction {txn} rolled back")
             raise
         else:
-            self.logger.info(f"💾 Committing transaction {txn}...")
             await tx_store.commit()
-            self.logger.info(f"✅ Transaction {txn} committed successfully")
 
     async def execute_in_transaction(self, func, *args, **kwargs) -> None:
         """Execute function within graph database transaction"""

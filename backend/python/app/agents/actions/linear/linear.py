@@ -1,18 +1,135 @@
-import asyncio
 import json
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
+from app.agents.actions.utils import run_async
 from app.agents.tools.decorator import tool
 from app.agents.tools.enums import ParameterType
 from app.agents.tools.models import ToolParameter
-from app.sources.client.http.http_response import HTTPResponse
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.tool_builder import (
+    ToolCategory,
+    ToolDefinition,
+    ToolsetBuilder,
+)
 from app.sources.client.linear.linear import LinearClient
 from app.sources.external.linear.linear import LinearDataSource
 
 logger = logging.getLogger(__name__)
 
+# Define tools
+tools: List[ToolDefinition] = [
+    ToolDefinition(
+        name="get_viewer",
+        description="Get current user information",
+        parameters=[],
+        tags=["users", "info"]
+    ),
+    ToolDefinition(
+        name="get_user",
+        description="Get user information",
+        parameters=[
+            {"name": "user_id", "type": "string", "description": "User ID", "required": True}
+        ],
+        tags=["users", "read"]
+    ),
+    ToolDefinition(
+        name="get_teams",
+        description="Get all teams",
+        parameters=[],
+        tags=["teams", "list"]
+    ),
+    ToolDefinition(
+        name="get_team",
+        description="Get team details",
+        parameters=[
+            {"name": "team_id", "type": "string", "description": "Team ID", "required": True}
+        ],
+        tags=["teams", "read"]
+    ),
+    ToolDefinition(
+        name="get_issues",
+        description="Get issues",
+        parameters=[
+            {"name": "team_id", "type": "string", "description": "Team ID", "required": False}
+        ],
+        tags=["issues", "list"]
+    ),
+    ToolDefinition(
+        name="get_issue",
+        description="Get issue details",
+        parameters=[
+            {"name": "issue_id", "type": "string", "description": "Issue ID", "required": True}
+        ],
+        tags=["issues", "read"]
+    ),
+    ToolDefinition(
+        name="create_issue",
+        description="Create a new issue",
+        parameters=[
+            {"name": "team_id", "type": "string", "description": "Team ID", "required": True},
+            {"name": "title", "type": "string", "description": "Issue title", "required": True}
+        ],
+        tags=["issues", "create"]
+    ),
+    ToolDefinition(
+        name="update_issue",
+        description="Update an issue",
+        parameters=[
+            {"name": "issue_id", "type": "string", "description": "Issue ID", "required": True}
+        ],
+        tags=["issues", "update"]
+    ),
+    ToolDefinition(
+        name="delete_issue",
+        description="Delete an issue",
+        parameters=[
+            {"name": "issue_id", "type": "string", "description": "Issue ID", "required": True}
+        ],
+        tags=["issues", "delete"]
+    ),
+]
 
+
+# Register Linear toolset
+@ToolsetBuilder("Linear")\
+    .in_group("Project Management")\
+    .with_description("Linear integration for issue tracking and project management")\
+    .with_category(ToolCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="Linear",
+            authorize_url="https://linear.app/oauth/authorize",
+            token_url="https://api.linear.app/oauth/token",
+            redirect_uri="toolsets/oauth/callback/linear",
+            scopes=OAuthScopeConfig(
+                personal_sync=[],
+                team_sync=[],
+                agent=[
+                    "read",
+                    "write"
+                ]
+            ),
+            fields=[
+                CommonFields.client_id("Linear OAuth App"),
+                CommonFields.client_secret("Linear OAuth App")
+            ],
+            icon_path="/assets/icons/connectors/linear.svg",
+            app_group="Project Management",
+            app_description="Linear OAuth application for agent integration"
+        ),
+        AuthBuilder.type(AuthType.API_TOKEN).fields([
+            CommonFields.api_token("Linear API Key", "lin_api_your-key-here")
+        ])
+    ])\
+    .with_tools(tools)\
+    .configure(lambda builder: builder.with_icon("/assets/icons/connectors/linear.svg"))\
+    .build_decorator()
 class Linear:
     """Linear tool exposed to the agents"""
     def __init__(self, client: LinearClient) -> None:
@@ -24,22 +141,6 @@ class Linear:
             None
         """
         self.client = LinearDataSource(client)
-
-    def _run_async(self, coro) -> HTTPResponse: # type: ignore [valid method]
-        """Helper method to run async operations in sync context"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, we need to use a thread pool
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, coro)
-                    return future.result()
-            else:
-                return loop.run_until_complete(coro)
-        except Exception as e:
-            logger.error(f"Error running async operation: {e}")
-            raise
 
     @tool(
         app_name="linear",
@@ -55,7 +156,7 @@ class Linear:
         """
         try:
             # Use LinearDataSource method
-            response = self._run_async(self.client.viewer())
+            response = run_async(self.client.viewer())
 
             if response.success:
                 return True, json.dumps({"data": response.data})
@@ -88,7 +189,7 @@ class Linear:
         """
         try:
             # Use LinearDataSource method
-            response = self._run_async(self.client.user(id=user_id))
+            response = run_async(self.client.user(id=user_id))
 
             if response.success:
                 return True, json.dumps({"data": response.data})
@@ -132,7 +233,7 @@ class Linear:
         """
         try:
             # Use LinearDataSource method
-            response = self._run_async(self.client.teams(first=first, after=after))
+            response = run_async(self.client.teams(first=first, after=after))
 
             if response.success:
                 return True, json.dumps({"data": response.data})
@@ -165,7 +266,7 @@ class Linear:
         """
         try:
             # Use LinearDataSource method
-            response = self._run_async(self.client.team(id=team_id))
+            response = run_async(self.client.team(id=team_id))
 
             if response.success:
                 return True, json.dumps({"data": response.data})
@@ -227,7 +328,7 @@ class Linear:
                     filter_dict = None
 
             # Use LinearDataSource method
-            response = self._run_async(self.client.issues(first=first, after=after, filter=filter_dict))
+            response = run_async(self.client.issues(first=first, after=after, filter=filter_dict))
 
             if response.success:
                 return True, json.dumps({"data": response.data})
@@ -260,7 +361,7 @@ class Linear:
         """
         try:
             # Use LinearDataSource method
-            response = self._run_async(self.client.issue(id=issue_id))
+            response = run_async(self.client.issue(id=issue_id))
 
             if response.success:
                 return True, json.dumps({"data": response.data})
@@ -304,6 +405,12 @@ class Linear:
                 type=ParameterType.STRING,
                 description="ID of the assignee",
                 required=False
+            ),
+            ToolParameter(
+                name="priority",
+                type=ParameterType.INTEGER,
+                description="Priority of the issue (0=No priority, 1=Urgent, 2=High, 3=Medium, 4=Low)",
+                required=False
             )
         ]
     )
@@ -313,7 +420,8 @@ class Linear:
         title: str,
         description: Optional[str] = None,
         state_id: Optional[str] = None,
-        assignee_id: Optional[str] = None
+        assignee_id: Optional[str] = None,
+        priority: Optional[int] = None
     ) -> Tuple[bool, str]:
         """Create a new issue"""
         """
@@ -323,6 +431,7 @@ class Linear:
             description: Description of the issue
             state_id: ID of the state
             assignee_id: ID of the assignee
+            priority: Priority of the issue (0=No priority, 1=Urgent, 2=High, 3=Medium, 4=Low)
         Returns:
             Tuple[bool, str]: True if successful, False otherwise
         """
@@ -335,9 +444,11 @@ class Linear:
                 issue_input["stateId"] = state_id
             if assignee_id is not None:
                 issue_input["assigneeId"] = assignee_id
+            if priority is not None:
+                issue_input["priority"] = priority
 
             # Call the correct LinearDataSource method
-            response = self._run_async(self.client.issueCreate(input=issue_input))
+            response = run_async(self.client.issueCreate(input=issue_input))
 
             if response.success:
                 return True, json.dumps({"data": response.data})
@@ -416,7 +527,7 @@ class Linear:
                 update_input["assigneeId"] = assignee_id
 
             # Call the correct LinearDataSource method
-            response = self._run_async(self.client.issueUpdate(id=issue_id, input=update_input))
+            response = run_async(self.client.issueUpdate(id=issue_id, input=update_input))
 
             if response.success:
                 return True, json.dumps({"data": response.data})
@@ -449,7 +560,7 @@ class Linear:
         """
         try:
             # Use LinearDataSource method with correct name
-            response = self._run_async(self.client.issueDelete(id=issue_id))
+            response = run_async(self.client.issueDelete(id=issue_id))
 
             if response.success:
                 return True, json.dumps({"data": response.data})

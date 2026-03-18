@@ -21,6 +21,7 @@ export interface AppConfig {
   indexingBackend: string;
   kafka: {
     brokers: string[];
+    ssl?: boolean;
     sasl?: {
       mechanism: 'plain' | 'scram-sha-256' | 'scram-sha-512';
       username: string;
@@ -30,7 +31,9 @@ export interface AppConfig {
   redis: {
     host: string;
     port: number;
+    username?: string;
     password?: string;
+    tls?: boolean;
     db?: number;
   };
   mongo: {
@@ -68,6 +71,18 @@ export interface AppConfig {
     storageType: string;
     endpoint: string;
   };
+
+  // OAuth Provider config
+  oauthIssuer: string;
+  oauthBackendUrl: string;
+  mcpScopes: string[];
+
+  // Domain check config
+  skipDomainCheck: boolean;
+
+  // Rate limit config
+  maxRequestsPerMinute: number;
+  maxOAuthClientRequestsPerMinute: number;
 }
 
 export const loadAppConfig = async (): Promise<AppConfig> => {
@@ -105,5 +120,21 @@ export const loadAppConfig = async (): Promise<AppConfig> => {
       dialTimeout: parseInt(process.env.ETCD_DIAL_TIMEOUT!, 10),
     },
     storage: await configService.getStorageConfig(),
+
+    // OAuth Provider config - initialize first, then get
+    oauthIssuer: (await configService.initializeOAuthIssuer(), await configService.getOAuthIssuer()),
+    oauthBackendUrl: await configService.getOAuthBackendUrl(),
+    mcpScopes: await configService.getMcpScopes(),
+
+    // Domain check config - when true, skip domain matching and use first available org
+    skipDomainCheck: process.env.SKIP_DOMAIN_CHECK === 'true',
+
+    // Rate limit config
+    maxRequestsPerMinute: process.env.MAX_REQUESTS_PER_MINUTE
+      ? parseInt(process.env.MAX_REQUESTS_PER_MINUTE, 10)
+      : 1000,
+    maxOAuthClientRequestsPerMinute: process.env.MAX_OAUTH_CLIENT_REQUESTS_PER_MINUTE
+      ? parseInt(process.env.MAX_OAUTH_CLIENT_REQUESTS_PER_MINUTE, 10)
+      : 1000,
   };
 };

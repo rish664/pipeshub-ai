@@ -10,10 +10,11 @@ const {
   WRONG_OTP,
   WRONG_PASSWORD,
   REFRESH_TOKEN,
+  PASSWORD_CHANGED,
 } = userActivitiesType;
 
 // 🔹 Define TypeScript Interfaces
-interface IUserActivity extends Document {
+export interface IUserActivity extends Document {
   email: string;
   userId: Types.ObjectId;
   orgId?: Types.ObjectId;
@@ -24,7 +25,8 @@ interface IUserActivity extends Document {
     | typeof OTP_GENERATE
     | typeof WRONG_OTP
     | typeof WRONG_PASSWORD
-    | typeof REFRESH_TOKEN;
+    | typeof REFRESH_TOKEN
+    | typeof PASSWORD_CHANGED;
   loginMode?:
     | 'OTP'
     | 'PASSWORD'
@@ -64,6 +66,7 @@ const UserActivitySchema = new Schema<IUserActivity>(
         WRONG_OTP,
         WRONG_PASSWORD,
         REFRESH_TOKEN,
+        PASSWORD_CHANGED,
       ],
       required: true,
     },

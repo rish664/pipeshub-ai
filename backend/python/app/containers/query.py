@@ -1,7 +1,7 @@
 from dependency_injector import containers, providers
 
 from app.config.configuration_service import ConfigurationService
-from app.config.providers.etcd.etcd3_encrypted_store import Etcd3EncryptedKeyValueStore
+from app.config.providers.encrypted_store import EncryptedKeyValueStore
 from app.containers.container import BaseAppContainer
 from app.containers.utils.utils import ContainerUtils
 from app.modules.reranker.reranker import RerankerService
@@ -14,19 +14,25 @@ class QueryAppContainer(BaseAppContainer):
     # Override logger with service-specific name
     logger = providers.Singleton(create_logger, "query_service")
     container_utils = ContainerUtils()
-    key_value_store = providers.Singleton(Etcd3EncryptedKeyValueStore, logger=logger)
+    key_value_store = providers.Singleton(EncryptedKeyValueStore, logger=logger)
 
     # Override config_service to use the service-specific logger
     config_service = providers.Singleton(ConfigurationService, logger=logger, key_value_store=key_value_store)
 
-    # Override arango_client and redis_client to use the service-specific config_service
+    # Override arango_client to use the service-specific config_service
     arango_client = providers.Resource(
         BaseAppContainer._create_arango_client, config_service=config_service
     )
-    redis_client = providers.Resource(
-        BaseAppContainer._create_redis_client, config_service=config_service
-    )
     kafka_service = providers.Singleton(lambda: None)  # Not used in query service
+
+    # Graph Database Provider via Factory (HTTP mode - fully async)
+    graph_provider = providers.Resource(
+        container_utils.create_graph_provider,
+        logger=logger,
+        config_service=config_service,
+    )
+
+    # Keep arango_service for backward compatibility with agent routes
     arango_service = providers.Resource(
         container_utils.create_arango_service,
         logger=logger,
@@ -43,7 +49,7 @@ class QueryAppContainer(BaseAppContainer):
         container_utils.create_blob_storage,
         logger=logger,
         config_service=config_service,
-        arango_service=arango_service,
+        graph_provider=graph_provider,
     )
 
     retrieval_service = providers.Resource(
@@ -51,7 +57,7 @@ class QueryAppContainer(BaseAppContainer):
         config_service=config_service,
         logger=logger,
         vector_db_service=vector_db_service,
-        arango_service=arango_service,
+        graph_provider=graph_provider,
         blob_store=blob_store,
     )
     reranker_service = providers.Singleton(

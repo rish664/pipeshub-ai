@@ -49,6 +49,12 @@ export type ChatInputProps = {
 };
 
 
+// Helper function to get model display name
+const getModelDisplayName = (model: { modelName: string; modelFriendlyName?: string } | null): string => {
+  if (!model) return '';
+  return model.modelFriendlyName || model.modelName;
+};
+
 const ChatInput: React.FC<ChatInputProps> = ({
   onSubmit,
   isLoading,
@@ -127,7 +133,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
   const theme = useTheme();
   const isDark = theme.palette.mode === 'dark';
   const scrollableStyles = createScrollableContainerStyle(theme);
-  const appItems = useMemo(() => apps || [], [apps]);
+  // Filter out KB apps at the source - they're handled separately via knowledgeBases
+  const appItems = useMemo(() => (apps || []).filter((app) => app?.name !== 'KB'), [apps]);
   // Prefetch app icons to avoid flicker when switching tabs
   useEffect(() => {
     try {
@@ -525,7 +532,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 sx={{ display: 'flex', gap: 1, flexDirection: 'row', mr: 2, alignItems: 'center', }}
               >
                 {/* Unified Resources selector with badge */}
-                <Tooltip title="Select apps and knowledge bases">
+                <Tooltip title="Select apps and collections">
                   <Badge
                     badgeContent={selectedApps.length + selectedKbIds.length}
                     color="primary"
@@ -554,7 +561,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
 
                 {/* Model Selector */}
                 <Tooltip
-                  title={`AI Model: ${selectedModel ? `${formattedProvider(selectedModel.provider)} - ${selectedModel.modelName}` : 'Select AI model'}`}
+                  title={`AI Model: ${selectedModel ? `${formattedProvider(selectedModel.provider)} - ${selectedModel.modelFriendlyName ? `${selectedModel.modelFriendlyName} | ${selectedModel.modelName.substring(0, 16)}` : getModelDisplayName(selectedModel)}` : 'Select AI model'}`}
                 >
                   <Box
                     onClick={handleModelMenuOpen}
@@ -582,7 +589,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                       variant="body2"
                       sx={{ fontSize: '0.8rem', fontWeight: 500, minWidth: '60px' }}
                     >
-                      {selectedModel?.modelName?.slice(0, 16) || ''}
+                      {getModelDisplayName(selectedModel)?.slice(0, 16) || ''}
                     </Typography>
                     <Icon icon={chevronDownIcon} width={12} height={12} />
                   </Box>
@@ -711,7 +718,8 @@ const ChatInput: React.FC<ChatInputProps> = ({
                 onClick={() => handleModelSelect(model)}
                 selected={
                   selectedModel?.provider === model.provider &&
-                  selectedModel?.modelName === model.modelName
+                  selectedModel?.modelName === model.modelName && 
+                  selectedModel?.modelKey === model.modelKey
                 }
                 sx={{
                   borderRadius: '8px',
@@ -740,7 +748,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
                     fontWeight="medium"
                     sx={{ fontSize: '0.9rem', mb: 0.5 }}
                   >
-                    {model.modelName}
+                    {model.modelFriendlyName ? `${model.modelFriendlyName} | ${model.modelName.substring(0, 16)}` : getModelDisplayName(model)}
                   </Typography>
                   <Typography
                     variant="caption"

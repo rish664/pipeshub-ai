@@ -1,4 +1,4 @@
-import asyncio
+import traceback
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, List
 
@@ -9,20 +9,21 @@ from fastapi.responses import JSONResponse
 
 from app.api.middlewares.auth import authMiddleware
 from app.api.routes.entity import router as entity_router
-from app.config.constants.arangodb import AccountType, Connectors, ConnectorScopes
+from app.api.routes.toolsets import router as toolsets_router
+from app.config.constants.arangodb import AccountType
 from app.connectors.api.router import router
 from app.connectors.core.base.data_store.graph_data_store import GraphDataStore
 from app.connectors.core.base.token_service.startup_service import startup_service
 from app.connectors.core.factory.connector_factory import ConnectorFactory
-from app.connectors.core.registry.connector import GmailConnector, GoogleDriveConnector
-from app.connectors.core.registry.connector_registry import ConnectorRegistry
+from app.connectors.core.registry.connector_registry import (
+    ConnectorRegistry,
+)
+from app.connectors.core.sync.task_manager import sync_task_manager
 from app.connectors.sources.localKB.api.kb_router import kb_router
 from app.connectors.sources.localKB.api.knowledge_hub_router import knowledge_hub_router
 from app.containers.connector import (
     ConnectorAppContainer,
     initialize_container,
-    initialize_enterprise_google_account_services_fn,
-    initialize_individual_google_account_services_fn,
 )
 from app.services.messaging.kafka.utils.utils import KafkaUtils
 from app.services.messaging.messaging_factory import MessagingFactory
@@ -39,8 +40,8 @@ async def get_initialized_container() -> ConnectorAppContainer:
         container.wire(
             modules=[
                 "app.core.celery_app",
-                "app.connectors.sources.google.common.sync_tasks",
                 "app.connectors.api.router",
+                "app.api.routes.toolsets",
                 "app.connectors.sources.localKB.api.kb_router",
                 "app.connectors.sources.localKB.api.knowledge_hub_router",
                 "app.api.routes.entity",
@@ -49,12 +50,38 @@ async def get_initialized_container() -> ConnectorAppContainer:
             ]
         )
         setattr(get_initialized_container, "_initialized", True)
-        # Start token refresh service at app startup
-        try:
-            await startup_service.initialize(container.key_value_store(), await container.arango_service())
-        except Exception as e:
-            container.logger().warning(f"Startup token refresh service failed to initialize: {e}")
     return container
+
+
+async def refresh_toolset_tokens(app_container: ConnectorAppContainer) -> bool:
+    """
+    Refresh OAuth tokens for all authenticated toolsets.
+    Uses the dedicated toolset token refresh service.
+    This function triggers an initial refresh on startup, but the service
+    also runs periodic refreshes automatically.
+    """
+    logger = app_container.logger()
+    logger.info("🔄 Triggering initial toolset token refresh...")
+
+    try:
+        from app.connectors.core.base.token_service.startup_service import (
+            startup_service,
+        )
+        toolset_refresh_service = startup_service.get_toolset_token_refresh_service()
+
+        if not toolset_refresh_service:
+            logger.warning("⚠️ Toolset token refresh service not initialized, skipping toolset token refresh")
+            return False
+
+        # The toolset refresh service handles all the logic internally
+        # Just trigger the refresh all tokens method
+        await toolset_refresh_service._refresh_all_tokens()
+        logger.info("✅ Initial toolset token refresh completed")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error refreshing toolset tokens: {e}", exc_info=True)
+        return False
 
 
 async def resume_sync_services(app_container: ConnectorAppContainer, data_store: GraphDataStore = None) -> bool:
@@ -63,51 +90,32 @@ async def resume_sync_services(app_container: ConnectorAppContainer, data_store:
     logger.debug("🔄 Checking for sync services to resume")
 
     try:
-        arango_service = await app_container.arango_service()  # type: ignore
+        graph_provider = data_store.graph_provider
 
         # Get all organizations
-        orgs = await arango_service.get_all_orgs(active=True)
+        orgs = await graph_provider.get_all_orgs(active=True)
         if not orgs:
             logger.info("No organizations found in the system")
             return True
 
         logger.info("Found %d organizations in the system", len(orgs))
+
+        config_service = app_container.config_service()
+
         # Process each organization
         for org in orgs:
-            org_id = org["_key"]
+            org_id = org.get("_key") or org.get("id")
             accountType = org.get("accountType", AccountType.INDIVIDUAL.value)
-            enabled_apps = await arango_service.get_org_apps(org_id)
+            enabled_apps = await graph_provider.get_org_apps(org_id)
             app_names = [app["type"].replace(" ", "").lower() for app in enabled_apps]
             logger.info(f"App names: {app_names}")
-            # Ensure the method is called on the correct object
-            for app in enabled_apps:
-                connector_id = app.get("_key")
-                app_group = app.get("appGroup", "")
-
-                if (accountType == AccountType.ENTERPRISE.value or accountType == AccountType.BUSINESS.value) and "google" in app_group.lower():
-                    if app["type"].lower() == Connectors.GOOGLE_DRIVE.value.lower() and app["scope"] == ConnectorScopes.TEAM.value:
-                        await initialize_enterprise_google_account_services_fn(org_id, app_container,connector_id, ['drive'])
-                    elif app["type"].lower() == Connectors.GOOGLE_MAIL.value.lower() and app["scope"] == ConnectorScopes.TEAM.value:
-                        await initialize_enterprise_google_account_services_fn(org_id, app_container,connector_id, ['gmail'])
-                    elif app["type"].lower() == Connectors.GOOGLE_DRIVE.value.lower() and app["scope"] == ConnectorScopes.PERSONAL.value:
-                        await initialize_individual_google_account_services_fn(org_id, app_container,connector_id, ['drive'])
-                    elif app["type"].lower() == Connectors.GOOGLE_MAIL.value.lower() and app["scope"] == ConnectorScopes.PERSONAL.value:
-                        await initialize_individual_google_account_services_fn(org_id, app_container,connector_id, ['gmail'])
-                elif accountType == AccountType.INDIVIDUAL.value and "google" in app_group.lower():
-                    if app["type"].lower() == Connectors.GOOGLE_DRIVE.value.lower() and app["scope"] == ConnectorScopes.TEAM.value:
-                        await initialize_individual_google_account_services_fn(org_id, app_container,connector_id, ['drive'])
-                    elif app["type"].lower() == Connectors.GOOGLE_MAIL.value.lower() and app["scope"] == ConnectorScopes.TEAM.value:
-                        await initialize_individual_google_account_services_fn(org_id, app_container,connector_id, ['gmail'])
-                else:
-                    logger.error("Account Type not valid")
-                    continue
 
             logger.info(
                 "Processing organization %s with account type %s", org_id, accountType
             )
 
             # Get users for this organization
-            users = await arango_service.get_users(org_id, active=True)
+            users = await graph_provider.get_users(org_id, active=True)
             logger.info(f"User: {users}")
             if not users:
                 logger.info("No users found for organization %s", org_id)
@@ -115,13 +123,9 @@ async def resume_sync_services(app_container: ConnectorAppContainer, data_store:
 
             logger.info("Found %d users for organization %s", len(users), org_id)
 
-
-            drive_sync_service = None
-            gmail_sync_service = None
             config_service = app_container.config_service()
-            arango_service = await app_container.arango_service()
             # Use pre-resolved data_store passed from lifespan to avoid coroutine reuse
-            data_store_provider = data_store if data_store else await app_container.data_store()
+            # data_store_provider = data_store if data_store else await app_container.data_store()
 
             # Initialize connectors_map if not already initialized
             if not hasattr(app_container, 'connectors_map'):
@@ -129,63 +133,26 @@ async def resume_sync_services(app_container: ConnectorAppContainer, data_store:
 
             for app in enabled_apps:
                 connector_id = app.get("_key")
-                if app["type"].lower() == Connectors.GOOGLE_DRIVE.value.lower():
-                    drive_sync_service = app_container.drive_sync_service()  # type: ignore
-                    await drive_sync_service.initialize(org_id, connector_id)  # type: ignore
-                    logger.info("Drive Service initialized for org %s", org_id)
 
-                elif app["type"].lower() == Connectors.GOOGLE_MAIL.value.lower():
-                    gmail_sync_service = app_container.gmail_sync_service()  # type: ignore
-                    await gmail_sync_service.initialize(org_id, connector_id)  # type: ignore
-                    logger.info("Gmail Service initialized for org %s", org_id)
-                else:
-                    connector_name = app["type"].lower().replace(" ", "")
-                    connector = await ConnectorFactory.create_and_start_sync(
-                        name=connector_name,
-                        logger=logger,
-                        data_store_provider=data_store_provider,
-                        config_service=config_service,
-                        connector_id=connector_id
-                    )
-                    if connector:
-                        # Store using connector_id as the unique key (not connector_name to avoid conflicts with multiple instances)
-                        app_container.connectors_map[connector_id] = connector
-                        logger.info(f"{connector_name} connector (id: {connector_id}) initialized for org %s", org_id)
-
-            if drive_sync_service is not None:
-                try:
-                    asyncio.create_task(drive_sync_service.perform_initial_sync(org_id, connector_id))  # type: ignore
-                    logger.info(
-                        "✅ Resumed Drive sync for org %s",
-                        org_id,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "❌ Error resuming Drive sync for org %s: %s",
-                        org_id,
-                        str(e),
-                    )
-
-            if gmail_sync_service is not None:
-                try:
-                    asyncio.create_task(gmail_sync_service.perform_initial_sync(org_id, connector_id))  # type: ignore
-                    logger.info(
-                        "✅ Resumed Gmail sync for org %s",
-                        org_id,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "❌ Error resuming Gmail sync for org %s: %s",
-                        org_id,
-                        str(e),
-                    )
-
+                connector_name = app["type"].lower().replace(" ", "")
+                connector = await ConnectorFactory.create_and_start_sync(
+                    name=connector_name,
+                    logger=logger,
+                    data_store_provider=data_store,
+                    config_service=config_service,
+                    connector_id=connector_id
+                )
+                if connector:
+                    # Store using connector_id as the unique key (not connector_name to avoid conflicts with multiple instances)
+                    app_container.connectors_map[connector_id] = connector
+                    logger.info(f"{connector_name} connector (id: {connector_id}) initialized for org %s", org_id)
 
             logger.info("✅ Sync services resumed for org %s", org_id)
         logger.info("✅ Sync services resumed for all orgs")
         return True
     except Exception as e:
         logger.error("❌ Error during sync service resumption: %s", str(e))
+        logger.error("❌ Detailed error traceback:\n%s", traceback.format_exc())
         return False
 
 async def initialize_connector_registry(app_container: ConnectorAppContainer) -> ConnectorRegistry:
@@ -199,11 +166,9 @@ async def initialize_connector_registry(app_container: ConnectorAppContainer) ->
         ConnectorFactory.initialize_beta_connector_registry()
         # Register connectors using generic factory
         available_connectors = ConnectorFactory.list_connectors()
-        for name, connector_class in available_connectors.items():
+        for connector_class in available_connectors.values():
             registry.register_connector(connector_class)
         logger.info("✅ Connectors registered")
-        registry.register_connector(GoogleDriveConnector)
-        registry.register_connector(GmailConnector)
         logger.info(f"Registered {len(registry._connectors)} connectors")
 
         # Sync with database
@@ -242,7 +207,7 @@ async def start_messaging_producer(app_container: ConnectorAppContainer) -> None
         logger.error(f"❌ Error starting messaging producer: {str(e)}")
         raise
 
-async def start_kafka_consumers(app_container: ConnectorAppContainer) -> List:
+async def start_kafka_consumers(app_container: ConnectorAppContainer, graph_provider) -> List:
     """Start all Kafka consumers at application level"""
     logger = app_container.logger()
     consumers = []
@@ -256,7 +221,7 @@ async def start_kafka_consumers(app_container: ConnectorAppContainer) -> List:
             logger=logger,
             config=entity_kafka_config
         )
-        entity_message_handler = await KafkaUtils.create_entity_message_handler(app_container)
+        entity_message_handler = await KafkaUtils.create_entity_message_handler(app_container, graph_provider)
         await entity_kafka_consumer.start(entity_message_handler)
         consumers.append(("entity", entity_kafka_consumer))
         logger.info("✅ Entity Kafka consumer started")
@@ -269,7 +234,7 @@ async def start_kafka_consumers(app_container: ConnectorAppContainer) -> List:
             logger=logger,
             config=sync_kafka_config
         )
-        sync_message_handler = await KafkaUtils.create_sync_message_handler(app_container)
+        sync_message_handler = await KafkaUtils.create_sync_message_handler(app_container, graph_provider)
         await sync_kafka_consumer.start(sync_message_handler)
         consumers.append(("sync", sync_kafka_consumer))
         logger.info("✅ Sync Kafka consumer started")
@@ -324,6 +289,13 @@ async def shutdown_container_resources(container: ConnectorAppContainer) -> None
     logger = container.logger()
 
     try:
+        # Cancel all running connector sync tasks first so they can clean up
+        # gracefully before the database and messaging connections are torn down
+        try:
+            await sync_task_manager.cancel_all()
+        except Exception as e:
+            logger.warning(f"Error cancelling sync tasks at shutdown: {e}")
+
         # Stop Kafka consumers
         await stop_kafka_consumers(container)
 
@@ -335,6 +307,13 @@ async def shutdown_container_resources(container: ConnectorAppContainer) -> None
             await startup_service.shutdown()
         except Exception as e:
             logger.warning(f"Error shutting down startup services: {e}")
+
+        # Close configuration service (stops Redis Pub/Sub subscription)
+        try:
+            config_service = container.config_service()
+            await config_service.close()
+        except Exception as e:
+            logger.error(f"Error closing configuration service: {e}")
 
         logger.info("✅ All container resources shut down successfully")
 
@@ -349,18 +328,51 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.container = app_container  # type: ignore
 
     app.state.config_service = app_container.config_service()
-    app.state.arango_service = await app_container.arango_service()  # type: ignore
 
-    # Resolve data_store FIRST - this internally resolves graph_provider as a dependency
-    # Access graph_provider from data_store (not from container) to avoid coroutine reuse
+    # Resolve data_store first - this internally resolves graph_provider
     data_store = await app_container.data_store()
-    app.state.graph_provider = data_store.graph_provider  # Already resolved inside data_store
+    app.state.graph_provider = data_store.graph_provider
 
     # Initialize connector registry
+    # Use the already-resolved graph_provider from data_store to avoid coroutine reuse
     logger = app_container.logger()
+    graph_provider = data_store.graph_provider
+
+    # Also resolve arango_service for ArangoDB-specific operations (like migrations)
+    # This is only needed when DATA_STORE=arangodb
+    import os
+    data_store_type = os.getenv("DATA_STORE", "arangodb").lower()
+    if data_store_type == "arangodb":
+        app.state.arango_service = await app_container.arango_service()
+        logger.info("✅ ArangoDB service resolved for migrations")
+    else:
+        app.state.arango_service = None
+
+    # Start token refresh service at app startup (database-agnostic)
+    try:
+        await startup_service.initialize(app_container.config_service(), graph_provider)
+        logger.info("✅ Startup services initialized successfully")
+    except Exception as e:
+        logger.warning(f"⚠️ Startup token refresh service failed to initialize: {e}")
+
+    # Initialize connector registry - pass already-resolved graph_provider
     registry = await initialize_connector_registry(app_container)
     app.state.connector_registry = registry
     logger.info("✅ Connector registry initialized and synchronized with database")
+
+    # Initialize toolset registry (in-memory, fast tool lookup)
+    logger.info("🔄 Initializing in-memory toolset registry...")
+    from app.agents.registry.toolset_registry import get_toolset_registry
+    from app.agents.tools.registry import _global_tools_registry
+
+    toolset_registry = get_toolset_registry()
+    toolset_registry.auto_discover_toolsets()
+    app.state.toolset_registry = toolset_registry
+    logger.info(f"✅ Loaded {len(toolset_registry.list_toolsets())} toolsets in memory")
+
+    # Log tool count from in-memory registry
+    tool_count = len(_global_tools_registry.list_tools())
+    logger.info(f"✅ {tool_count} tools available from in-memory registry")
 
     # Initialize OAuth config registry (completely independent, no connector registry needed)
     # Note: OAuth registry is populated when connectors are registered above
@@ -373,37 +385,42 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Run OAuth credentials migration (AFTER connector and OAuth registries are initialized)
     # This migration needs OAuth registry to be populated to get OAuth infrastructure fields
-    try:
-        logger.info("🔄 Running OAuth credentials migration...")
-        from app.migrations.oauth_credentials_migration import (
-            run_oauth_credentials_migration,
-        )
+    # Skip if Neo4j is configured (migration is ArangoDB-specific)
+    if data_store_type != "arangodb":
+        logger.info(f"⏭️ Skipping OAuth credentials migration (DATA_STORE={data_store_type}, migration is ArangoDB-specific)")
+    else:
+        try:
+            logger.info("🔄 Running OAuth credentials migration...")
+            from app.migrations.oauth_credentials_migration import (
+                run_oauth_credentials_migration,
+            )
 
-        migration_result = await run_oauth_credentials_migration(
-            config_service=app_container.config_service(),
-            arango_service=await app_container.arango_service(),
-            logger=logger,
-            dry_run=False
-        )
+            migration_result = await run_oauth_credentials_migration(
+                config_service=app_container.config_service(),
+                arango_service=app.state.arango_service,
+                logger=logger,
+                dry_run=False
+            )
 
-        if migration_result.get("success"):
-            if migration_result.get("skipped"):
-                logger.info("✅ OAuth credentials migration already completed")
+            if migration_result.get("success"):
+                if migration_result.get("skipped"):
+                    logger.info("✅ OAuth credentials migration already completed")
+                else:
+                    connectors_migrated = migration_result.get("connectors_migrated", 0)
+                    oauth_configs_created = migration_result.get("oauth_configs_created", 0)
+                    logger.info(
+                        f"✅ OAuth credentials migration completed: "
+                        f"{connectors_migrated} connectors migrated, {oauth_configs_created} OAuth configs created"
+                    )
             else:
-                connectors_migrated = migration_result.get("connectors_migrated", 0)
-                oauth_configs_created = migration_result.get("oauth_configs_created", 0)
-                logger.info(
-                    f"✅ OAuth credentials migration completed: "
-                    f"{connectors_migrated} connectors migrated, {oauth_configs_created} OAuth configs created"
-                )
-        else:
-            error_msg = migration_result.get("error", "Unknown error")
-            logger.error(f"❌ OAuth credentials migration failed: {error_msg}")
-    except Exception as e:
-        logger.error(f"❌ OAuth credentials migration error: {e}")
-        # Don't fail startup - migration is idempotent and can be retried
+                error_msg = migration_result.get("error", "Unknown error")
+                logger.error(f"❌ OAuth credentials migration failed: {error_msg}")
+        except Exception as e:
+            logger.error(f"❌ OAuth credentials migration error: {e}")
+            # Don't fail startup - migration is idempotent and can be retried
 
     logger.debug("🚀 Starting application")
+
     # Start messaging producer first
     try:
         await start_messaging_producer(app_container)
@@ -412,17 +429,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error(f"❌ Failed to start messaging producer: {str(e)}")
         raise
 
-    # Start all Kafka consumers centrally
+    # Resume sync services BEFORE starting Kafka consumers so that
+    # connectors_map is populated before we begin processing sync events.
     try:
-        consumers = await start_kafka_consumers(app_container)
+        await resume_sync_services(app_container, data_store)
+    except Exception as e:
+        logger.error(f"❌ Error during sync service resumption: {str(e)}")
+
+    # Start all Kafka consumers centrally - pass already resolved graph_provider
+    try:
+        consumers = await start_kafka_consumers(app_container, graph_provider)
         app_container.kafka_consumers = consumers
         logger.info("✅ All Kafka consumers started successfully")
     except Exception as e:
         logger.error(f"❌ Failed to start Kafka consumers: {str(e)}")
         raise
 
-    # Resume sync services (pass pre-resolved data_store)
-    asyncio.create_task(resume_sync_services(app_container, data_store))
+    # NOTE: ToolsetTokenRefreshService.start() already performs an initial refresh scan.
+    # Avoid triggering another startup scan here to prevent duplicate scheduling attempts.
 
     yield
     logger.info("🔄 Shut down application started")
@@ -435,8 +459,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 # Create FastAPI app with lifespan
 app = FastAPI(
-    title="Google Drive Sync Service",
-    description="Service for syncing Google Drive content to ArangoDB",
+    title="Connectors Sync Service",
+    description="Service for syncing content from connectors to GraphDB",
     version="1.0.0",
     lifespan=lifespan,
     dependencies=[Depends(get_initialized_container)],
@@ -485,8 +509,7 @@ async def authenticate_requests(request: Request, call_next) -> JSONResponse:
     try:
         logger.debug(f"Applying authentication for path: {request_path}")
         authenticated_request = await authMiddleware(request)
-        response = await call_next(authenticated_request)
-        return response
+        return await call_next(authenticated_request)
 
     except HTTPException as exc:
         # Handle authentication errors
@@ -535,6 +558,7 @@ async def health_check() -> JSONResponse:
 
 # Include routes - more specific routes first
 app.include_router(entity_router)
+app.include_router(toolsets_router)
 app.include_router(kb_router)
 app.include_router(knowledge_hub_router)
 app.include_router(router)

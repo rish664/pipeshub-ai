@@ -19,6 +19,7 @@ class ToolCategory(Enum):
     CODE_MANAGEMENT = "code_management"
     UTILITY = "utility"
     SEARCH = "search"
+    KNOWLEDGE = "knowledge"
 
 
 class ToolMetadata(BaseModel):
@@ -94,6 +95,9 @@ class ToolDiscoveryConfig:
         "utility": AppConfiguration(
             app_name="utility",
         ),
+        "retrieval": AppConfiguration(
+            app_name="retrieval",
+        ),
         "google": AppConfiguration(
             app_name="google",
             subdirectories=["gmail", "calendar", "drive", "meet"],
@@ -108,6 +112,18 @@ class ToolDiscoveryConfig:
         "microsoft": AppConfiguration(
             app_name="microsoft",
             subdirectories=["one_drive", "sharepoint"],
+            client_builder="MSGraphClient",
+        ),
+        "outlook": AppConfiguration(
+            app_name="outlook",
+            client_builder="MSGraphClient",
+        ),
+        "teams": AppConfiguration(
+            app_name="teams",
+            client_builder="MSGraphClient",
+        ),
+        "onedrive": AppConfiguration(
+            app_name="onedrive",
             client_builder="MSGraphClient",
         ),
         # "discord": AppConfiguration(
@@ -150,10 +166,10 @@ class ToolDiscoveryConfig:
             app_name="dropbox",
             client_builder="DropboxClient",
         ),
-        # "github": AppConfiguration(
-        #     app_name="github",
-        #     client_builder="GitHubClient",
-        # ),
+        "github": AppConfiguration(
+            app_name="github",
+            client_builder="GitHubClient",
+        ),
         # "gitlab": AppConfiguration(
         #     app_name="gitlab",
         #     client_builder="GitLabClient",
@@ -182,6 +198,7 @@ class ToolDiscoveryConfig:
         "calculator.",
         "web_search",
         "get_current_datetime",
+        "retrieval.search_internal_knowledge",
     }
 
     # Files to skip during discovery

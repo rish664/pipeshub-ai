@@ -58,6 +58,19 @@ import { AIModelsConfig } from '../types/ai-models.types';
 const logger = Logger.getInstance({
   service: 'ConfigurationManagerController',
 });
+type SlackBotConfigEntry = {
+  id: string;
+  name: string;
+  botToken: string;
+  signingSecret: string;
+  agentId?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type SlackBotStore = {
+  configs: SlackBotConfigEntry[];
+};
 
 const AI_SERVICE_UNAVAILABLE_MESSAGE =
   'AI Service is currently unavailable. Please check your network connection or try again later.';
@@ -402,6 +415,247 @@ export const getSmtpConfig =
       next(error);
     }
   };
+const SLACK_BOT_CAS_MAX_RETRIES = 5;
+
+const parseSlackBotStore = (
+  encrypted: string | null | undefined,
+  configManagerConfig: ReturnType<typeof loadConfigurationManagerConfig>,
+): SlackBotStore => {
+  if (!encrypted) {
+    return { configs: [] };
+  }
+
+  try {
+    const decrypted = EncryptionService.getInstance(
+      configManagerConfig.algorithm,
+      configManagerConfig.secretKey,
+    ).decrypt(encrypted);
+
+    const parsed = JSON.parse(decrypted) as Partial<SlackBotStore>;
+    return {
+      configs: Array.isArray(parsed.configs) ? parsed.configs : [],
+    };
+  } catch (error) {
+    logger.warn('Failed to parse slack bot settings, using empty config', { error });
+    return { configs: [] };
+  }
+};
+
+const getSlackBotStore = async (
+  keyValueStoreService: KeyValueStoreService,
+): Promise<SlackBotStore> => {
+  const configManagerConfig = loadConfigurationManagerConfig();
+  const encrypted = await keyValueStoreService.get<string>(configPaths.slackBot);
+  return parseSlackBotStore(encrypted, configManagerConfig);
+};
+
+const updateSlackBotStoreWithCAS = async <T>(
+  keyValueStoreService: KeyValueStoreService,
+  updater: (store: SlackBotStore) => T,
+): Promise<T> => {
+  const configManagerConfig = loadConfigurationManagerConfig();
+
+  for (let attempt = 0; attempt < SLACK_BOT_CAS_MAX_RETRIES; attempt++) {
+    const encryptedCurrent = await keyValueStoreService.get<string>(configPaths.slackBot);
+    const store = parseSlackBotStore(encryptedCurrent, configManagerConfig);
+    const result = updater(store);
+
+    const encryptedUpdated = EncryptionService.getInstance(
+      configManagerConfig.algorithm,
+      configManagerConfig.secretKey,
+    ).encrypt(JSON.stringify(store));
+
+    const casSuccess = await keyValueStoreService.compareAndSet<string>(
+      configPaths.slackBot,
+      encryptedCurrent ?? null,
+      encryptedUpdated,
+    );
+
+    if (casSuccess) {
+      return result;
+    }
+
+    if (attempt === SLACK_BOT_CAS_MAX_RETRIES - 1) {
+      throw new Error(
+        'Failed to update Slack bot config due to concurrent modification. Please try again.',
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+  }
+
+  throw new Error('Failed to update Slack bot config.');
+};
+
+const slackBotConfig = (config: SlackBotConfigEntry) => ({
+  id: config.id,
+  name: config.name,
+  agentId: config.agentId ?? null,
+  createdAt: config.createdAt,
+  updatedAt: config.updatedAt,
+  botToken: config.botToken,
+  signingSecret: config.signingSecret,
+});
+
+export const getSlackBotConfigs =
+  (keyValueStoreService: KeyValueStoreService) =>
+  async (_req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const store = await getSlackBotStore(keyValueStoreService);
+      res
+        .status(HTTP_STATUS.OK)
+        .json({
+          status: 'success',
+          configs: store.configs.map(slackBotConfig),
+        })
+        .end();
+    } catch (error: any) {
+      logger.error('Error getting slack bot configs', { error });
+      next(error);
+    }
+  };
+
+export const createSlackBotConfig =
+  (keyValueStoreService: KeyValueStoreService) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { name, botToken, signingSecret, agentId } = req.body;
+      const normalizedAgentId =
+        typeof agentId === 'string' && agentId.trim().length > 0
+          ? agentId.trim()
+          : undefined;
+      const config = await updateSlackBotStoreWithCAS(
+        keyValueStoreService,
+        (store): SlackBotConfigEntry => {
+          if (normalizedAgentId) {
+            const duplicate = store.configs.find(
+              (configItem) => configItem.agentId === normalizedAgentId,
+            );
+            if (duplicate) {
+              throw new BadRequestError(
+                'Selected agent is already linked to another Slack Bot configuration',
+              );
+            }
+          }
+
+          const timestamp = new Date().toISOString();
+          const createdConfig: SlackBotConfigEntry = {
+            id: uuidv4(),
+            name,
+            botToken,
+            signingSecret,
+            agentId: normalizedAgentId,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          };
+
+          store.configs.push(createdConfig);
+          return createdConfig;
+        },
+      );
+
+      res
+        .status(HTTP_STATUS.OK)
+        .json({
+          status: 'success',
+          config: slackBotConfig(config),
+        })
+        .end();
+    } catch (error: any) {
+      logger.error('Error creating slack bot config', { error });
+      next(error);
+    }
+  };
+
+export const updateSlackBotConfig =
+  (keyValueStoreService: KeyValueStoreService) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { configId } = req.params;
+      const { name, botToken, signingSecret, agentId } = req.body;
+      const normalizedAgentId =
+        typeof agentId === 'string' && agentId.trim().length > 0
+          ? agentId.trim()
+          : undefined;
+      const updatedConfig = await updateSlackBotStoreWithCAS(
+        keyValueStoreService,
+        (store): SlackBotConfigEntry => {
+          const configIndex = store.configs.findIndex((config) => config.id === configId);
+
+          if (configIndex === -1) {
+            throw new NotFoundError('Slack Bot configuration not found');
+          }
+
+          if (normalizedAgentId) {
+            const duplicate = store.configs.find(
+              (configItem) =>
+                configItem.agentId === normalizedAgentId && configItem.id !== configId,
+            );
+            if (duplicate) {
+              throw new BadRequestError(
+                'Selected agent is already linked to another Slack Bot configuration',
+              );
+            }
+          }
+
+          const previousConfig = store.configs[configIndex];
+          if (!previousConfig) {
+            throw new Error("Config not found");
+          }
+          const nextConfig: SlackBotConfigEntry = {
+            ...previousConfig,
+            name,
+            botToken,
+            signingSecret,
+            agentId: normalizedAgentId,
+            updatedAt: new Date().toISOString(),
+          };
+
+          store.configs[configIndex] = nextConfig;
+          return nextConfig;
+        },
+      );
+
+      res
+        .status(HTTP_STATUS.OK)
+        .json({
+          status: 'success',
+          config: slackBotConfig(updatedConfig),
+        })
+        .end();
+    } catch (error: any) {
+      logger.error('Error updating slack bot config', { error });
+      next(error);
+    }
+  };
+
+export const deleteSlackBotConfig =
+  (keyValueStoreService: KeyValueStoreService) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { configId } = req.params;
+      await updateSlackBotStoreWithCAS(keyValueStoreService, (store) => {
+        const configIndex = store.configs.findIndex((config) => config.id === configId);
+
+        if (configIndex === -1) {
+          throw new NotFoundError('Slack Bot configuration not found');
+        }
+
+        store.configs.splice(configIndex, 1);
+      });
+
+      res
+        .status(HTTP_STATUS.OK)
+        .json({
+          status: 'success',
+          message: 'Slack Bot configuration deleted',
+        })
+        .end();
+    } catch (error: any) {
+      logger.error('Error deleting slack bot config', { error });
+      next(error);
+    }
+  };
 
 // Platform settings
 export const setPlatformSettings =
@@ -492,13 +746,13 @@ export const setAzureAdAuthConfig =
     try {
       const configManagerConfig = loadConfigurationManagerConfig();
 
-      const { clientId, tenantId } = req.body;
+      const { clientId, tenantId, enableJit } = req.body;
       const authority = `https://login.microsoftonline.com/${tenantId}`;
 
       const encryptedAuthConfig = EncryptionService.getInstance(
         configManagerConfig.algorithm,
         configManagerConfig.secretKey,
-      ).encrypt(JSON.stringify({ clientId, tenantId, authority }));
+      ).encrypt(JSON.stringify({ clientId, tenantId, authority, enableJit: enableJit ?? true }));
 
       await keyValueStoreService.set<string>(
         configPaths.auth.azureAD,
@@ -548,13 +802,13 @@ export const setMicrosoftAuthConfig =
     try {
       const configManagerConfig = loadConfigurationManagerConfig();
 
-      const { clientId, tenantId } = req.body;
+      const { clientId, tenantId, enableJit } = req.body;
       const authority = `https://login.microsoftonline.com/${tenantId}`;
 
       const encryptedAuthConfig = EncryptionService.getInstance(
         configManagerConfig.algorithm,
         configManagerConfig.secretKey,
-      ).encrypt(JSON.stringify({ clientId, tenantId, authority }));
+      ).encrypt(JSON.stringify({ clientId, tenantId, authority, enableJit: enableJit ?? true }));
 
       await keyValueStoreService.set<string>(
         configPaths.auth.microsoft,
@@ -604,12 +858,12 @@ export const setGoogleAuthConfig =
     try {
       const configManagerConfig = loadConfigurationManagerConfig();
 
-      const { clientId } = req.body;
+      const { clientId, enableJit } = req.body;
 
       const encryptedAuthConfig = EncryptionService.getInstance(
         configManagerConfig.algorithm,
         configManagerConfig.secretKey,
-      ).encrypt(JSON.stringify({ clientId }));
+      ).encrypt(JSON.stringify({ clientId, enableJit: enableJit ?? true }));
 
       await keyValueStoreService.set<string>(
         configPaths.auth.google,
@@ -668,6 +922,7 @@ export const setOAuthConfig =
         userInfoEndpoint,
         scope,
         redirectUri,
+        enableJit,
       } = req.body;
 
       const oauthConfig = {
@@ -679,6 +934,7 @@ export const setOAuthConfig =
         ...(userInfoEndpoint && { userInfoEndpoint }),
         ...(scope && { scope }),
         ...(redirectUri && { redirectUri }),
+        enableJit: enableJit ?? true,
       };
 
       const encryptedAuthConfig = EncryptionService.getInstance(
@@ -1722,7 +1978,7 @@ export const setSsoAuthConfig =
   (keyValueStoreService: KeyValueStoreService) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
     try {
-      const { entryPoint, emailKey } = req.body;
+      const { entryPoint, emailKey, enableJit } = req.body;
       let { certificate } = req.body;
       certificate = certificate
         .replace(/\\n/g, '') // Remove \n
@@ -1744,7 +2000,7 @@ export const setSsoAuthConfig =
       const encryptedSsoConfig = EncryptionService.getInstance(
         configManagerConfig.algorithm,
         configManagerConfig.secretKey,
-      ).encrypt(JSON.stringify({ certificate, entryPoint, emailKey }));
+      ).encrypt(JSON.stringify({ certificate, entryPoint, emailKey, enableJit: enableJit ?? true }));
       await keyValueStoreService.set<string>(
         configPaths.auth.sso,
         encryptedSsoConfig,
@@ -2441,6 +2697,9 @@ export const getAvailableModelsByType =
           markDefault = true;
         }
 
+        // Only include modelFriendlyName if there's a single model (not comma-separated)
+        const shouldIncludeFriendlyName = modelNames.length === 1 && config.modelFriendlyName;
+
         for (const modelName of modelNames) {
           const flattenedModel = {
             modelType,
@@ -2450,6 +2709,7 @@ export const getAvailableModelsByType =
             isMultimodal: config.isMultimodal || false,
             isReasoning: config.isReasoning || false,
             isDefault: markDefault,
+            ...(shouldIncludeFriendlyName && { modelFriendlyName: config.modelFriendlyName }),
           };
           markDefault = false; // Only mark first model as default
           flattenedModels.push(flattenedModel);
@@ -2592,6 +2852,9 @@ export const addAIModelProvider =
         );
       } while (existingKeys.includes(modelKey));
 
+      // Extract modelFriendlyName from configuration if present
+      const modelFriendlyName = configuration.modelFriendlyName;
+
       // Prepare the new configuration
       const newConfig = {
         provider,
@@ -2601,6 +2864,7 @@ export const addAIModelProvider =
         isDefault,
         isReasoning,
         contextLength,
+        ...(modelFriendlyName && { modelFriendlyName }),
       };
 
       // If this is set as default, remove default flag from other models
@@ -2782,12 +3046,18 @@ export const updateAIModelProvider =
         return;
       }
 
+      // Extract modelFriendlyName from configuration if present
+      const modelFriendlyName = configuration.modelFriendlyName;
+
       // Update the model configuration
       targetModel.configuration = configuration;
       targetModel.isMultimodal = isMultimodal;
       targetModel.isDefault = isDefault;
       targetModel.isReasoning = isReasoning;
       targetModel.contextLength = contextLength || null;
+      if (modelFriendlyName !== undefined) {
+        targetModel.modelFriendlyName = modelFriendlyName;
+      }
       // If this is set as default, remove default flag from other models of the same type
       if (isDefault) {
         for (const config of aiModels[targetModelType]) {

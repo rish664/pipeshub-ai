@@ -158,6 +158,10 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
   });
   const [checkingConfigs, setCheckingConfigs] = useState(true);
   const [lastConfigured, setLastConfigured] = useState<string | null>(null);
+  const [azureAdConfigData, setAzureAdConfigData] = useState<{
+    clientId?: string;
+    tenantId?: string;
+  } | null>(null);
 
   // Check authentication configurations on component mount and when configUpdated changes
   useEffect(() => {
@@ -183,11 +187,23 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
           !!results[1].value.clientId &&
           !!results[1].value.tenantId;
 
-        const azureConfigured =
-          results[2].status === 'fulfilled' &&
-          results[2].value &&
-          !!results[2].value.clientId &&
-          !!results[2].value.tenantId;
+        // Store Azure AD config data for more robust checking
+        const azureConfigResult = results[2];
+        const azureConfigValue =
+          azureConfigResult.status === 'fulfilled' ? azureConfigResult.value : null;
+
+        // Store the raw config data
+        setAzureAdConfigData(azureConfigValue);
+
+        // Ensure azureConfigured is always a boolean
+        const azureConfigured = Boolean(
+          azureConfigResult.status === 'fulfilled' &&
+          azureConfigValue &&
+          !!azureConfigValue.clientId &&
+          !!azureConfigValue.tenantId &&
+          azureConfigValue.clientId.trim() !== '' &&
+          azureConfigValue.tenantId.trim() !== ''
+        );
 
         // Fixed SAML check - making sure it returns a boolean
         const samlConfigured =
@@ -426,7 +442,7 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
           onClose={handleCloseError}
           severity={errorMessage?.includes('successfully') ? 'success' : 'warning'}
           variant="filled"
-          sx={{ 
+          sx={{
             width: '100%',
             boxShadow: theme.palette.mode === 'dark'
               ? '0px 3px 8px rgba(0, 0, 0, 0.3)'
@@ -443,22 +459,22 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
 
       {/* Section header for Authentication Methods */}
       <Box sx={{ mb: 2, mt: 3 }}>
-        <Typography 
-          variant="h6" 
-          sx={{ 
-            fontWeight: 600, 
+        <Typography
+          variant="h6"
+          sx={{
+            fontWeight: 600,
             mb: 0.5,
             fontSize: '1rem',
           }}
         >
           Authentication Methods
         </Typography>
-        <Typography 
-          variant="body2" 
+        <Typography
+          variant="body2"
           color="text.secondary"
-          sx={{ 
+          sx={{
             fontSize: '0.8125rem',
-            lineHeight: 1.5 
+            lineHeight: 1.5
           }}
         >
           Select the authentication method users will use to sign in
@@ -466,7 +482,27 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
       </Box>
 
       <Grid container spacing={2}>
-        {AUTH_METHODS_CONFIG.map((methodConfig) => {
+        {AUTH_METHODS_CONFIG.filter((methodConfig) => {
+          // Hide Azure AD unless it's configured or enabled (for backward compatibility)
+          if (methodConfig.type === 'azureAd') {
+            const currentMethod = authMethods.find((m) => m.type === 'azureAd');
+            const isEnabled = currentMethod?.enabled || false;
+
+            // Check if Azure AD has actual configuration data (not just empty strings)
+            const hasConfigData =
+              azureAdConfigData &&
+              azureAdConfigData.clientId &&
+              azureAdConfigData.tenantId &&
+              azureAdConfigData.clientId.trim() !== '' &&
+              azureAdConfigData.tenantId.trim() !== '';
+
+            // Show Azure AD if:
+            // 1. It's enabled (backward compatibility for active users)
+            // 2. It has configuration data (backward compatibility for configured but not enabled)
+            return isEnabled || hasConfigData || configStatus.azureAd;
+          }
+          return true;
+        }).map((methodConfig) => {
           const currentMethod = authMethods.find((m) => m.type === methodConfig.type);
           const isEnabled = currentMethod?.enabled || false;
           const isDisabled = isMethodDisabled(methodConfig.type, isEnabled);
@@ -515,22 +551,22 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
                     minHeight: 68,
                     borderRadius: 1,
                     border: '1px solid',
-                    borderColor: isEnabled 
-                      ? alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.3 : 0.2) 
+                    borderColor: isEnabled
+                      ? alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.3 : 0.2)
                       : theme.palette.divider,
-                    bgcolor: isEnabled 
+                    bgcolor: isEnabled
                       ? alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.05 : 0.02)
                       : 'transparent',
                     transition: 'all 0.15s ease',
                     opacity: isDisabled && !isEnabled ? 0.7 : 1,
                     ...(isEditing &&
                       !isDisabled && {
-                        '&:hover': {
-                          borderColor: alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.4 : 0.3),
-                          bgcolor: alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.08 : 0.04),
-                          transform: 'translateY(-1px)',
-                        },
-                      }),
+                      '&:hover': {
+                        borderColor: alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.4 : 0.3),
+                        bgcolor: alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.08 : 0.04),
+                        transform: 'translateY(-1px)',
+                      },
+                    }),
                   }}
                 >
                   {/* Icon container */}
@@ -542,7 +578,7 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
                       alignItems: 'center',
                       justifyContent: 'center',
                       mr: 2,
-                      bgcolor: theme.palette.mode === 'dark' 
+                      bgcolor: theme.palette.mode === 'dark'
                         ? alpha(theme.palette.background.paper, 0.3)
                         : alpha(theme.palette.grey[100], 0.8),
                       color: isEnabled
@@ -635,7 +671,7 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
                           display: 'flex',
                           alignItems: 'center',
                           borderRadius: 0.75,
-                          bgcolor: theme.palette.mode === 'dark' 
+                          bgcolor: theme.palette.mode === 'dark'
                             ? alpha(isConfigured ? theme.palette.info.main : theme.palette.warning.main, 0.15)
                             : alpha(isConfigured ? theme.palette.info.main : theme.palette.warning.main, 0.08),
                           color: isConfigured ? theme.palette.info.main : theme.palette.warning.main,
@@ -715,169 +751,7 @@ const AuthMethodsList: React.FC<AuthMethodsListProps> = ({
         })}
       </Grid>
 
-      {/* Section header for Configuration */}
-      <Box sx={{ mb: 2, mt: 3 }}>
-        <Typography 
-          variant="h6" 
-          sx={{ 
-            fontWeight: 600, 
-            mb: 0.5,
-            fontSize: '1rem',
-          }}
-        >
-          Server Configuration
-        </Typography>
-        <Typography 
-          variant="body2" 
-          color="text.secondary"
-          sx={{ 
-            fontSize: '0.8125rem',
-            lineHeight: 1.5 
-          }}
-        >
-          Configure email and other server settings for authentication
-        </Typography>
-      </Box>
 
-      {/* SMTP Configuration Card */}
-      <Grid container spacing={2}>
-        <Grid item xs={12} sm={10} md={6}>
-          <Paper
-            elevation={0}
-            sx={{
-              p: 2,
-              display: 'flex',
-              alignItems: 'center',
-              minHeight: 68,
-              borderRadius: 1,
-              border: '1px solid',
-              borderColor: smtpConfigured 
-                ? alpha(theme.palette.success.main, theme.palette.mode === 'dark' ? 0.3 : 0.2) 
-                : alpha(theme.palette.warning.main, theme.palette.mode === 'dark' ? 0.3 : 0.2),
-              bgcolor: smtpConfigured 
-                ? alpha(theme.palette.success.main, theme.palette.mode === 'dark' ? 0.05 : 0.02)
-                : alpha(theme.palette.warning.main, theme.palette.mode === 'dark' ? 0.05 : 0.02),
-              transition: 'all 0.15s ease',
-              '&:hover': {
-                borderColor: smtpConfigured 
-                  ? alpha(theme.palette.success.main, theme.palette.mode === 'dark' ? 0.4 : 0.3)
-                  : alpha(theme.palette.warning.main, theme.palette.mode === 'dark' ? 0.4 : 0.3),
-                transform: 'translateY(-1px)',
-              },
-            }}
-          >
-            {/* Icon container */}
-            <Box
-              sx={{
-                width: 36,
-                height: 36,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                mr: 2,
-                bgcolor: theme.palette.mode === 'dark' 
-                  ? alpha(theme.palette.background.paper, 0.3)
-                  : alpha(theme.palette.grey[100], 0.8),
-                color: smtpConfigured ? theme.palette.success.main : theme.palette.warning.main,
-                borderRadius: 1,
-                flexShrink: 0,
-                border: '1px solid',
-                borderColor: theme.palette.divider,
-              }}
-            >
-              <Iconify icon={SMTP_CONFIG.icon} width={20} height={20} />
-            </Box>
-
-            {/* Content */}
-            <Box
-              sx={{
-                flexGrow: 1,
-                overflow: 'hidden',
-                mr: 1,
-              }}
-            >
-              <Typography
-                variant="subtitle2"
-                sx={{
-                  fontWeight: 600,
-                  fontSize: '0.875rem',
-                  color: smtpConfigured ? theme.palette.success.main : theme.palette.warning.main,
-                }}
-              >
-                {SMTP_CONFIG.title}
-              </Typography>
-              <Typography
-                variant="caption"
-                color="text.secondary"
-                sx={{
-                  display: '-webkit-box',
-                  WebkitLineClamp: 1,
-                  WebkitBoxOrient: 'vertical',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  fontSize: '0.75rem',
-                  lineHeight: 1.4,
-                }}
-              >
-                {SMTP_CONFIG.description}
-              </Typography>
-            </Box>
-
-            {/* Status indicator */}
-            <Box
-              sx={{
-                height: 22,
-                fontSize: '0.6875rem',
-                px: 1,
-                display: 'flex',
-                alignItems: 'center',
-                borderRadius: 0.75,
-                mr: 1.5,
-                bgcolor: theme.palette.mode === 'dark' 
-                  ? alpha(smtpConfigured ? theme.palette.success.main : theme.palette.warning.main, 0.15)
-                  : alpha(smtpConfigured ? theme.palette.success.main : theme.palette.warning.main, 0.08),
-                color: smtpConfigured ? theme.palette.success.main : theme.palette.warning.main,
-                fontWeight: 600,
-              }}
-            >
-              <Box
-                sx={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: '50%',
-                  bgcolor: 'currentColor',
-                  mr: 0.5,
-                }}
-              />
-              {smtpConfigured ? 'Configured' : 'Not Configured'}
-            </Box>
-
-            {/* Configure button */}
-            <IconButton
-              size="small"
-              onClick={() => handleConfigureWithTracking('smtp')}
-              sx={{
-                p: 0.75,
-                color: theme.palette.text.secondary,
-                bgcolor: theme.palette.mode === 'dark' 
-                  ? alpha(theme.palette.background.paper, 0.3)
-                  : alpha(theme.palette.background.default, 0.8),
-                border: '1px solid',
-                borderColor: theme.palette.divider,
-                '&:hover': {
-                  bgcolor: alpha(
-                    smtpConfigured ? theme.palette.success.main : theme.palette.warning.main,
-                    theme.palette.mode === 'dark' ? 0.15 : 0.08
-                  ),
-                  color: smtpConfigured ? theme.palette.success.main : theme.palette.warning.main,
-                },
-              }}
-            >
-              <Iconify icon={settingsIcon} width={18} height={18} />
-            </IconButton>
-          </Paper>
-        </Grid>
-      </Grid>
     </>
   );
 };

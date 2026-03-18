@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import cors from 'cors';
 import morgan from 'morgan';
 import http from 'http';
+import { HttpMethod } from './libs/enums/http-methods.enum';
 import { Container } from 'inversify';
 import { TokenManagerContainer } from './modules/tokens_manager/container/token-manager.container';
 import { Logger } from './libs/services/logger.service';
@@ -12,6 +13,8 @@ import { ErrorMiddleware } from './libs/middlewares/error.middleware';
 import { createUserRouter } from './modules/user_management/routes/users.routes';
 import { createUserGroupRouter } from './modules/user_management/routes/userGroups.routes';
 import { createOrgRouter } from './modules/user_management/routes/org.routes';
+import { OAuthTokenService } from './modules/oauth_provider/services/oauth_token.service';
+import { registerOAuthTokenService } from './libs/services/oauth-token-service.provider';
 import {
   createConversationalRouter,
   createSemanticSearchRouter,
@@ -19,6 +22,7 @@ import {
 } from './modules/enterprise_search/routes/es.routes';
 import { EnterpriseSearchAgentContainer } from './modules/enterprise_search/container/es.container';
 import { requestContextMiddleware } from './libs/middlewares/request.context';
+import { xssSanitizationMiddleware } from './libs/middlewares/xss-sanitization.middleware';
 
 import { createUserAccountRouter } from './modules/auth/routes/userAccount.routes';
 import { UserManagerContainer } from './modules/user_management/container/userManager.container';
@@ -44,19 +48,22 @@ import {
 } from './modules/tokens_manager/config/config';
 import { NotificationService } from './modules/notification/service/notification.service';
 import { createGlobalRateLimiter } from './libs/middlewares/rate-limit.middleware';
-import {
-  createSwaggerContainer,
-  SwaggerConfig,
-  SwaggerService,
-} from './modules/docs/swagger.container';
-import { registerStorageSwagger } from './modules/storage/docs/swagger';
+import { ApiDocsContainer } from './modules/api-docs/docs.container';
+import { createApiDocsRouter } from './modules/api-docs/docs.routes';
 import { CrawlingManagerContainer } from './modules/crawling_manager/container/cm_container';
 import createCrawlingManagerRouter from './modules/crawling_manager/routes/cm_routes';
 import { MigrationService } from './modules/configuration_manager/services/migration.service';
+import { checkAndMigrateIfNeeded } from './libs/keyValueStore/migration/kvStoreMigration.service';
+import { StoreType } from './libs/keyValueStore/constants/KeyValueStoreType';
 import { createTeamsRouter } from './modules/user_management/routes/teams.routes';
-import { registerAuthSwagger } from './modules/auth/docs/swagger';
-import { registerConfigurationManagerSwagger } from './modules/configuration_manager/docs/swagger';
-import { registerCrawlingManagerSwagger } from './modules/crawling_manager/docs/swagger';
+import { OAuthProviderContainer } from './modules/oauth_provider/container/oauth.provider.container';
+import { createOAuthProviderRouter } from './modules/oauth_provider/routes/oauth.provider.routes';
+import { createOAuthClientsRouter } from './modules/oauth_provider/routes/oauth.clients.routes';
+import { createOIDCDiscoveryRouter } from './modules/oauth_provider/routes/oid.provider.routes';
+import { ensureKafkaTopicsExist, REQUIRED_KAFKA_TOPICS } from './libs/services/kafka-admin.service';
+import { ToolsetsContainer } from './modules/toolsets/container/toolsets.container';
+import { createToolsetsRouter } from './modules/toolsets/routes/toolsets_routes';
+import { createMCPRouter } from './modules/mcp/routes/mcp.routes';
 
 const loggerConfig = {
   service: 'Application',
@@ -76,6 +83,9 @@ export class Application {
   private mailServiceContainer!: Container;
   private notificationContainer!: Container;
   private crawlingManagerContainer!: Container;
+  private apiDocsContainer!: Container;
+  private oauthProviderContainer!: Container;
+  private toolsetsContainer!: Container;
   private port: number;
 
   constructor() {
@@ -84,6 +94,7 @@ export class Application {
     this.server = http.createServer(this.app);
   }
 
+
   async initialize(): Promise<void> {
     try {
       // Initialize Logger
@@ -91,6 +102,18 @@ export class Application {
       // Loads configuration
       const configurationManagerConfig = loadConfigurationManagerConfig();
       const appConfig = await loadAppConfig();
+
+      // Ensure Kafka topics exist (important for Kafka deployments where auto-create is disabled)
+      try {
+        this.logger.info('Ensuring Kafka topics exist...');
+        await ensureKafkaTopicsExist(appConfig.kafka, this.logger, REQUIRED_KAFKA_TOPICS);
+        this.logger.info('Kafka topics check completed');
+      } catch (kafkaError: any) {
+        this.logger.warn(
+          `Could not verify/create Kafka topics: ${kafkaError.message}.`
+        );
+        // Don't throw - allow app to continue; topics might already exist or be created elsewhere
+      }
 
       this.tokenManagerContainer = await TokenManagerContainer.initialize(
         configurationManagerConfig,
@@ -136,6 +159,19 @@ export class Application {
           configurationManagerConfig,
           appConfig,
         );
+
+      this.oauthProviderContainer = await OAuthProviderContainer.initialize(
+        configurationManagerConfig,
+        appConfig,
+      );
+
+
+      this.toolsetsContainer = await ToolsetsContainer.initialize(
+        configurationManagerConfig,
+      );
+
+      await this.addOAuthServicesToAuthMiddleware();
+
 
       // binding prometheus to all services routes
       this.logger.debug('Binding Prometheus Service with other services');
@@ -183,10 +219,27 @@ export class Application {
         .toSelf()
         .inSingletonScope();
 
+      this.oauthProviderContainer
+        .bind<PrometheusService>(PrometheusService)
+        .toSelf()
+        .inSingletonScope();
+
+      this.toolsetsContainer
+        .bind<PrometheusService>(PrometheusService)
+        .toSelf()
+        .inSingletonScope();
+
+      // Initialize API Documentation
+      this.apiDocsContainer = await ApiDocsContainer.initialize();
+
+      // Slack events proxy must be mounted before body-parsing middleware
+      // so the raw request body is forwarded intact for signature verification
+      this.setupSlackEventsProxy();
+
       // Configure Express
       this.configureMiddleware(appConfig);
       this.configureRoutes();
-      this.setupSwagger();
+      this.setupApiDocs();
       this.configureErrorHandling();
 
       this.notificationContainer
@@ -211,49 +264,54 @@ export class Application {
   }
 
   private configureMiddleware(appConfig: AppConfig): void {
-    const isDev = process.env.NODE_ENV !== 'production';
-    // Security middleware - configure helmet once with all options
-    const envConnectSrcs = process.env.CSP_CONNECT_SRCS?.split(',').filter(Boolean) ?? [];
-    const connectSrc = [
-      ...new Set([
-        "'self'",
-        "https://static.cloudflareinsights.com",
-        // Login with google urls
-        'https://accounts.google.com',
-        'https://www.googleapis.com',
-        // Login with microsoft urls
-        'https://login.microsoftonline.com',
-        'https://graph.microsoft.com',
-        ...envConnectSrcs,
-        appConfig.connectorPublicUrl,
-      ]),
-    ].filter(Boolean);
+    const isStrictMode = process.env.STRICT_MODE === 'true';
+    if (isStrictMode) {
+      // Security middleware - configure helmet once with all options
+      const envConnectSrcs = process.env.CSP_CONNECT_SRCS?.split(',').filter(Boolean) ?? [];
+      const connectSrc = [
+        ...new Set([
+          "'self'",
+          "https://static.cloudflareinsights.com",
+          // Login with google urls
+          'https://accounts.google.com',
+          'https://www.googleapis.com',
+          // Login with microsoft urls
+          'https://login.microsoftonline.com',
+          'https://graph.microsoft.com',
+          ...envConnectSrcs,
+          appConfig.connectorPublicUrl,
+        ]),
+      ].filter(Boolean);
 
-    this.app.use(helmet({
-      crossOriginOpenerPolicy: { policy: "unsafe-none" }, // Required for MSAL popup
-      contentSecurityPolicy: {
-        directives: {
-          defaultSrc: ["'self'"],
-          scriptSrc: [
-            "'self'",
-            ...(process.env.CSP_SCRIPT_SRCS?.split(',') ?? [
-              "https://cdnjs.cloudflare.com",
-              "https://login.microsoftonline.com",
-              "https://graph.microsoft.com",
-            ]),
-            ...(isDev ? ["'unsafe-inline'", "'unsafe-eval'"] : [])
-          ],
-          connectSrc: connectSrc,
-          objectSrc: ["'self'", "data:", "blob:"], // PDF rendering
-          frameSrc: ["'self'", "blob:"], // PDF rendering in frames
-          workerSrc: ["'self'", "blob:"], // PDF.js workers
-          childSrc: ["'self'", "blob:"], // PDF rendering
-          imgSrc: ["'self'", "data:", "blob:", "https:"], // Images in PDFs
-          fontSrc: ["'self'", "data:", "https:"], // Fonts in PDFs
-          mediaSrc: ["'self'", "blob:", "data:"] // Media in PDFs
+      this.app.use(helmet({
+        crossOriginOpenerPolicy: { policy: "unsafe-none" }, // Required for MSAL popup
+        contentSecurityPolicy: {
+          directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: [
+              "'self'",
+              ...(process.env.CSP_SCRIPT_SRCS?.split(',') ?? [
+                "https://cdnjs.cloudflare.com",
+                "https://login.microsoftonline.com",
+                "https://graph.microsoft.com",
+                "https://accounts.google.com",
+                "https://challenges.cloudflare.com",
+                "https://api.iconify.design",
+                "https://api.simplesvg.com"
+              ]),
+            ],
+            connectSrc: connectSrc,
+            objectSrc: ["'self'", "data:", "blob:"], // PDF rendering
+            frameSrc: ["'self'", "blob:"], // PDF rendering in frames
+            workerSrc: ["'self'", "blob:"], // PDF.js workers
+            childSrc: ["'self'", "blob:"], // PDF rendering
+            imgSrc: ["'self'", "data:", "blob:", "https:"], // Images in PDFs
+            fontSrc: ["'self'", "data:", "https:"], // Fonts in PDFs
+            mediaSrc: ["'self'", "blob:", "data:"] // Media in PDFs
+          }
         }
-      }
-    }));
+      }));
+    }
 
     // Request context middleware
     this.app.use(requestContextMiddleware);
@@ -264,7 +322,7 @@ export class Application {
         origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'], // Be more specific than '*'
         credentials: true,
         exposedHeaders: ['x-session-token', 'content-disposition'],
-        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        methods: [HttpMethod.DELETE, HttpMethod.GET, HttpMethod.OPTIONS, HttpMethod.PATCH, HttpMethod.POST, HttpMethod.PUT],
         allowedHeaders: ['Content-Type', 'Authorization', 'x-session-token']
       }),
     );
@@ -272,6 +330,7 @@ export class Application {
     // Body parsing
     this.app.use(express.json({ limit: '10mb' }));
     this.app.use(express.urlencoded({ extended: true }));
+    this.app.use(xssSanitizationMiddleware);
 
     // Logging
     this.app.use(
@@ -283,7 +342,7 @@ export class Application {
     );
 
     // Global rate limiter - applies to all routes
-    this.app.use(createGlobalRateLimiter(this.logger));
+    this.app.use(createGlobalRateLimiter(this.logger, appConfig.maxRequestsPerMinute));
   }
 
   private configureRoutes(): void {
@@ -292,7 +351,6 @@ export class Application {
       '/api/v1/health',
       createHealthRouter(
         this.tokenManagerContainer,
-        this.knowledgeBaseContainer,
         this.configurationManagerContainer,
       ),
     );
@@ -311,7 +369,7 @@ export class Application {
     );
     this.app.use('/api/v1/org', createOrgRouter(this.entityManagerContainer));
 
-    this.app.use('/api/v1/saml', createSamlRouter(this.authServiceContainer, this.entityManagerContainer));
+    this.app.use('/api/v1/saml', createSamlRouter(this.authServiceContainer));
 
     this.app.use(
       '/api/v1/userAccount',
@@ -361,13 +419,19 @@ export class Application {
     // knowledge base routes
     this.app.use(
       '/api/v1/knowledgeBase',
-      createKnowledgeBaseRouter(this.knowledgeBaseContainer),
+      createKnowledgeBaseRouter(this.knowledgeBaseContainer, this.notificationContainer),
     );
 
     // configuration manager routes
     this.app.use(
       '/api/v1/configurationManager',
       createConfigurationManagerRouter(this.configurationManagerContainer),
+    );
+
+    // toolsets routes
+    this.app.use(
+      '/api/v1/toolsets',
+      createToolsetsRouter(this.toolsetsContainer)
     );
 
     this.app.use(
@@ -379,6 +443,34 @@ export class Application {
     this.app.use(
       '/api/v1/crawlingManager',
       createCrawlingManagerRouter(this.crawlingManagerContainer),
+    );
+
+    // pipeshub OAuth Provider routes
+    this.app.use(
+      '/api/v1/oauth2',
+      createOAuthProviderRouter(this.oauthProviderContainer),
+    );
+
+    // OAuth Clients routes (OAuth app management)
+    this.app.use(
+      '/api/v1/oauth-clients',
+      createOAuthClientsRouter(this.oauthProviderContainer),
+    );
+
+    // MCP (Model Context Protocol) routes
+    this.app.use(
+      '/mcp',
+      createMCPRouter(this.oauthProviderContainer),
+    );
+
+    // OIDC Discovery routes - mounted at root level per RFC 8414 & RFC 9728
+    // Exposes: GET /.well-known/openid-configuration
+    //          GET /.well-known/oauth-authorization-server
+    //          GET /.well-known/oauth-protected-resource
+    //          GET /.well-known/jwks.json
+    this.app.use(
+      '/.well-known',
+      createOIDCDiscoveryRouter(this.oauthProviderContainer),
     );
   }
 
@@ -405,9 +497,14 @@ export class Application {
   async stop(): Promise<void> {
     try {
       this.logger.info('Shutting down application...');
-      this.notificationContainer
-        .get<NotificationService>(NotificationService)
-        .shutdown();
+      try {
+        this.notificationContainer
+          .get<NotificationService>(NotificationService)
+          .shutdown();
+      } catch (err) {
+        this.logger.warn('NotificationService not available during shutdown',
+          { error: err instanceof Error ? err.message : String(err) });
+      }
       await NotificationContainer.dispose();
       await StorageContainer.dispose();
       await UserManagerContainer.dispose();
@@ -418,6 +515,8 @@ export class Application {
       await ConfigurationManagerContainer.dispose();
       await MailServiceContainer.dispose();
       await CrawlingManagerContainer.dispose();
+      await ApiDocsContainer.dispose();
+      await OAuthProviderContainer.dispose();
 
       this.logger.info('Application stopped successfully');
     } catch (error) {
@@ -445,47 +544,108 @@ export class Application {
     }
   }
 
-  private setupSwagger() {
+  private setupApiDocs(): void {
     try {
-      // Create the Swagger configuration
-      const swaggerConfig: SwaggerConfig = {
-        title: 'PipesHub API',
-        version: '1.0.0',
-        description: 'RESTful API for PipesHub services',
-        contact: {
-          name: 'API Support',
-          email: 'contact@pipeshub.com',
-        },
-        basePath: '/api-docs',
-      };
-
-      // Create container
-      const swaggerContainer = createSwaggerContainer();
-
-      // Get SwaggerService from container - IMPORTANT: Use the class directly, not as a string token
-      const swaggerService = swaggerContainer.get(SwaggerService);
-
-      // Initialize with app and config
-      swaggerService.initialize(this.app, swaggerConfig);
-
-      // Register module documentation
-      registerStorageSwagger(swaggerService);
-
-      registerAuthSwagger(swaggerService);
-
-      registerConfigurationManagerSwagger(swaggerService);
-
-      registerCrawlingManagerSwagger(swaggerService);
-      // Register other modules as needed
-
-      // Setup the Swagger UI routes
-      swaggerService.setupSwaggerRoutes();
-
-      this.logger.info('Swagger documentation initialized successfully');
+      // Mount the API documentation UI at /api/v1/docs
+      this.app.use('/api/v1/docs', createApiDocsRouter(this.apiDocsContainer));
+      this.logger.info('API documentation initialized at /api/v1/docs');
     } catch (error) {
-      this.logger.error('Failed to initialize Swagger documentation', {
+      this.logger.error('Failed to initialize API documentation', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  /**
+   * Run migration from etcd to Redis BEFORE loading app config.
+   * This ensures secrets exist in Redis before we try to read them.
+   * Must be called before initialize().
+   */
+  async preInitMigration(): Promise<void> {
+    const logger = Logger.getInstance(loggerConfig);
+    const configurationManagerConfig = loadConfigurationManagerConfig();
+
+    if (configurationManagerConfig.storeType !== StoreType.Redis || !process.env.ETCD_URL) {
+      logger.debug('KV store is not Redis or etcd not available, skipping pre-init migration check');
+      return;
+    }
+
+    logger.info('Checking KV store migration status before loading config...');
+    const migrationResult = await checkAndMigrateIfNeeded({
+      etcd: {
+        host: configurationManagerConfig.storeConfig.host,
+        port: configurationManagerConfig.storeConfig.port,
+        dialTimeout: configurationManagerConfig.storeConfig.dialTimeout,
+      },
+      redis: {
+        host: configurationManagerConfig.redisConfig.host,
+        port: configurationManagerConfig.redisConfig.port,
+        username: configurationManagerConfig.redisConfig.username || undefined,
+        password: configurationManagerConfig.redisConfig.password,
+        db: configurationManagerConfig.redisConfig.db,
+        keyPrefix: configurationManagerConfig.redisConfig.keyPrefix,
+        tls: configurationManagerConfig.redisConfig.tls,
+      },
+    });
+
+    if (migrationResult !== null) {
+      if (migrationResult.success) {
+        logger.info('KV store migration completed successfully', {
+          migratedKeys: migrationResult.migratedKeys.length,
+        });
+      } else {
+        logger.error('KV store migration failed', {
+          error: migrationResult.error,
+          failedKeys: migrationResult.failedKeys,
+        });
+        throw new Error(`KV store migration failed: ${migrationResult.error}`);
+      }
+    } else {
+      logger.info('KV store migration not needed (already completed or etcd not available)');
+    }
+  }
+
+  private setupSlackEventsProxy(): void {
+    const slackBotPort = parseInt(process.env.SLACK_BOT_PORT || '3020', 10);
+
+    this.app.use('/slack/events', (req, res) => {
+      const proxyReq = http.request(
+        {
+          hostname: 'localhost',
+          port: slackBotPort,
+          path: '/slack/events',
+          method: req.method,
+          headers: req.headers,
+        },
+        (proxyRes) => {
+          res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+          proxyRes.pipe(res);
+        },
+      );
+
+      proxyReq.on('error', (err) => {
+        this.logger.error('Slack events proxy error', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        if (!res.headersSent) {
+          res.status(502).json({ error: 'Slack bot service unavailable' });
+        }
+      });
+
+      req.pipe(proxyReq);
+    });
+  }
+
+  async addOAuthServicesToAuthMiddleware(): Promise<void> {
+    try {
+      const oauthTokenService = this.oauthProviderContainer.get<OAuthTokenService>('OAuthTokenService');
+      registerOAuthTokenService(oauthTokenService);
+      this.logger.info('OAuth token service registered for AuthMiddleware factory');
+    } catch (error) {
+      this.logger.warn('Failed to register OAuth token service', {
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
   }
 }
+

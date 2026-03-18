@@ -39,8 +39,8 @@ import {
 
 import axios from 'src/utils/axios';
 import { CONFIG } from 'src/config-global';
+import { ConnectorApiService } from 'src/sections/accountdetails/connectors/services/api';
 import type { Record } from './types/record-details';
-import { getConnectorPublicUrl } from '../accountdetails/account-settings/services/utils/services-configuration-service';
 import { ORIGIN } from './constants/knowledge-search';
 import PdfHighlighterComp from '../qna/chatbot/components/pdf-highlighter';
 import DocxViewer from '../qna/chatbot/components/docx-highlighter';
@@ -50,7 +50,7 @@ import TextViewer from '../qna/chatbot/components/text-highlighter';
 import MarkdownViewer from '../qna/chatbot/components/markdown-highlighter';
 import { KnowledgeBaseAPI } from './services/api';
 import ImageHighlighter from '../qna/chatbot/components/image-highlighter';
-import { getExtensionFromMimeType} from './utils/utils';
+import { getExtensionFromMimeType } from './utils/utils';
 
 const MAX_FILE_SIZE_MB = 10; // 10MB
 
@@ -153,7 +153,7 @@ const getExtensionColor = (extension: string, recordType?: string) => {
 
 function getDocumentType(extension: string, recordType?: string) {
   if (extension === 'pdf') return 'pdf';
-  if (['xlsx', 'xls', 'csv'].includes(extension)) return 'excel';
+  if (['xlsx', 'xls', 'csv', 'tsv'].includes(extension)) return 'excel';
   if (extension === 'docx') return 'docx';
   if (extension === 'html') return 'html';
   if (extension === 'txt') return 'text';
@@ -439,8 +439,8 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
     (errorMessage: string) => {
       setSnackbar({
         open: true,
-        message: 'Failed to load preview. Redirecting to the original document shortly...',
-        severity: 'info',
+        message: errorMessage,
+        severity: 'error',
       });
 
       let webUrl = record.fileRecord?.webUrl || record.mailRecord?.webUrl;
@@ -454,27 +454,15 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
         handleCloseViewer();
       }, 500);
 
-      setTimeout(() => {
-        if (webUrl) {
+      if (webUrl) {
+        setTimeout(() => {
           try {
             window.open(webUrl, '_blank', 'noopener,noreferrer');
           } catch (openError) {
             console.error('Error opening new tab:', openError);
-            setSnackbar({
-              open: true,
-              message:
-                'Failed to automatically open the document. Please check your browser pop-up settings.',
-              severity: 'error',
-            });
           }
-        } else {
-          setSnackbar({
-            open: true,
-            message: 'Failed to load preview and cannot redirect (document URL not found).',
-            severity: 'error',
-          });
-        }
-      }, 2500);
+        }, 2500);
+      }
     },
     [record, handleCloseViewer]
   );
@@ -503,6 +491,11 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
   // Helper function to get webUrl with text fragment (similar to other components)
   const getWebUrl = useCallback((): string | null => {
     try {
+      const hideWeburl = record.hideWeburl ?? false;
+      if (hideWeburl) {
+        return null;
+      }
+
       let webUrl = record.webUrl;
       if (!webUrl) {
         return null;
@@ -537,14 +530,14 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
   const handleDownload = async () => {
     try {
       setIsDownloading(true);
-      const recordId = origin === ORIGIN.UPLOAD ? externalRecordId : record._key;
-      await KnowledgeBaseAPI.handleDownloadDocument(recordId, recordName, origin);
-    } catch (error) {
+      // Always use record._key - the backend handles both KB and connector records via unified stream API
+      await KnowledgeBaseAPI.handleDownloadDocument(record.id, recordName);
+    } catch (error: any) {
       console.error('Failed to download document:', error);
       setSnackbar({
         open: true,
-        message: 'Failed to download document. Please try again.',
-        severity: 'error',
+        message: error?.message || 'Failed to download document. Please try again.',
+        severity: error?.statusCode === 503 ? 'warning' : 'error',
       });
     } finally {
       setIsDownloading(false);
@@ -567,7 +560,7 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
     }));
 
     try {
-      const recordId = record._key;
+      const recordId = record.id;
 
       if (!record) {
         console.error('Record not found for ID:', recordId);
@@ -581,108 +574,59 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
       }
 
       let fileDataLoaded = false;
-      let loadedFileUrl = '';
+
       let loadedFileBuffer: ArrayBuffer | null = null;
 
-      if (record.origin === ORIGIN.UPLOAD) {
-        try {
-          setViewerState((prev) => ({ ...prev, loadingStep: 'Downloading document...' }));
+      // Check if conversion is needed (declare before try block for use after)
+      const isPowerPoint = extension && ['pptx', 'ppt'].includes(extension);
+      const isGoogleSlides = mimeType === 'application/vnd.google-apps.presentation';
 
-          const downloadResponse = await axios.get(
-            `/api/v1/document/${externalRecordId}/download`,
-            { responseType: 'blob' }
+      // Unified streaming - use stream/record API for both KB and connector records
+      try {
+        setViewerState((prev) => ({ ...prev, loadingStep: 'Downloading document...' }));
+
+        let params: { convertTo?: string } = {};
+
+        // Use the extension already declared above (line 498)
+        const sizeInBytes = record.fileRecord?.sizeInBytes || record.sizeInBytes || 0;
+        // Handle PowerPoint files and Google Slides - request PDF conversion
+        if (isPowerPoint || isGoogleSlides) {
+          params = { convertTo: 'application/pdf' };
+          if ( sizeInBytes && sizeInBytes / 1048576 > MAX_FILE_SIZE_MB) {
+            throw new Error('Large file size, redirecting to web page');
+          }
+        }
+
+        const streamResponse = await axios.get(
+            `${CONFIG.backendUrl}/api/v1/knowledgeBase/stream/record/${recordId}`,
+            { responseType: 'blob', params }
           );
+        
+        if (!streamResponse) return;
 
-          setViewerState((prev) => ({ ...prev, loadingStep: 'Processing document data...' }));
+        setViewerState((prev) => ({ ...prev, loadingStep: 'Processing document...' }));
 
-          const reader = new FileReader();
-          const textPromise = new Promise<string>((resolve) => {
-            reader.onload = () => {
-              resolve(reader.result?.toString() || '');
-            };
-          });
+        const bufferReader = new FileReader();
+        const arrayBufferPromise = new Promise<ArrayBuffer>((resolve, reject) => {
+          bufferReader.onload = () => {
+            const originalBuffer = bufferReader.result as ArrayBuffer;
+            const bufferCopy = originalBuffer.slice(0);
+            resolve(bufferCopy);
+          };
+          bufferReader.onerror = () => {
+            reject(new Error('Failed to read blob as array buffer'));
+          };
+          bufferReader.readAsArrayBuffer(streamResponse.data);
+        });
 
-          reader.readAsText(downloadResponse.data);
-          const text = await textPromise;
-
-          try {
-            const jsonData = JSON.parse(text);
-            if (jsonData && jsonData.signedUrl) {
-              loadedFileUrl = jsonData.signedUrl;
-              fileDataLoaded = true;
-            }
-          } catch (e) {
-            const bufferReader = new FileReader();
-            const arrayBufferPromise = new Promise<ArrayBuffer>((resolve) => {
-              bufferReader.onload = () => {
-                resolve(bufferReader.result as ArrayBuffer);
-              };
-              bufferReader.readAsArrayBuffer(downloadResponse.data);
-            });
-
-            loadedFileBuffer = await arrayBufferPromise;
-            fileDataLoaded = true;
-          }
-        } catch (error) {
-          console.error('Error downloading document:', error);
-          showErrorAndRedirect('Failed to load document from upload');
-          return;
-        }
-      } else if (record.origin === ORIGIN.CONNECTOR) {
-        try {
-          setViewerState((prev) => ({ ...prev, loadingStep: 'Connecting to document source...' }));
-
-          let params = {};
-
-          // Handle PowerPoint files
-          if (record?.fileRecord && ['pptx', 'ppt'].includes(record?.fileRecord?.extension)) {
-            params = { convertTo: 'application/pdf' };
-            if (record.fileRecord.sizeInBytes / 1048576 > MAX_FILE_SIZE_MB) {
-              throw new Error('Large file size, redirecting to web page');
-            }
-          }
-
-          const publicConnectorUrlResponse = await getConnectorPublicUrl();
-          let connectorResponse;
-
-          if (publicConnectorUrlResponse && publicConnectorUrlResponse.url) {
-            const CONNECTOR_URL = publicConnectorUrlResponse.url;
-            connectorResponse = await axios.get(
-              `${CONNECTOR_URL}/api/v1/stream/record/${recordId}`,
-              { responseType: 'blob', params }
-            );
-          } else {
-            connectorResponse = await axios.get(
-              `${CONFIG.backendUrl}/api/v1/knowledgeBase/stream/record/${recordId}`,
-              { responseType: 'blob', params }
-            );
-          }
-
-          if (!connectorResponse) return;
-
-          setViewerState((prev) => ({ ...prev, loadingStep: 'Processing document...' }));
-
-          const bufferReader = new FileReader();
-          const arrayBufferPromise = new Promise<ArrayBuffer>((resolve, reject) => {
-            bufferReader.onload = () => {
-              const originalBuffer = bufferReader.result as ArrayBuffer;
-              const bufferCopy = originalBuffer.slice(0);
-              resolve(bufferCopy);
-            };
-            bufferReader.onerror = () => {
-              reject(new Error('Failed to read blob as array buffer'));
-            };
-            bufferReader.readAsArrayBuffer(connectorResponse.data);
-          });
-
-          loadedFileBuffer = await arrayBufferPromise;
-          fileDataLoaded = true;
-        } catch (err) {
-          console.error('Error downloading document:', err);
-          showErrorAndRedirect('Failed to load document from connector');
-          return;
-        }
+        loadedFileBuffer = await arrayBufferPromise;
+        fileDataLoaded = true;
+      } catch (err: any) {
+        console.error('Error downloading document:', err);
+        showErrorAndRedirect(err?.message || 'Failed to load document');
+        return;
       }
+
 
       if (fileDataLoaded) {
         // Use recordType to determine document type for mail records
@@ -696,7 +640,7 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
             ...prev,
             phase: 'ready',
             documentType,
-            fileUrl: loadedFileUrl,
+            fileUrl: '',
             fileBuffer: loadedFileBuffer,
             recordCitations: null,
           }));
@@ -850,7 +794,7 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
             style={{ color: getExtensionColor(extension, recordTypeForDisplay) }}
           />
           <Box sx={{ flexGrow: 1 }}>
-          <Tooltip title={recordName} arrow placement="top">
+            <Tooltip title={recordName} arrow placement="top">
               <Box>
                 <Typography variant="h6" gutterBottom>
                   {recordName.length > 60 ? `${recordName.substring(0, 60)}...` : recordName}
@@ -1102,7 +1046,8 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
         open={snackbar.open}
         autoHideDuration={6000}
         onClose={() => setSnackbar((prev) => ({ ...prev, open: false }))}
-        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
+        sx={{ mt: 6 }}
       >
         <Alert
           onClose={() => setSnackbar((prev) => ({ ...prev, open: false }))}

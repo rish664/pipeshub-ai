@@ -24,6 +24,7 @@ from app.config.constants.arangodb import (
     Connectors,
     MimeTypes,
     OriginTypes,
+    ProgressStatus,
 )
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.core.base.connector.connector_service import BaseConnector
@@ -46,6 +47,7 @@ from app.connectors.core.registry.connector_builder import (
     ConnectorBuilder,
     ConnectorScope,
     DocumentationLink,
+    SyncStrategy,
 )
 from app.connectors.core.registry.filters import (
     FilterCategory,
@@ -64,7 +66,6 @@ from app.models.entities import (
     AppRole,
     AppUser,
     FileRecord,
-    IndexingStatus,
     Record,
     RecordGroup,
     RecordGroupType,
@@ -152,7 +153,7 @@ class RecordUpdate:
             default_value=[],
             option_source_type=OptionSourceType.DYNAMIC
         ))
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(True)
         .with_agent_support(False)
@@ -297,10 +298,6 @@ class BookStackConnector(BaseConnector):
             The web URL of the record or None
         """
         signed_url = f"{self.bookstack_base_url}api/pages/{record.external_record_id}/export/markdown"
-        if not record.weburl:
-            self.logger.warning(f"No web URL found for record {record.id}")
-            return None
-
         return signed_url
 
     async def stream_record(self, record: Record) -> StreamingResponse:
@@ -1259,6 +1256,14 @@ class BookStackConnector(BaseConnector):
                 self.logger.warning(f"Skipping {content_type_name} due to missing id or name: {item}")
                 return None
 
+            # Map content type to RecordGroupType
+            content_type_mapping = {
+                "bookshelf": RecordGroupType.SHELF,
+                "book": RecordGroupType.BOOK,
+                "chapter": RecordGroupType.CHAPTER,
+            }
+            group_type = content_type_mapping.get(content_type_name, RecordGroupType.KB)
+
             # 1. Create the RecordGroup object
             record_group = RecordGroup(
                 name=item_name,
@@ -1267,7 +1272,7 @@ class BookStackConnector(BaseConnector):
                 description=item.get("description", ""),
                 connector_name=self.connector_name,
                 connector_id=self.connector_id,
-                group_type=RecordGroupType.KB,
+                group_type=group_type,
                 parent_external_group_id=parent_external_id,
                 inherit_permissions=parent_external_id is not None,
             )
@@ -1662,7 +1667,7 @@ class BookStackConnector(BaseConnector):
 
                 if record_update.record:
                     if not self.indexing_filters.is_enabled(IndexingFilterKey.FILES, default=True):
-                        record_update.record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                        record_update.record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
 
                 # Handle deleted records
                 if record_update.is_deleted:
@@ -2014,7 +2019,7 @@ class BookStackConnector(BaseConnector):
 
         if record_update.record:
             if not self.indexing_filters.is_enabled(IndexingFilterKey.FILES, default=True):
-                record_update.record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                record_update.record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
 
         if record_update.is_new:
             self.logger.info(f"New record detected from event: {record_update.record.record_name}")

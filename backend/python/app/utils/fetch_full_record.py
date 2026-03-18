@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
-
-from app.modules.transformers.blob_storage import BlobStorage
 
 
 class FetchFullRecordArgs(BaseModel):
@@ -34,29 +31,6 @@ class FetchBlockGroupArgs(BaseModel):
         default="Fetching block group for additional context",
         description="Why the block group is needed (explain the gap in the provided blocks)."
     )
-
-
-async def _try_blobstore_fetch(blob_store: BlobStorage, org_id: str, record_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Try common BlobStorage paths. We don't know the exact method names in your code,
-    so attempt a few sensible options and return the first successful payload.
-    """
-    try:
-        rec = await blob_store.get_record_from_storage(org_id=org_id, virtual_record_id=record_id)
-        if rec:
-            return rec
-    except Exception:
-        pass
-
-async def _fetch_full_record_using_vrid(vrid: str, blob_store: BlobStorage,org_id: str) -> Dict[str, Any]:
-    """
-    Fetch complete record using virtual record id.
-    """
-    record = await _try_blobstore_fetch(blob_store, org_id, vrid)
-    if record:
-        return {"ok": True, "record": record}
-    else:
-        return {"ok": False, "error": f"Record with vrid '{vrid}' not found in blob store."}
 
 async def _fetch_multiple_records_impl(
     record_ids: List[str],
@@ -125,48 +99,6 @@ def create_fetch_full_record_tool(virtual_record_id_to_result: Dict[str, Any]) -
 
     return fetch_full_record_tool
 
-def create_fetch_block_group_tool(blob_store: BlobStorage,final_results: List[Dict[str, Any]],org_id: str) -> Callable:
-    """
-    Factory function to create the tool with runtime dependencies injected.
-    """
-    @tool("fetch_block_group", args_schema=FetchBlockGroupArgs)
-    async def fetch_block_group_tool(block_group_number: str, reason: str = "Fetching block group for additional context") -> str:
-        record_number = block_group_number.split("-")[0]
-        number = int(re.findall(r'\d+', record_number)[0])
-        count = 0
-        seen = set()
-        record = None
-        vrid = None
-        for result in final_results:
-            if result.get("virtual_record_id") not in seen:
-                seen.add(result.get("virtual_record_id"))
-                count += 1
-                if count == number:
-                    vrid = result.get("virtual_record_id")
-                    break
-
-        if vrid:
-            record = await _fetch_full_record_using_vrid(vrid, blob_store,org_id)
-            if record:
-                block_group_index = int(block_group_number.split("-")[1])
-                block_container = record.get("block_containers",{})
-                block_groups = block_container.get("block_groups",[])
-                blocks = block_container.get("blocks",[])
-                if block_groups and block_group_index < len(block_groups):
-                    block_group = block_groups[block_group_index]
-                    children = block_group.get("children",[])
-                    result_blocks = []
-                    for child in children:
-                        block_index = child.get("block_index")
-                        block = blocks[block_index]
-                        result_blocks.append(block)
-                    record = create_record_for_fetch_block_group(record, block_group, result_blocks)
-                    return {"ok": True, "record": record}
-            else:
-                return {"ok": False, "error": f"Block group '{block_group_number}' not found in record with vrid '{vrid}'."}
-        else:
-            return {"ok": False, "error": f"Block group '{block_group_number}' not found."}
-    return fetch_block_group_tool
 
 def create_record_for_fetch_block_group(record: Dict[str, Any],block_group: Dict[str, Any],blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
     block_container = {

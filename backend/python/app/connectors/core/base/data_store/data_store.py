@@ -9,6 +9,7 @@ from app.models.entities import (
     AppUser,
     Domain,
     Org,
+    Person,
     Record,
     RecordGroup,
     User,
@@ -65,6 +66,11 @@ class BaseDataStore(ABC):
         pass
 
     @abstractmethod
+    async def get_record_by_external_revision_id(self, connector_id: str, external_revision_id: str) -> Optional[Record]:
+        """Get record by external revision ID (e.g., etag for S3)."""
+        pass
+
+    @abstractmethod
     async def get_record_by_issue_key(self, connector_id: str, issue_key: str) -> Optional[Record]:
         """Get record by Jira issue key (e.g., PROJ-123) by searching weburl pattern."""
         pass
@@ -77,6 +83,19 @@ class BaseDataStore(ABC):
         record_type: Optional[str] = None
     ) -> List[Record]:
         """Get all child records for a parent record by parent_external_record_id. Optionally filter by record_type."""
+        pass
+
+    @abstractmethod
+    async def get_record_path(self, record_id: str) -> Optional[str]:
+        """
+        Get full hierarchical path for a record by traversing parent-child edges.
+
+        Args:
+            record_id: The record _key to get the path for.
+
+        Returns:
+            Optional[str]: Path string (e.g. "Folder1/Subfolder/File.txt") or None.
+        """
         pass
 
     @abstractmethod
@@ -107,6 +126,10 @@ class BaseDataStore(ABC):
 
     @abstractmethod
     async def get_app_user_by_email(self, email: str) -> Optional[AppUser]:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_people(self, people: List[Person]) -> None:
         pass
 
     @abstractmethod
@@ -190,7 +213,12 @@ class BaseDataStore(ABC):
         pass
 
     @abstractmethod
-    async def create_record_relation(self, from_record_id: str, to_record_id: str, relation_type: str) -> None:
+    async def create_record_relation(
+        self,
+        from_record_id: str,
+        to_record_id: str,
+        relation_type: str
+    ) -> None:
         pass
 
     @abstractmethod
@@ -223,6 +251,41 @@ class BaseDataStore(ABC):
 
     @abstractmethod
     async def delete_edge(self, from_id: str, from_collection: str, to_id: str, to_collection: str, collection: str) -> None:
+        pass
+
+    @abstractmethod
+    async def delete_edges_by_relationship_types(
+        self,
+        from_id: str,
+        from_collection: str,
+        collection: str,
+        relationship_types: List[str]
+    ) -> int:
+        """
+        Delete edges from a record by relationship types.
+
+        Args:
+            from_id: Source record ID
+            from_collection: Source record collection name
+            collection: Edge collection name
+            relationship_types: List of relationship type values to delete
+
+        Returns:
+            int: Number of edges deleted
+        """
+        pass
+
+    @abstractmethod
+    async def delete_parent_child_edge_to_record(self, record_id: str) -> int:
+        """
+        Delete PARENT_CHILD edges pointing to a specific target record.
+
+        Args:
+            record_id: The record_id for which the parent_child edge has to be deleted
+
+        Returns:
+            int: Number of edges deleted
+        """
         pass
 
 

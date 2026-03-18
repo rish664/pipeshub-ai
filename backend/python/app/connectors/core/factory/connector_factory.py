@@ -10,37 +10,53 @@ from app.connectors.core.base.connector.connector_service import BaseConnector
 from app.connectors.core.base.data_store.graph_data_store import GraphDataStore
 from app.connectors.core.registry.connector import (
     AirtableConnector,
-    AzureBlobConnector,
     CalendarConnector,
     DocsConnector,
     FormsConnector,
-    LinearConnector,
     MeetConnector,
-    NotionConnector,
     SlackConnector,
     SlidesConnector,
     ZendeskConnector,
 )
+from app.connectors.core.registry.connector_builder import SyncStrategy
+from app.connectors.core.sync.task_manager import sync_task_manager
 from app.connectors.sources.atlassian.confluence_cloud.connector import (
     ConfluenceConnector,
 )
 from app.connectors.sources.atlassian.jira_cloud.connector import JiraConnector
+from app.connectors.sources.azure_blob.connector import AzureBlobConnector
+from app.connectors.sources.azure_files.connector import AzureFilesConnector
 from app.connectors.sources.bookstack.connector import BookStackConnector
 from app.connectors.sources.box.connector import BoxConnector
 from app.connectors.sources.dropbox.connector import DropboxConnector
 from app.connectors.sources.dropbox_individual.connector import (
     DropboxIndividualConnector,
 )
+from app.connectors.sources.github.connector import GithubConnector
+from app.connectors.sources.google.drive.individual.connector import (
+    GoogleDriveIndividualConnector,
+)
+from app.connectors.sources.google.drive.team.connector import GoogleDriveTeamConnector
+from app.connectors.sources.google.gmail.individual.connector import (
+    GoogleGmailIndividualConnector,
+)
+from app.connectors.sources.google.gmail.team.connector import GoogleGmailTeamConnector
+from app.connectors.sources.google_cloud_storage.connector import GCSConnector
+from app.connectors.sources.linear.connector import LinearConnector
+from app.connectors.sources.localKB.connector import KnowledgeBaseConnector
 from app.connectors.sources.microsoft.onedrive.connector import OneDriveConnector
 from app.connectors.sources.microsoft.outlook.connector import OutlookConnector
 from app.connectors.sources.microsoft.sharepoint_online.connector import (
     SharePointConnector,
 )
+from app.connectors.sources.minio.connector import MinIOConnector
+from app.connectors.sources.nextcloud.connector import NextcloudConnector
+from app.connectors.sources.notion.connector import NotionConnector
+from app.connectors.sources.rss.connector import RSSConnector
 from app.connectors.sources.s3.connector import S3Connector
-from app.connectors.sources.servicenow.servicenow.connector import (
-    ServiceNowConnector,
-)
+from app.connectors.sources.servicenow.servicenow.connector import ServiceNowConnector
 from app.connectors.sources.web.connector import WebConnector
+from app.connectors.sources.zammad.connector import ZammadConnector
 
 
 class ConnectorFactory:
@@ -54,12 +70,27 @@ class ConnectorFactory:
         "confluence": ConfluenceConnector,
         "jira": JiraConnector,
         "box": BoxConnector,
+        "drive": GoogleDriveIndividualConnector,
+        "driveworkspace": GoogleDriveTeamConnector,
+        "gmail": GoogleGmailIndividualConnector,
+        "gmailworkspace": GoogleGmailTeamConnector,
         "dropbox": DropboxConnector,
         "dropboxpersonal": DropboxIndividualConnector,
+        "nextcloud": NextcloudConnector,
         "servicenow": ServiceNowConnector,
         "web": WebConnector,
+        "rss": RSSConnector,
         "bookstack": BookStackConnector,
+        "github": GithubConnector,
         "s3": S3Connector,
+        "minio": MinIOConnector,
+        "gcs": GCSConnector,
+        "kb": KnowledgeBaseConnector,
+        "azureblob": AzureBlobConnector,
+        "azurefiles": AzureFilesConnector,
+        "linear": LinearConnector,
+        "notion": NotionConnector,
+        "zammad": ZammadConnector,
     }
 
     # Beta connector definitions - single source of truth
@@ -72,10 +103,7 @@ class ConnectorFactory:
         'slides': SlidesConnector,
         'docs': DocsConnector,
         'zendesk': ZendeskConnector,
-        'linear': LinearConnector,
-        'notion': NotionConnector,
         'airtable': AirtableConnector,
-        'azureblob': AzureBlobConnector,
     }
 
 
@@ -165,7 +193,10 @@ class ConnectorFactory:
 
         if connector:
             try:
-                await connector.init()
+                success = await connector.init()
+                if not success:
+                    logger.error(f"❌ Failed to initialize {name} {connector_id} connector")
+                    return None
                 logger.info(f"Initialized {name} {connector_id} connector successfully")
                 return connector
             except Exception as e:
@@ -194,11 +225,15 @@ class ConnectorFactory:
             **kwargs
         )
 
+        config = await config_service.get_config(f"/services/connectors/{connector_id}/config")
+        sync_strategy = (config or {}).get("sync", {}).get("selectedStrategy")
         if connector:
             try:
-                import asyncio
-                asyncio.create_task(connector.run_sync())
-                logger.info(f"Started sync for {name} {connector_id} connector")
+                if sync_strategy == SyncStrategy.MANUAL.value:
+                    logger.info(f"Skipping sync for {name} {connector_id} connector because selected strategy is MANUAL")
+                else:
+                    await sync_task_manager.start_sync(connector_id, connector.run_sync())
+                    logger.info(f"Started sync for {name} {connector_id} connector")
                 return connector
             except Exception as e:
                 logger.error(f"❌ Failed to start sync for {name} {connector_id} connector: {str(e)}")

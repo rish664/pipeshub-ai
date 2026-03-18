@@ -1,19 +1,118 @@
-import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
+from app.agents.actions.utils import run_async
 from app.agents.tools.decorator import tool
 from app.agents.tools.enums import ParameterType
 from app.agents.tools.models import ToolParameter
-from app.sources.client.http.http_response import HTTPResponse
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+)
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.tool_builder import (
+    ToolCategory,
+    ToolDefinition,
+    ToolsetBuilder,
+)
 from app.sources.client.s3.s3 import S3Client
 from app.sources.external.s3.s3 import S3DataSource
 
 logger = logging.getLogger(__name__)
 
+# Define tools
+tools: List[ToolDefinition] = [
+    ToolDefinition(
+        name="list_buckets",
+        description="List all S3 buckets",
+        parameters=[],
+        tags=["buckets", "list"]
+    ),
+    ToolDefinition(
+        name="create_bucket",
+        description="Create a new S3 bucket",
+        parameters=[
+            {"name": "bucket_name", "type": "string", "description": "Bucket name", "required": True},
+            {"name": "region", "type": "string", "description": "AWS region", "required": False}
+        ],
+        tags=["buckets", "create"]
+    ),
+    ToolDefinition(
+        name="delete_bucket",
+        description="Delete an S3 bucket",
+        parameters=[
+            {"name": "bucket_name", "type": "string", "description": "Bucket name", "required": True}
+        ],
+        tags=["buckets", "delete"]
+    ),
+    ToolDefinition(
+        name="list_objects",
+        description="List objects in a bucket",
+        parameters=[
+            {"name": "bucket_name", "type": "string", "description": "Bucket name", "required": True},
+            {"name": "prefix", "type": "string", "description": "Object prefix", "required": False}
+        ],
+        tags=["objects", "list"]
+    ),
+    ToolDefinition(
+        name="get_object",
+        description="Get an object from S3",
+        parameters=[
+            {"name": "bucket_name", "type": "string", "description": "Bucket name", "required": True},
+            {"name": "object_key", "type": "string", "description": "Object key", "required": True}
+        ],
+        tags=["objects", "read"]
+    ),
+    ToolDefinition(
+        name="put_object",
+        description="Upload an object to S3",
+        parameters=[
+            {"name": "bucket_name", "type": "string", "description": "Bucket name", "required": True},
+            {"name": "object_key", "type": "string", "description": "Object key", "required": True},
+            {"name": "content", "type": "string", "description": "Object content", "required": True}
+        ],
+        tags=["objects", "upload"]
+    ),
+    ToolDefinition(
+        name="delete_object",
+        description="Delete an object from S3",
+        parameters=[
+            {"name": "bucket_name", "type": "string", "description": "Bucket name", "required": True},
+            {"name": "object_key", "type": "string", "description": "Object key", "required": True}
+        ],
+        tags=["objects", "delete"]
+    ),
+    ToolDefinition(
+        name="copy_object",
+        description="Copy an object in S3",
+        parameters=[
+            {"name": "source_bucket", "type": "string", "description": "Source bucket", "required": True},
+            {"name": "source_key", "type": "string", "description": "Source key", "required": True},
+            {"name": "dest_bucket", "type": "string", "description": "Destination bucket", "required": True},
+            {"name": "dest_key", "type": "string", "description": "Destination key", "required": True}
+        ],
+        tags=["objects", "copy"]
+    ),
+]
 
+
+# Register S3 toolset
+@ToolsetBuilder("AWS S3")\
+    .in_group("Storage")\
+    .with_description("AWS S3 integration for object storage and bucket management")\
+    .with_category(ToolCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.API_TOKEN).fields([
+            CommonFields.api_token("AWS Access Key ID", "your-access-key-id", field_name="accessKeyId"),
+            CommonFields.api_token("AWS Secret Access Key", "your-secret-key", field_name="secretAccessKey"),
+            CommonFields.api_token("AWS Region", "us-east-1", field_name="region", required=False)
+        ])
+    ])\
+    .with_tools(tools)\
+    .configure(lambda builder: builder.with_icon("/assets/icons/connectors/s3.svg"))\
+    .build_decorator()
 class S3:
     """S3 tool exposed to the agents"""
     def __init__(self, client: S3Client) -> None:
@@ -26,21 +125,6 @@ class S3:
         """
         self.client = S3DataSource(client)
 
-    def _run_async(self, coro) -> HTTPResponse: # type: ignore [valid method]
-        """Helper method to run async operations in sync context"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, we need to use a thread pool
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, coro)
-                    return future.result()
-            else:
-                return loop.run_until_complete(coro)
-        except Exception as e:
-            logger.error(f"Error running async operation: {e}")
-            raise
 
     @tool(
         app_name="s3",
@@ -56,7 +140,7 @@ class S3:
         """
         try:
             # Use S3DataSource method
-            response = self._run_async(self.client.list_buckets())
+            response = run_async(self.client.list_buckets())
 
             if response.success:
                 return True, response.to_json()
@@ -100,7 +184,7 @@ class S3:
         """
         try:
             # Use S3DataSource method
-            response = self._run_async(self.client.create_bucket(
+            response = run_async(self.client.create_bucket(
                 Bucket=bucket_name,
                 CreateBucketConfiguration={'LocationConstraint': region} if region else None
             ))
@@ -136,7 +220,7 @@ class S3:
         """
         try:
             # Use S3DataSource method
-            response = self._run_async(self.client.delete_bucket(Bucket=bucket_name))
+            response = run_async(self.client.delete_bucket(Bucket=bucket_name))
 
             if response.success:
                 return True, response.to_json()
@@ -204,7 +288,7 @@ class S3:
         """
         try:
             # Use S3DataSource method
-            response = self._run_async(self.client.list_objects_v2(
+            response = run_async(self.client.list_objects_v2(
                 Bucket=bucket_name,
                 Prefix=prefix,
                 MaxKeys=max_keys,
@@ -305,7 +389,7 @@ class S3:
         """
         try:
             # Use S3DataSource method
-            response = self._run_async(self.client.get_object(
+            response = run_async(self.client.get_object(
                 Bucket=bucket_name,
                 Key=key
             ))
@@ -372,7 +456,7 @@ class S3:
             if content_type:
                 extra_args['ContentType'] = content_type
 
-            response = self._run_async(self.client.put_object(
+            response = run_async(self.client.put_object(
                 Bucket=bucket_name,
                 Key=key,
                 Body=body,
@@ -421,7 +505,7 @@ class S3:
         """
         try:
             # Use S3DataSource method
-            response = self._run_async(self.client.delete_object(
+            response = run_async(self.client.delete_object(
                 Bucket=bucket_name,
                 Key=key
             ))
@@ -484,7 +568,7 @@ class S3:
         """
         try:
             # Use S3DataSource method
-            response = self._run_async(self.client.copy_object(
+            response = run_async(self.client.copy_object(
                 Bucket=dest_bucket,
                 Key=dest_key,
                 CopySource={'Bucket': source_bucket, 'Key': source_key}

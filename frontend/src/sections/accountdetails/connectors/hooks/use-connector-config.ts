@@ -58,6 +58,7 @@ interface UseConnectorConfigReturn {
   formErrors: FormErrors;
   saveError: string | null;
   conditionalDisplay: Record<string, boolean>;
+  saveAttempted: boolean;
 
   // Business OAuth state (Google Workspace)
   adminEmail: string;
@@ -112,7 +113,7 @@ interface UseConnectorConfigReturn {
 }
 
 // Constants
-const MIN_INSTANCE_NAME_LENGTH = 3;
+const MIN_INSTANCE_NAME_LENGTH = 2;
 const REQUIRED_SERVICE_ACCOUNT_FIELDS = ['client_id', 'project_id', 'type'];
 const SERVICE_ACCOUNT_TYPE = 'service_account';
 
@@ -155,6 +156,7 @@ export const useConnectorConfig = ({
   });
   const [saveError, setSaveError] = useState<string | null>(null);
   const [conditionalDisplay, setConditionalDisplay] = useState<Record<string, boolean>>({});
+  const [saveAttempted, setSaveAttempted] = useState(false);
 
   // Create mode state
   const [instanceName, setInstanceName] = useState(initialInstanceName);
@@ -206,16 +208,17 @@ export const useConnectorConfig = ({
   // Memoized helper functions
   const getBusinessOAuthData = useCallback((config: any) => {
     const authValues = config?.config?.auth?.values || config?.config?.auth || {};
+    
+    // Check if service account credentials exist by looking for key fields
+    const hasServiceAccountCredentials = 
+      authValues.client_id && 
+      authValues.project_id && 
+      (authValues.type === SERVICE_ACCOUNT_TYPE || authValues.private_key || authValues.client_email);
+    
     return {
       adminEmail: authValues.adminEmail || '',
-      jsonData:
-        authValues.client_id && authValues.project_id && authValues.type === SERVICE_ACCOUNT_TYPE
-          ? authValues
-          : null,
-      fileName:
-        authValues.client_id && authValues.project_id && authValues.type === SERVICE_ACCOUNT_TYPE
-          ? 'existing-credentials.json'
-          : null,
+      jsonData: hasServiceAccountCredentials ? authValues : null,
+      fileName: hasServiceAccountCredentials ? 'Service Account Credentials' : null,
     };
   }, []);
 
@@ -225,8 +228,8 @@ export const useConnectorConfig = ({
     return {
       certificate: authValues.certificate || null,
       privateKey: authValues.privateKey || null,
-      certificateFileName: authValues.certificate ? 'existing-certificate.pem' : null,
-      privateKeyFileName: authValues.privateKey ? 'existing-privatekey.pem' : null,
+      certificateFileName: authValues.certificate ? 'Client Certificate' : null,
+      privateKeyFileName: authValues.privateKey ? 'Private Key (PKCS#8)' : null,
     };
   }, []);
 
@@ -418,16 +421,33 @@ export const useConnectorConfig = ({
       initializeFilterFields(indexingFilters.schema, config.config.filters?.indexing?.values);
     }
 
+    // Build sync data from saved values first
+    const syncData: Record<string, any> = {
+      selectedStrategy:
+        config.config.sync?.selectedStrategy ||
+        config.config.sync?.supportedStrategies?.[0] ||
+        'MANUAL',
+      scheduledConfig: config.config.sync?.scheduledConfig || {},
+      ...(config.config.sync?.values || config.config.sync || {}),
+    };
+
+    // Seed sync customField defaults for fields not yet saved
+    // (mirrors the same pattern used for auth fields above)
+    const syncCustomFields: any[] = config.config.sync?.customFields || [];
+    syncCustomFields.forEach((field: any) => {
+      if (field.defaultValue !== undefined && syncData[field.name] === undefined) {
+        if (field.fieldType === 'BOOLEAN') {
+          // Backend may send defaultValue as string "true"/"false" — normalise to boolean
+          syncData[field.name] = field.defaultValue === true || field.defaultValue === 'true';
+        } else {
+          syncData[field.name] = field.defaultValue;
+        }
+      }
+    });
+
     return {
       auth: authData,
-      sync: {
-        selectedStrategy:
-          config.config.sync?.selectedStrategy ||
-          config.config.sync?.supportedStrategies?.[0] ||
-          'MANUAL',
-        scheduledConfig: config.config.sync?.scheduledConfig || {},
-        ...(config.config.sync?.values || config.config.sync || {}),
-      },
+      sync: syncData,
       filters: filtersData,
     };
   }, []);
@@ -620,8 +640,18 @@ export const useConnectorConfig = ({
         setCertificateContent(content);
         setCertificateError(null);
 
-        // Clear save error when user uploads a valid file
+        // Clear certificate error from formErrors when file is successfully uploaded
+        setFormErrors((prev) => {
+          const { certificate, ...restAuth } = prev.auth;
+          return {
+            ...prev,
+            auth: restAuth,
+          };
+        });
+
+        // Clear save error and saveAttempted when user uploads a valid file
         setSaveError(null);
+        setSaveAttempted(false);
 
         // Parse certificate information (basic parsing for display)
         try {
@@ -681,8 +711,18 @@ export const useConnectorConfig = ({
         setPrivateKeyData(content);
         setPrivateKeyError(null);
 
-        // Clear save error when user uploads a valid file
+        // Clear private key error from formErrors when file is successfully uploaded
+        setFormErrors((prev) => {
+          const { privateKey, ...restAuth } = prev.auth;
+          return {
+            ...prev,
+            auth: restAuth,
+          };
+        });
+
+        // Clear save error and saveAttempted when user uploads a valid file
         setSaveError(null);
+        setSaveAttempted(false);
 
         // Update form data with private key content
         setFormData((prev) => ({
@@ -763,7 +803,6 @@ export const useConnectorConfig = ({
       try {
         setLoading(true);
         let mergedConfig: any = null;
-        console.log('create mode', isCreateMode);
 
         if (isCreateMode) {
           // Create mode: load schema only
@@ -946,9 +985,11 @@ export const useConnectorConfig = ({
         return `${field.displayName} must be at least ${minLength} characters`;
       }
 
-      if (maxLength && value && value.length > maxLength) {
+   // Skip maxLength validation for serviceAccountJson to allow larger JSON files
+    if (maxLength && value && value.length > maxLength && field.name !== 'serviceAccountJson') {
         return `${field.displayName} must be no more than ${maxLength} characters`;
-      }
+     }
+  
 
       if (format && value) {
         switch (format) {
@@ -1031,22 +1072,44 @@ export const useConnectorConfig = ({
         return newFormData;
       });
 
-      // Clear error for this field
-      setFormErrors((prev) => {
-        const currentSectionErrors = (prev[section as keyof FormErrors] || {}) as Record<string, string>;
-        return {
-          ...prev,
-          [section]: {
-            ...currentSectionErrors,
-            [fieldName]: '',
-          },
-        };
-      });
+      // Clear error for this field when value is provided
+      // For SharePoint fields, remove the error property entirely for consistency
+      if (section === 'auth' && isSharePointCertificateAuth && 
+          (fieldName === 'hasAdminConsent' || fieldName === 'certificate' || fieldName === 'privateKey')) {
+        // Remove the error property for SharePoint-specific fields
+        setFormErrors((prev) => {
+          const { [fieldName]: removed, ...restAuth } = prev.auth;
+          return {
+            ...prev,
+            auth: restAuth,
+          };
+        });
+      } else {
+        // For other fields, clear the error by setting to empty string
+        setFormErrors((prev) => {
+          const currentSectionErrors = (prev[section as keyof FormErrors] || {}) as Record<string, string>;
+          return {
+            ...prev,
+            [section]: {
+              ...currentSectionErrors,
+              [fieldName]: '',
+            },
+          };
+        });
+      }
 
       // Clear save error when user makes changes
       setSaveError(null);
+      
+      // Clear saveAttempted flag when user makes changes to SharePoint fields
+      // This will hide the validation summary card as user fixes issues
+      if (section === 'auth' && isSharePointCertificateAuth && 
+          (fieldName === 'clientId' || fieldName === 'tenantId' || fieldName === 'sharepointDomain' || 
+           fieldName === 'hasAdminConsent' || fieldName === 'certificate' || fieldName === 'privateKey')) {
+        setSaveAttempted(false);
+      }
     },
-    [connectorConfig]
+    [connectorConfig, isSharePointCertificateAuth]
   );
 
   const handleNext = useCallback(() => {
@@ -1056,14 +1119,16 @@ export const useConnectorConfig = ({
     setSaveError(null);
 
     const isNoAuthType = isNoneAuthType(connector.authType);
-    const hasFilters = (connectorConfig.config.filters?.sync?.schema?.fields?.length ?? 0) > 0;
+    const syncFiltersCount = connectorConfig.config.filters?.sync?.schema?.fields?.length ?? 0;
+    const indexingFiltersCount = connectorConfig.config.filters?.indexing?.schema?.fields?.length ?? 0;
+    const hasFilters = syncFiltersCount > 0 || indexingFiltersCount > 0;
     
     // Determine which step we're on based on mode
     let currentSection = '';
     let maxStep = 0;
     
-    // Enable mode: filters -> sync (skip auth)
-    if (enableMode) {
+    // Sync Settings mode: filters (if available) -> sync (skip auth)
+    if (syncSettingsMode || enableMode) {
       maxStep = hasFilters ? 1 : 0; // Filters (0) -> Sync (1) or just Sync (0)
       if (hasFilters) {
         currentSection = activeStep === 0 ? 'filters' : 'sync';
@@ -1137,12 +1202,27 @@ export const useConnectorConfig = ({
         const hasCertificate = !!(certificateContent || formData.auth.certificate);
         const hasPrivateKey = !!(privateKeyData || formData.auth.privateKey);
         
-        if (!hasCertificate) sharePointErrors.certificate = 'Certificate file is required';
-        if (!hasPrivateKey) sharePointErrors.privateKey = 'Private key file is required';
+        // Set certificate error in both formErrors and state
+        if (!hasCertificate) {
+          const certError = 'Certificate file is required';
+          sharePointErrors.certificate = certError;
+          if (!certificateError) {
+            setCertificateError(certError);
+          }
+        } else if (certificateError) {
+          sharePointErrors.certificate = certificateError;
+        }
         
-        // Check for file validation errors
-        if (certificateError) sharePointErrors.certificate = certificateError;
-        if (privateKeyError) sharePointErrors.privateKey = privateKeyError;
+        // Set private key error in both formErrors and state
+        if (!hasPrivateKey) {
+          const keyError = 'Private key file is required';
+          sharePointErrors.privateKey = keyError;
+          if (!privateKeyError) {
+            setPrivateKeyError(keyError);
+          }
+        } else if (privateKeyError) {
+          sharePointErrors.privateKey = privateKeyError;
+        }
         
         errors = sharePointErrors;
       } else {
@@ -1215,6 +1295,7 @@ export const useConnectorConfig = ({
     privateKeyData,
     privateKeyError,
     enableMode,
+    syncSettingsMode,
     isCreateMode,
     selectedAuthType,
     isAdmin,
@@ -1448,6 +1529,7 @@ export const useConnectorConfig = ({
     try {
       setSaving(true);
       setSaveError(null);
+      setSaveAttempted(true);
 
       const isNoAuthType = isNoneAuthType(connector.authType);
 
@@ -1493,13 +1575,29 @@ export const useConnectorConfig = ({
             const hasCertificate = !!(certificateContent || formData.auth.certificate);
             const hasPrivateKey = !!(privateKeyData || formData.auth.privateKey);
             
-            if (!hasCertificate) authErrors.certificate = 'Certificate file is required';
-            if (!hasPrivateKey) authErrors.privateKey = 'Private key file is required';
+            // Set certificate error in both formErrors and state
+            if (!hasCertificate) {
+              const certError = 'Certificate file is required';
+              authErrors.certificate = certError;
+              if (!certificateError) {
+                setCertificateError(certError);
+              }
+            } else if (certificateError) {
+              authErrors.certificate = certificateError;
+            }
             
-            if (certificateError) authErrors.certificate = certificateError;
-            if (privateKeyError) authErrors.privateKey = privateKeyError;
+            // Set private key error in both formErrors and state
+            if (!hasPrivateKey) {
+              const keyError = 'Private key file is required';
+              authErrors.privateKey = keyError;
+              if (!privateKeyError) {
+                setPrivateKeyError(keyError);
+              }
+            } else if (privateKeyError) {
+              authErrors.privateKey = privateKeyError;
+            }
           } else {
-            // Use schema from existing auth type in edit mode (authOnly mode)
+            // Generic auth validation (API keys, manual OAuth, etc.)
             const validationAuthType = connectorConfig.config.auth?.type || '';
             const validationAuthSchemas = connectorConfig.config.auth?.schemas || {};
             const validationSchema = validationAuthType && validationAuthSchemas[validationAuthType]
@@ -1561,11 +1659,16 @@ export const useConnectorConfig = ({
         }
 
         // For business OAuth, merge JSON data and admin email
+        // Also set oauthInstanceName to connector instance name for Google Workspace business OAuth
         if (isCustomGoogleBusinessOAuth && jsonData) {
+          // Use connector.name in edit mode, instanceName in create mode
+          const connectorInstanceName = isCreateMode ? instanceName : (connector.name || instanceName);
           authToSave = {
             ...authToSave,
             ...jsonData,
             adminEmail,
+            // Set oauthInstanceName to connector instance name for Google Workspace business OAuth
+            oauthInstanceName: connectorInstanceName || authToSave.oauthInstanceName,
           };
         }
 
@@ -1688,11 +1791,27 @@ export const useConnectorConfig = ({
             const hasCertificate = !!(certificateContent || formData.auth.certificate);
             const hasPrivateKey = !!(privateKeyData || formData.auth.privateKey);
             
-            if (!hasCertificate) authErrors.certificate = 'Certificate file is required';
-            if (!hasPrivateKey) authErrors.privateKey = 'Private key file is required';
+            // Set certificate error in both formErrors and state
+            if (!hasCertificate) {
+              const certError = 'Certificate file is required';
+              authErrors.certificate = certError;
+              if (!certificateError) {
+                setCertificateError(certError);
+              }
+            } else if (certificateError) {
+              authErrors.certificate = certificateError;
+            }
             
-            if (certificateError) authErrors.certificate = certificateError;
-            if (privateKeyError) authErrors.privateKey = privateKeyError;
+            // Set private key error in both formErrors and state
+            if (!hasPrivateKey) {
+              const keyError = 'Private key file is required';
+              authErrors.privateKey = keyError;
+              if (!privateKeyError) {
+                setPrivateKeyError(keyError);
+              }
+            } else if (privateKeyError) {
+              authErrors.privateKey = privateKeyError;
+            }
           } else {
             // Use schema from selected auth type in create mode
             const validationAuthType = selectedAuthType || connectorConfig.config.auth?.type || '';
@@ -1756,11 +1875,16 @@ export const useConnectorConfig = ({
         }
 
         // For business OAuth, merge JSON data and admin email
+        // Also set oauthInstanceName to connector instance name for Google Workspace business OAuth
         if (isCustomGoogleBusinessOAuth && jsonData) {
+          // Use connector.name in edit mode, instanceName in create mode
+          const connectorInstanceName = isCreateMode ? instanceName : (connector.name || instanceName);
           authToSave = {
             ...authToSave,
             ...jsonData,
             adminEmail,
+            // Set oauthInstanceName to connector instance name for Google Workspace business OAuth
+            oauthInstanceName: connectorInstanceName || authToSave.oauthInstanceName,
           };
         }
 
@@ -1847,11 +1971,27 @@ export const useConnectorConfig = ({
           const hasCertificate = !!(certificateContent || formData.auth.certificate);
           const hasPrivateKey = !!(privateKeyData || formData.auth.privateKey);
           
-          if (!hasCertificate) authErrors.certificate = 'Certificate file is required';
-          if (!hasPrivateKey) authErrors.privateKey = 'Private key file is required';
+          // Set certificate error in both formErrors and state
+          if (!hasCertificate) {
+            const certError = 'Certificate file is required';
+            authErrors.certificate = certError;
+            if (!certificateError) {
+              setCertificateError(certError);
+            }
+          } else if (certificateError) {
+            authErrors.certificate = certificateError;
+          }
           
-          if (certificateError) authErrors.certificate = certificateError;
-          if (privateKeyError) authErrors.privateKey = privateKeyError;
+          // Set private key error in both formErrors and state
+          if (!hasPrivateKey) {
+            const keyError = 'Private key file is required';
+            authErrors.privateKey = keyError;
+            if (!privateKeyError) {
+              setPrivateKeyError(keyError);
+            }
+          } else if (privateKeyError) {
+            authErrors.privateKey = privateKeyError;
+          }
         } else {
           // Use schema from existing auth type in edit mode (cannot be changed)
           const editAuthType = connectorConfig.config.auth?.type || '';
@@ -1923,11 +2063,16 @@ export const useConnectorConfig = ({
         }
 
         // For business OAuth, merge JSON data and admin email
+        // Also set oauthInstanceName to connector instance name for Google Workspace business OAuth
         if (isCustomGoogleBusinessOAuth && jsonData) {
+          // Use connector.name in edit mode, instanceName in create mode
+          const connectorInstanceName = isCreateMode ? instanceName : (connector.name || instanceName);
           authToSave = {
             ...authToSave,
             ...jsonData,
             adminEmail,
+            // Set oauthInstanceName to connector instance name for Google Workspace business OAuth
+            oauthInstanceName: connectorInstanceName || authToSave.oauthInstanceName,
           };
         }
 
@@ -2105,6 +2250,7 @@ export const useConnectorConfig = ({
     formErrors,
     saveError,
     conditionalDisplay,
+    saveAttempted,
 
     // Business OAuth state (Google Workspace)
     adminEmail,

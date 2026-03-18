@@ -4,9 +4,8 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from logging import Logger
-from typing import AsyncGenerator, Dict, List, NoReturn, Optional, Tuple
+from typing import AsyncGenerator, Dict, List, NoReturn, Optional, Set, Tuple
 
-from aiohttp import ClientSession
 from aiolimiter import AsyncLimiter
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -17,6 +16,7 @@ from app.config.constants.arangodb import (
     Connectors,
     MimeTypes,
     OriginTypes,
+    ProgressStatus,
 )
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.core.base.connector.connector_service import BaseConnector
@@ -38,10 +38,15 @@ from app.connectors.core.registry.connector_builder import (
     ConnectorBuilder,
     ConnectorScope,
     DocumentationLink,
+    SyncStrategy,
 )
 from app.connectors.core.registry.filters import (
+    FilterCategory,
     FilterCollection,
+    FilterField,
     FilterOperator,
+    FilterType,
+    IndexingFilterKey,
     SyncFilterKey,
     load_connector_filters,
 )
@@ -62,8 +67,8 @@ from app.models.entities import (
 )
 from app.models.permission import EntityType, Permission, PermissionType
 from app.sources.client.box.box import (
+    BoxCCGConfig,
     BoxClient,
-    BoxTokenConfig,
 )
 from app.sources.external.box.box import BoxDataSource
 from app.utils.streaming import create_stream_record_response, stream_content
@@ -116,7 +121,7 @@ def get_mimetype_enum_for_box(entry_type: str, filename: str = None) -> MimeType
     .in_group("Cloud Storage")\
     .with_description("Sync files and folders from Box")\
     .with_categories(["Storage"])\
-    .with_scopes([ConnectorScope.TEAM.value])\
+    .with_scopes([ConnectorScope.TEAM])\
     .with_auth([
         AuthBuilder.type(AuthType.API_TOKEN).fields([
                 AuthField(
@@ -154,14 +159,34 @@ def get_mimetype_enum_for_box(entry_type: str, filename: str = None) -> MimeType
             'https://docs.pipeshub.com/connectors/box',
             'pipeshub'
         ))
+        .add_filter_field(CommonFields.modified_date_filter("Filter files and folders by modification date."))
+        .add_filter_field(CommonFields.created_date_filter("Filter files and folders by creation date."))
+        .add_filter_field(CommonFields.file_extension_filter())
+        .add_filter_field(FilterField(
+            name="shared",
+            display_name="Index Items Shared by Me",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.INDEXING,
+            description="Enable indexing of items you have shared (with a link or collaboration)",
+            default_value=True,
+        ))
+        .add_filter_field(FilterField(
+            name="shared_with_me",
+            display_name="Index Items Shared With Me",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.INDEXING,
+            description="Enable indexing of items shared with you via collaboration",
+            default_value=True,
+        ))
         .with_webhook_config(True, ["FILE.UPLOADED", "FILE.DELETED", "FILE.MOVED", "FOLDER.CREATED", "COLLABORATION.CREATED", "COLLABORATION.ACCEPTED", "COLLABORATION.REMOVED"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_agent_support(False)
         .with_sync_support(True)
-        .add_filter_field(CommonFields.file_extension_filter())
         .add_sync_custom_field(CommonFields.batch_size_field())
     )\
     .build_decorator()
+
 class BoxConnector(BaseConnector):
     """
     Connector for synchronizing data from a Box account.
@@ -173,6 +198,9 @@ class BoxConnector(BaseConnector):
     HTTP_OK = 200
     HTTP_NOT_FOUND = 404
     current_user_id: Optional[str] = None
+
+    # Box only retains admin_logs_streaming events for 2 weeks. If last sync was longer ago, do full sync.
+    BOX_EVENT_STREAM_RETENTION_DAYS = 14
 
     def __init__(
         self,
@@ -216,11 +244,8 @@ class BoxConnector(BaseConnector):
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
 
-        # Track the current access token to detect changes
-        self._current_access_token: Optional[str] = None
-
     async def init(self) -> bool:
-        """Initializes the Box client using credentials from the config service."""
+        """Initializes the Box client using CCG authentication."""
         config = await self.config_service.get_config(
             f"/services/connectors/{self.connector_id}/config"
         )
@@ -235,7 +260,6 @@ class BoxConnector(BaseConnector):
 
         client_id = auth_config.get("clientId")
         client_secret = auth_config.get("clientSecret")
-        # Extract enterprise_id from auth config
         enterprise_id = auth_config.get("enterpriseId")
 
         if not client_id or not client_secret or not enterprise_id:
@@ -243,124 +267,21 @@ class BoxConnector(BaseConnector):
             return False
 
         try:
-            # Check if we already have credentials (OAuth flow)
-            credentials_config = config.get("credentials", {}) or {}
-            access_token = credentials_config.get("access_token")
-
-            # If no stored access token, attempt to get one via HTTP API call
-            if not access_token:
-                self.logger.info("No stored access token found. Attempting to fetch via HTTP API...")
-                # Pass enterprise_id to the fetch method
-                access_token = await self._fetch_access_token_via_http(client_id, client_secret, enterprise_id)
-
-                if not access_token:
-                    self.logger.error("Failed to fetch access token via HTTP API.")
-                    return False
-
-            # Initialize Box client with the access token
-            config_obj = BoxTokenConfig(token=access_token)
+            # Use CCG authentication - SDK handles token refresh automatically
+            config_obj = BoxCCGConfig(
+                client_id=client_id,
+                client_secret=client_secret,
+                enterprise_id=enterprise_id
+            )
             client = await BoxClient.build_with_config(config_obj)
             await client.get_client().create_client()
             self.data_source = BoxDataSource(client)
 
-            # Store the initial token
-            self._current_access_token = access_token
-
-            self.logger.info("Box client initialized successfully.")
+            self.logger.info(f"Box CCG client initialized successfully for enterprise {enterprise_id}")
             return True
         except Exception as e:
-            self.logger.error(f"Failed to initialize Box client: {e}", exc_info=True)
+            self.logger.error(f"Failed to initialize Box CCG client: {e}", exc_info=True)
             return False
-
-    async def _fetch_access_token_via_http(self, client_id: str, client_secret: str, enterprise_id: str) -> Optional[str]:
-        """
-        Fetch access token from Box API using client credentials.
-        Args:
-            client_id: Box application client ID
-            client_secret: Box application client secret
-            enterprise_id: Box Enterprise ID for subject_id
-        Returns:
-            Access token string or None if failed
-        """
-        token_url = f"{self.BASE_URL}{self.TOKEN_ENDPOINT}"
-
-        try:
-            async with ClientSession() as session:
-                # Prepare request data for OAuth token exchange
-                data = {
-                    "grant_type": "client_credentials",
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "box_subject_type": "enterprise",
-                    "box_subject_id": enterprise_id
-                }
-
-                self.logger.info(f"Fetching access token from {token_url}")
-
-                async with session.post(token_url, data=data) as response:
-                    if response.status != self.HTTP_OK:
-                        error_text = await response.text()
-                        self.logger.error(
-                            f"Failed to fetch access token. Status: {response.status}, "
-                            f"Response: {error_text}"
-                        )
-                        return None
-
-                    token_data = await response.json()
-                    access_token = token_data.get("access_token")
-                    return access_token
-
-
-        except Exception as e:
-            self.logger.error(f"Error fetching access token via HTTP: {e}", exc_info=True)
-            return None
-
-    async def _get_fresh_datasource(self) -> None:
-        """
-        Ensures self.data_source is using an ALWAYS-FRESH access token.
-        It checks the central config and rebuilds the client if the token has changed.
-        """
-        try:
-            # 1. Fetch current config from configuration service
-            config = await self.config_service.get_config(f"/services/connectors/{self.connector_id}/config")
-
-            if not config:
-                self.logger.warning("Could not fetch Box config for token refresh check.")
-                return
-
-            # 2. Extract fresh OAuth access token
-            credentials_config = config.get("credentials", {}) or {}
-            fresh_token = credentials_config.get("access_token", "")
-
-            if not fresh_token:
-                self.logger.warning("No OAuth access token found in config refresh check.")
-                return
-
-            # 3. Compare with existing token
-            if self._current_access_token != fresh_token:
-                self.logger.info("🔄 Detected new Box Access Token. Re-initializing client...")
-
-                # 4. Re-initialize the client with the new token
-                config_obj = BoxTokenConfig(token=fresh_token)
-                client = await BoxClient.build_with_config(config_obj)
-
-                # Create the internal client instance
-                await client.get_client().create_client()
-
-                # 5. Update the datasource and the tracker
-                self.data_source = BoxDataSource(client)
-                self._current_access_token = fresh_token
-
-                # 6. Clear any cached user ID to force re-fetch with new token
-                self.current_user_id = None
-
-                self.logger.info("✅ Box client successfully updated with fresh token.")
-            else:
-                self.logger.debug("Token unchanged, skipping client refresh.")
-
-        except Exception as e:
-            # Log error but don't crash; attempt to proceed with existing token
-            self.logger.error(f"Error checking for fresh datasource: {e}", exc_info=True)
 
     def _parse_box_timestamp(self, ts_str: Optional[str], field_name: str, entry_name: str) -> int:
         """Helper to parse Box timestamps safely."""
@@ -401,7 +322,6 @@ class BoxConnector(BaseConnector):
         user_id: str,
         user_email: str,
         record_group_id: str,
-        is_personal_folder: bool
     ) -> Optional[RecordUpdate]:
         """
         Process a single Box entry and detect changes.
@@ -459,23 +379,28 @@ class BoxConnector(BaseConnector):
                 else:
                     self.logger.warning(f"Size field missing for file {entry_name}")
 
-            web_url = entry.get('shared_link', {}).get('url')
-            if not web_url:
-                web_url = f"https://app.box.com/{entry_type}/{entry_id}"
+            web_url = f"https://app.box.com/{entry_type}/{entry_id}"
+
+            # Shared by me: item has a shared link or was explicitly shared
+            is_shared = bool(entry.get('shared_link'))
+            # Shared with me: item is owned by someone else (e.g. from collaboration list)
+            owned_by = entry.get('owned_by') or {}
+            owner_id = str(owned_by.get('id', '')) if owned_by else ''
+            is_shared_with_me = bool(owner_id and owner_id != user_id)
 
             file_record = FileRecord(
                 id=record_id,
                 org_id=self.data_entities_processor.org_id,
                 record_name=entry_name,
-                record_type=record_type.value,
-                record_group_type=RecordGroupType.DRIVE.value,
+                record_type=record_type,
+                record_group_type=RecordGroupType.DRIVE,
                 external_record_id=entry_id,
                 external_record_group_id=record_group_id,
                 parent_external_record_id=parent_external_record_id,
-                parent_record_type=RecordType.FILE.value if parent_external_record_id else None,
+                parent_record_type=RecordType.FILE if parent_external_record_id else None,
                 version=version,
-                origin=OriginTypes.CONNECTOR.value,
-                connector_name=self.connector_name.value,
+                origin=OriginTypes.CONNECTOR,
+                connector_name=self.connector_name,
                 connector_id=self.connector_id,
                 mime_type=mime_type,
                 weburl=web_url,
@@ -490,7 +415,9 @@ class BoxConnector(BaseConnector):
                 path=file_path,
                 etag=entry.get('etag'),
                 sha1_hash=entry.get('sha1'),
-                external_revision_id=entry.get('etag')
+                external_revision_id=entry.get('etag'),
+                is_shared=is_shared,
+                is_shared_with_me=is_shared_with_me,
             )
 
             # 1. Fetch explicit API permissions (Collaborators only)
@@ -521,6 +448,34 @@ class BoxConnector(BaseConnector):
                     )
 
             permissions = list(final_permissions_map.values())
+
+            # Respect indexing filters for shared / shared_with_me (same as Drive)
+            if self.indexing_filters:
+                shared_disabled = (
+                    file_record.is_shared
+                    and not file_record.is_shared_with_me
+                    and not self.indexing_filters.is_enabled(IndexingFilterKey.SHARED, default=True)
+                )
+                shared_with_me_disabled = (
+                    file_record.is_shared_with_me
+                    and not self.indexing_filters.is_enabled(IndexingFilterKey.SHARED_WITH_ME, default=True)
+                )
+                if shared_disabled or shared_with_me_disabled:
+                    file_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+
+            # Link shared-with-me records to the user's "Shared with Me" record group (for future collaboration sync)
+            if file_record.is_shared_with_me and user_email:
+                file_record.external_record_group_id = None
+                async with self.data_store_provider.transaction() as tx_store:
+                    shared_with_me_group = await tx_store.get_record_group_by_external_id(
+                        connector_id=self.connector_id,
+                        external_id=f"0S:{user_email}",
+                    )
+                    if shared_with_me_group:
+                        await tx_store.create_record_group_relation(
+                            file_record.id,
+                            shared_with_me_group.id,
+                        )
 
             # Determine if new or updated
             if existing_record:
@@ -567,8 +522,8 @@ class BoxConnector(BaseConnector):
                 response = await self.data_source.collaborations_get_folder_collaborations(folder_id=item_id)
 
             if not response.success:
-                # Handle 404 no permission to view collabs
-                if response.status_code == self.HTTP_NOT_FOUND:
+                # 404 or no permission to view collabs (BoxResponse has no status_code; check error string)
+                if response.error and "404" in str(response.error):
                     self.logger.debug(f"No collaborations found or accessible for {item_type} {item_id} (404).")
                 else:
                     self.logger.debug(f"Could not fetch permissions for {item_type} {item_id}: {response.error}")
@@ -618,7 +573,6 @@ class BoxConnector(BaseConnector):
         user_id: str,
         user_email: str,
         record_group_id: str,
-        is_personal_folder: bool
     ) -> AsyncGenerator[Tuple[Optional[FileRecord], List[Permission], RecordUpdate], None]:
         """
         Process Box items and yield FileRecord, permissions, and RecordUpdate.
@@ -629,7 +583,6 @@ class BoxConnector(BaseConnector):
                 user_id=user_id,
                 user_email=user_email,
                 record_group_id=record_group_id,
-                is_personal_folder=is_personal_folder
             )
 
             if record_update:
@@ -942,8 +895,17 @@ class BoxConnector(BaseConnector):
             self.logger.info("Syncing Box record groups (user drives)...")
 
             for user in users:
-                # Get the root folder info to use as the user's drive
-                response = await self.data_source.folders_get_folder_by_id(folder_id='0')
+                try:
+                    # Folder '0' is the user's root "All Files"; must set As-User to get that user's root.
+                    await self.data_source.set_as_user_context(user.source_user_id)
+                except Exception as e:
+                    self.logger.warning(f"Could not set As-User for {user.email}: {e}")
+                    continue
+
+                try:
+                    response = await self.data_source.folders_get_folder_by_id(folder_id='0')
+                finally:
+                    await self.data_source.clear_as_user_context()
 
                 if not response.success:
                     self.logger.warning(f"Could not fetch root folder for user {user.email}: {response.error}")
@@ -953,19 +915,29 @@ class BoxConnector(BaseConnector):
 
                 # Create RecordGroup for user's drive (their "All Files" root storage)
                 record_group = RecordGroup(
-                    org_id=self.data_entities_processor.org_id,
                     name=f"{user.full_name or user.email}'s Box",
+                    org_id=self.data_entities_processor.org_id,
                     external_group_id=user.source_user_id,
-                    external_user_id=user.source_user_id,
-                    connector_name=self.connector_name.value,
+                    connector_name=self.connector_name,
                     connector_id=self.connector_id,
-                    group_type=RecordGroupType.DRIVE.value,
+                    group_type=RecordGroupType.DRIVE,
                     web_url=root_folder.get('shared_link', {}).get('url') if root_folder.get('shared_link') else None,
                     source_created_at=int(datetime.fromisoformat(root_folder.get('created_at', '').replace('Z', '+00:00')).timestamp() * 1000) if root_folder.get('created_at') else None,
                     source_updated_at=int(datetime.fromisoformat(root_folder.get('modified_at', '').replace('Z', '+00:00')).timestamp() * 1000) if root_folder.get('modified_at') else None,
                 )
 
-                # User has owner permission on their own drive
+                # Shared with Me: virtual group for items shared with this user (e.g. via collaborations)
+                shared_with_me_record_group = RecordGroup(
+                    name=f"{user.full_name or user.email}'s Shared with Me",
+                    org_id=self.data_entities_processor.org_id,
+                    external_group_id=f"0S:{user.email}",
+                    connector_name=self.connector_name,
+                    connector_id=self.connector_id,
+                    group_type=RecordGroupType.DRIVE,
+                    is_internal=True,
+                )
+
+                # User has owner permission on their own drive and on Shared with Me
                 drive_permissions = [Permission(
                     external_id=user.source_user_id,
                     email=user.email,
@@ -973,7 +945,10 @@ class BoxConnector(BaseConnector):
                     entity_type=EntityType.USER
                 )]
 
-                await self.data_entities_processor.on_new_record_groups([(record_group, drive_permissions)])
+                await self.data_entities_processor.on_new_record_groups([
+                    (record_group, drive_permissions),
+                    (shared_with_me_record_group, drive_permissions),
+                ])
 
             self.logger.info("Box record groups sync completed")
 
@@ -1016,9 +991,13 @@ class BoxConnector(BaseConnector):
         if not self.current_user_id:
             try:
                 current_user_response = await self.data_source.get_current_user()
-                if current_user_response.success:
-                    self.current_user_id = current_user_response.data.id
-                    self.logger.info(f"🔍 Current Token Owner ID: {self.current_user_id}")
+                if current_user_response.success and current_user_response.data:
+                    user_data = self._to_dict(current_user_response.data)
+                    self.current_user_id = user_data.get("id")
+                    if self.current_user_id is not None:
+                        self.current_user_id = str(self.current_user_id)
+                    if self.current_user_id:
+                        self.logger.info(f"🔍 Current Token Owner ID: {self.current_user_id}")
             except Exception as e:
                 self.logger.warning(f"Could not fetch current user ID: {e}")
 
@@ -1036,21 +1015,6 @@ class BoxConnector(BaseConnector):
             pass
 
         while True:
-            # 1. Capture the current datasource instance before checking for updates
-            previous_datasource = self.data_source
-
-            await self._get_fresh_datasource()
-
-            # 2. If the datasource was replaced (token refresh), re-apply the user context!
-            if self.data_source != previous_datasource:
-                try:
-                    if self.current_user_id and user.source_user_id != self.current_user_id:
-                        self.logger.info(f"🔄 Token refreshed. Re-applying As-User context for {user.email}")
-                        await self.data_source.set_as_user_context(user.source_user_id)
-                    else:
-                        await self.data_source.clear_as_user_context()
-                except Exception as e:
-                    self.logger.error(f"Failed to re-apply As-User context after refresh: {e}")
 
             async with self.rate_limiter:
                 response = await self.data_source.folders_get_folder_items(
@@ -1079,7 +1043,6 @@ class BoxConnector(BaseConnector):
                 user.source_user_id,
                 user.email,
                 current_record_group_id,
-                True
             ):
                 if record_update.is_deleted or record_update.is_updated:
                     await self._handle_record_updates(record_update)
@@ -1117,7 +1080,6 @@ class BoxConnector(BaseConnector):
             # Filter for active users only
             all_active_users = await self.data_entities_processor.get_all_active_users()
             active_user_emails = {active_user.email.lower() for active_user in all_active_users}
-
             users_to_sync = [
                 user for user in users
                 if user.email and user.email.lower() in active_user_emails
@@ -1190,6 +1152,9 @@ class BoxConnector(BaseConnector):
                 self.config_service, "box", self.connector_id, self.logger
             )
 
+            # Cache date filters once at sync start for performance
+            self._cached_date_filters = self._get_date_filters()
+
             # 1. Check if we have an existing cursor
             key = "event_stream_cursor"
 
@@ -1202,20 +1167,27 @@ class BoxConnector(BaseConnector):
             # 2. DECISION LOGIC
             if cursor_data and cursor_data.get("cursor"):
                 cursor_val = cursor_data.get("cursor")
-                self.logger.info(f"✅ [Smart Sync] Found existing cursor: {cursor_val}")
-                self.logger.info("🚀 [Smart Sync] Switching to INCREMENTAL SYNC path.")
+                cursor_updated_at_ms = cursor_data.get("cursor_updated_at")
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                retention_ms = self.BOX_EVENT_STREAM_RETENTION_DAYS * 24 * 3600 * 1000
 
-                # Hand off to the incremental engine
-                await self.run_incremental_sync()
-                return
+                if cursor_updated_at_ms is not None and (now_ms - cursor_updated_at_ms) < retention_ms:
+                    self.logger.info(f"✅ [Smart Sync] Found existing cursor: {cursor_val} (within retention window)")
+                    self.logger.info("🚀 [Smart Sync] Switching to INCREMENTAL SYNC path.")
+                    await self.run_incremental_sync()
+                    return
+                else:
+                    self.logger.info(
+                        f"⚪ [Smart Sync] Cursor too old or missing timestamp (> {self.BOX_EVENT_STREAM_RETENTION_DAYS} days). "
+                        "Box retains events only 2 weeks. Starting FULL SYNC."
+                    )
 
-            # NO CURSOR FOUND PROCEED WITH FULL SYNC
-            self.logger.info("⚪ [Smart Sync] No cursor found. Starting FULL SYNC & Anchoring.")
+            # NO CURSOR OR CURSOR TOO OLD: PROCEED WITH FULL SYNC
+            if not (cursor_data and cursor_data.get("cursor")):
+                self.logger.info("⚪ [Smart Sync] No cursor found. Starting FULL SYNC & Anchoring.")
 
             # ANCHOR THE STREAM
             try:
-                await self._get_fresh_datasource()
-
                 # Get current position ('now')
                 response = await self.data_source.events_get_events(
                     stream_type='admin_logs_streaming',
@@ -1228,9 +1200,10 @@ class BoxConnector(BaseConnector):
                     next_stream_pos = data.get('next_stream_position')
 
                     if next_stream_pos:
+                        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                         await self.box_cursor_sync_point.update_sync_point(
                             key,
-                            {"cursor": next_stream_pos}
+                            {"cursor": next_stream_pos, "cursor_updated_at": now_ms}
                         )
                         self.logger.info(f"⚓ [Smart Sync] Anchored Event Stream at: {next_stream_pos}")
                     else:
@@ -1267,12 +1240,19 @@ class BoxConnector(BaseConnector):
         """
         self.logger.info("🔄 [Incremental] Starting Box Enterprise incremental sync.")
 
+        our_org_box_user_ids: Set[str] = set()
         try:
             self.logger.info("👥 [Incremental] Refreshing User list...")
             users = await self._sync_users()
 
             # Update the in-memory or DB map of users so we can link files to them later
             await self.data_entities_processor.on_new_app_users(users)
+
+            # Box user IDs that belong to our org (for distinguishing external vs internal shares)
+            our_org_box_user_ids = {
+                str(u.source_user_id) for u in (users or [])
+                if getattr(u, 'source_user_id', None)
+            }
 
             self.logger.info("🛡️ [Incremental] Refreshing Virtual Groups...")
             await self._ensure_virtual_groups()
@@ -1286,7 +1266,7 @@ class BoxConnector(BaseConnector):
 
         key = "event_stream_cursor"
 
-        # 1. Load Cursor
+        # 1. Load Cursor (Box guarantees events after cursor are new; duplicates only within that stream)
         stream_position = 'now'
         try:
             data = await self.box_cursor_sync_point.read_sync_point(key)
@@ -1301,8 +1281,6 @@ class BoxConnector(BaseConnector):
 
         try:
             while has_more:
-                await self._get_fresh_datasource()
-
                 self.logger.info(f"📡 [Incremental] Polling Box events from pos: {stream_position}")
 
                 response = await self.data_source.events_get_events(
@@ -1325,30 +1303,39 @@ class BoxConnector(BaseConnector):
 
                 if events:
                     self.logger.info(f"📥 [Incremental] Fetched {len(events)} new events from Box.")
-                    await self._process_event_batch(events)
+                    await self._process_event_batch(events, our_org_box_user_ids=our_org_box_user_ids)
                 else:
                     self.logger.info("ℹ️ [Incremental] Box says: No new events yet.")
                     has_more = False
 
                 if next_stream_position:
                     stream_position = next_stream_position
-                    # Update cursor immediately
+                    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                     await self.box_cursor_sync_point.update_sync_point(
                         key,
-                        {"cursor": stream_position}
+                        {"cursor": stream_position, "cursor_updated_at": now_ms}
                     )
                     self.logger.debug(f"💾 [Incremental] Updated cursor to: {stream_position}")
 
         except Exception as e:
             self.logger.error(f"❌ [Incremental] Error during sync: {e}", exc_info=True)
 
-    async def _process_event_batch(self, events: List[Dict]) -> None:
+    async def _process_event_batch(
+        self,
+        events: List[Dict],
+        our_org_box_user_ids: Optional[Set[str]] = None,
+    ) -> None:
         """
-        Deduplicates events, handles deletions, and groups updates.
-        Now handles "Flat" dictionary schemas AND fetches missing emails.
-        Supports both files and folders.
+        Deduplicates events by event_id (Box may return events more than once or out of order),
+        handles deletions, and groups updates.
+        Supports "Flat" dictionary schemas and fetches missing emails. Handles files and folders.
+
+        Shared-with-me: we only link to Shared with Me when the share is *from outside our org*
+        to a user in our org. Shares from our org to external users are ignored for the grantee;
+        shares from our org to our org (internal) are not added to Shared with Me.
         """
         items_to_sync: Dict[str, Tuple[str, str]] = {}  # item_id -> (owner_id, item_type)
+        items_to_sync_shared_with_me: List[Tuple[str, str, str, str]] = []  # (item_id, item_type, collaborator_box_id, collaborator_email)
         items_to_delete: set = set()
 
         DELETION_EVENTS = {
@@ -1366,9 +1353,13 @@ class BoxConnector(BaseConnector):
         COLLABORATION_GRANT_EVENTS = {
             'COLLABORATION_CREATED',
             'COLLABORATION_INVITE',
+            'COLLABORATION_INVITE_ACCEPTED',
             'COLLABORATION_ACCEPTED',
             'COLLABORATION.CREATED',
             'COLLABORATION.ACCEPTED',
+            'COLLABORATION_ADD',
+            'ADD_COLLABORATOR',
+            'COLLABORATION.INVITE',
         }
 
         def get_val(obj: Optional[object], key: str, default: Optional[object] = None) -> Optional[object]:
@@ -1378,7 +1369,24 @@ class BoxConnector(BaseConnector):
                 return obj.get(key, default)
             return getattr(obj, key, default)
 
+        # Box may return events out of chronological order; sort by created_at so we process in time order.
+        def _event_sort_key(e: Dict) -> Tuple[int, str]:
+            ts = get_val(e, 'created_at')
+            if ts is not None and isinstance(ts, str):
+                return (0, ts)  # ISO 8601 strings sort correctly
+            return (1, '')  # events without timestamp last
+
+        events = sorted(events, key=_event_sort_key)
+        processed_ids_set = set()
+
         for event in events:
+            event_id = get_val(event, 'event_id')
+            if event_id:
+                if event_id in processed_ids_set:
+                    self.logger.debug(f"Skipping duplicate event (event_id={event_id})")
+                    continue
+                processed_ids_set.add(event_id)
+
             event_type = get_val(event, 'event_type')
             source = get_val(event, 'source')
 
@@ -1460,10 +1468,34 @@ class BoxConnector(BaseConnector):
                             self.logger.warning(f"⚠️ Failed to fetch owner for {item_type} {item_id}: {e}")
 
                     if owner_id:
-                        # Queue for sync to refresh permissions
-                        items_to_sync[item_id] = (owner_id, item_type)
+                        # Queue for sync to refresh permissions (owner's drive)
+                        items_to_sync[item_id] = (str(owner_id), item_type)
                     else:
                         self.logger.warning(f"⚠️ Cannot sync {item_type} {item_id} - no owner found")
+
+                    # Queue for "Shared with Me" only when: collaborator is in our org AND owner is outside our org.
+                    # (Our org → external: we ignore for the grantee. External → our org: link to Shared with Me.)
+                    owner_in_our_org = str(owner_id) in our_org_box_user_ids
+                    if item_id and granted_email and granted_user_box_id and not owner_in_our_org:
+                        collaborators_in_org = await self._get_app_users_by_emails([granted_email])
+                        if collaborators_in_org:
+                            items_to_sync_shared_with_me.append((
+                                str(item_id),
+                                item_type or 'file',
+                                str(granted_user_box_id),
+                                granted_email,
+                            ))
+                            self.logger.info(
+                                f"📥 Queued {item_type} {item_id} for Shared with Me (external→our org) for {granted_email}"
+                            )
+                        else:
+                            self.logger.debug(
+                                f"Skip Shared with Me for {item_id}: grantee {granted_email} not in our org"
+                            )
+                    elif owner_in_our_org and item_id and granted_email:
+                        self.logger.debug(
+                            f"Skip Shared with Me for {item_id}: owner in our org (internal share or our→external)"
+                        )
                 else:
                     self.logger.warning("⚠️ Collaboration grant skipped. Missing item ID")
 
@@ -1631,8 +1663,79 @@ class BoxConnector(BaseConnector):
                 if items['folders']:
                     self.logger.info(f"📁 Syncing {len(items['folders'])} folder(s) for owner {owner_id}")
                     await self._fetch_and_sync_folders_for_owner(owner_id, items['folders'])
-        else:
+
+        # 7. SYNC ITEMS AS "SHARED WITH ME" FOR COLLABORATORS (from COLLABORATION_* events)
+        if items_to_sync_shared_with_me:
+            self.logger.info(f"📥 Syncing {len(items_to_sync_shared_with_me)} item(s) as Shared with Me for collaborators")
+            await self._fetch_and_sync_items_as_shared_with_me(items_to_sync_shared_with_me)
+
+        if not items_to_sync and not items_to_sync_shared_with_me and not items_to_delete:
             self.logger.debug("ℹ️ No items to sync from this event batch")
+
+    async def _fetch_and_sync_items_as_shared_with_me(
+        self,
+        items: List[Tuple[str, str, str, str]],  # (item_id, item_type, collaborator_box_id, collaborator_email)
+    ) -> None:
+        """
+        For collaboration-grant events: fetch each item as the collaborator and upsert with
+        is_shared_with_me=True so the record is linked to their Shared with Me group.
+        """
+        if not items:
+            return
+        # Group by collaborator to minimize as-user context switches
+        by_collaborator: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}  # (box_id, email) -> [(item_id, item_type)]
+        for item_id, item_type, collab_box_id, collab_email in items:
+            key = (collab_box_id, collab_email)
+            if key not in by_collaborator:
+                by_collaborator[key] = []
+            by_collaborator[key].append((item_id, item_type))
+
+        for (collab_box_id, collab_email), collab_items in by_collaborator.items():
+            try:
+                await self.data_source.set_as_user_context(collab_box_id)
+                updates_to_push = []
+                for item_id, item_type in collab_items:
+                    try:
+                        if (item_type or "").lower() == "folder":
+                            folder_response = await self.data_source.folders_get_folder_by_id(item_id)
+                            if not folder_response.success:
+                                self.logger.warning(f"Failed to fetch folder {item_id} as shared-with-me: {folder_response.error}")
+                                continue
+                            entry = self._to_dict(folder_response.data)
+                        else:
+                            file_response = await self.data_source.files_get_file_by_id(item_id)
+                            if not file_response.success:
+                                self.logger.warning(f"Failed to fetch file {item_id} as shared-with-me: {file_response.error}")
+                                continue
+                            entry = self._to_dict(file_response.data)
+                        if not entry:
+                            continue
+                        update_obj = await self._process_box_entry(
+                            entry=entry,
+                            user_id=collab_box_id,
+                            user_email=collab_email,
+                            record_group_id=collab_box_id,
+                        )
+                        if update_obj:
+                            updates_to_push.append((update_obj.record, update_obj.new_permissions or []))
+                            if (item_type or "").lower() == "folder":
+                                batch_records = []
+                                await self._sync_folder_contents_recursively(
+                                    owner_id=collab_box_id,
+                                    folder_id=item_id,
+                                    batch_records=batch_records,
+                                    user_email=collab_email,
+                                )
+                                if batch_records:
+                                    await self.data_entities_processor.on_new_records(batch_records)
+                    except Exception as e:
+                        self.logger.warning(f"Error syncing shared-with-me item {item_id} for {collab_email}: {e}")
+                if updates_to_push:
+                    await self.data_entities_processor.on_new_records(updates_to_push)
+            except Exception as e:
+                self.logger.error(f"Error syncing shared-with-me for collaborator {collab_email}: {e}")
+            finally:
+                await self.data_source.clear_as_user_context()
 
     async def _fetch_and_sync_files_for_owner(self, owner_id: str, file_ids: List[str]) -> None:
         """
@@ -1688,7 +1791,6 @@ class BoxConnector(BaseConnector):
                     user_id=owner_id,
                     user_email="incremental_sync_user",
                     record_group_id=owner_id,
-                    is_personal_folder=True
                 )
 
                 if update_obj:
@@ -1747,7 +1849,6 @@ class BoxConnector(BaseConnector):
                         user_id=owner_id,
                         user_email="incremental_sync_user",
                         record_group_id=owner_id,
-                        is_personal_folder=True
                     )
 
                     if update_obj:
@@ -1790,7 +1891,6 @@ class BoxConnector(BaseConnector):
                         user_id=owner_id,
                         user_email="incremental_sync_user",
                         record_group_id=owner_id,
-                        is_personal_folder=True
                     )
 
                     if update_obj:
@@ -1817,14 +1917,22 @@ class BoxConnector(BaseConnector):
             # 6. ALWAYS Clear Context
             await self.data_source.clear_as_user_context()
 
-    async def _sync_folder_contents_recursively(self, owner_id: str, folder_id: str, batch_records: List) -> None:
+    async def _sync_folder_contents_recursively(
+        self,
+        owner_id: str,
+        folder_id: str,
+        batch_records: List,
+        user_email: Optional[str] = None,
+    ) -> None:
         """
         Recursively fetch all items in a folder, similar to _sync_folder_recursively but simpler.
         Used by incremental sync to handle new folders.
+        When user_email is provided (e.g. for shared-with-me sync), use it for Shared with Me group linking.
         """
         offset = 0
         limit = 1000
         fields = 'type,id,name,size,created_at,modified_at,path_collection,etag,sha1,shared_link,owned_by'
+        effective_email = user_email or "incremental_sync_user"
 
         while True:
             try:
@@ -1854,9 +1962,8 @@ class BoxConnector(BaseConnector):
                         update_obj = await self._process_box_entry(
                             entry=item,
                             user_id=owner_id,
-                            user_email="incremental_sync_user",
+                            user_email=effective_email,
                             record_group_id=owner_id,
-                            is_personal_folder=True
                         )
 
                         if update_obj:
@@ -1878,7 +1985,9 @@ class BoxConnector(BaseConnector):
 
                 # Recursively process subfolders
                 for sub_folder_id in sub_folders_to_traverse:
-                    await self._sync_folder_contents_recursively(owner_id, sub_folder_id, batch_records)
+                    await self._sync_folder_contents_recursively(
+                        owner_id, sub_folder_id, batch_records, user_email=user_email
+                    )
 
                 offset += len(items)
                 if offset >= total_count:
@@ -1897,14 +2006,14 @@ class BoxConnector(BaseConnector):
 
         # self.logger.info(f"🗑️ Processing batch deletion for {len(file_ids)} Box files...")
         self.logger.info(f"ℹ️ [TODO] Skipped deletion for {len(file_ids)} files (Backend support pending). IDs: {file_ids}")
-        # arango_service = self.data_store_provider.arango_service
+        # graph_provider = self.data_store_provider.graph_provider
 
         # deleted_count = 0
 
         # for external_id in file_ids:
         #     try:
         #         # 1. Use the service to find the record
-        #         existing_record = await arango_service.get_record_by_external_id(
+        #         existing_record = await graph_provider.get_record_by_external_id(
         #             connector_id=self.connector_id,
         #             external_id=external_id
         #         )
@@ -1932,60 +2041,47 @@ class BoxConnector(BaseConnector):
 
     async def get_signed_url(self, record: Record) -> Optional[str]:
         """
-        Get a signed URL, ensuring we impersonate the correct user (Record Group Owner).
+        Get a download URL for indexing (creates temporary shared link if needed).
+        Uses Box's official downloads.get_download_file_url() API which:
+        - Creates a temporary shared link visible in Box UI (expires in ~24 hours)
+        - Returns existing shared link URL if file already has one
+        - Does not require authentication headers for download
+        Note: Similar to Dropbox's get_temporary_link approach. The created shared
+        links expire automatically and are visible in Box UI with expiration badge.
         """
         if not self.data_source:
             return None
 
-        # 1. Determine the user context
+        # Determine the user context for As-User impersonation
         context_user_id = record.external_record_group_id
 
         try:
-            # 2. Set As-User Context
+            # Set As-User Context
             if context_user_id:
                 await self.data_source.set_as_user_context(context_user_id)
 
-            # 3. Try to get existing file info
-            response = await self.data_source.files_get_file_by_id(
+            # Get download URL (creates temporary shared link if needed, expires ~24 hours)
+            response = await self.data_source.downloads_get_download_file_url(
                 file_id=record.external_record_id
             )
 
-            download_url = None
-
-            if response.success:
-                file_data = self._to_dict(response.data)
-
-                # shared_link might be None, dict, or Object (if _to_dict was shallow, though it usually handles it)
-                shared_link = file_data.get('shared_link')
-                if isinstance(shared_link, dict):
-                    download_url = shared_link.get('download_url')
-                elif hasattr(shared_link, 'download_url'):
-                    # Fallback for SDK objects that survived
-                    download_url = getattr(shared_link, 'download_url', None)
-
-            # 4. If no URL found, create a temporary shared link
-            if not download_url:
-                link_response = await self.data_source.shared_links_create_shared_link_for_file(
-                    file_id=record.external_record_id,
-                    access='open'
+            if response.success and response.data:
+                # Response.data is the download URL (shared link or existing link)
+                return str(response.data)
+            else:
+                self.logger.warning(
+                    f"Failed to get download URL for {record.record_name}: {response.error}"
                 )
-
-                if link_response.success:
-                    file_data = self._to_dict(link_response.data)
-                    shared_link = file_data.get('shared_link')
-
-                    if isinstance(shared_link, dict):
-                        download_url = shared_link.get('download_url')
-                else:
-                    self.logger.warning(f"Failed to create shared link for {record.record_name}: {link_response.error}")
-
-            return str(download_url) if download_url else None
+                return None
 
         except Exception as e:
-            self.logger.error(f"Error creating signed URL for record {record.id}: {e}", exc_info=True)
+            self.logger.error(
+                f"Error getting temporary download URL for record {record.id}: {e}",
+                exc_info=True
+            )
             return None
         finally:
-            # 5. ALWAYS clear context to avoid polluting other requests
+            # Always clear As-User context to avoid polluting other requests
             if context_user_id:
                 await self.data_source.clear_as_user_context()
 
@@ -2102,7 +2198,6 @@ class BoxConnector(BaseConnector):
                             user_id=owner_id,
                             user_email="reindex_process",
                             record_group_id=owner_id,
-                            is_personal_folder=True
                         )
 
                         if update_result:
@@ -2130,9 +2225,45 @@ class BoxConnector(BaseConnector):
             self.logger.error(f"Error during Box reindex: {e}", exc_info=True)
             raise
 
+    def _get_date_filters(self) -> Tuple[Optional[datetime], Optional[datetime], Optional[datetime], Optional[datetime]]:
+        """
+        Extract date filter values from sync_filters.
+
+        Returns:
+            Tuple of (modified_after, modified_before, created_after, created_before)
+        """
+        modified_after: Optional[datetime] = None
+        modified_before: Optional[datetime] = None
+        created_after: Optional[datetime] = None
+        created_before: Optional[datetime] = None
+
+        # Get modified date filter
+        modified_date_filter = self.sync_filters.get(SyncFilterKey.MODIFIED)
+        if modified_date_filter and not modified_date_filter.is_empty():
+            after_iso, before_iso = modified_date_filter.get_datetime_iso()
+            if after_iso:
+                modified_after = datetime.fromisoformat(after_iso).replace(tzinfo=timezone.utc)
+                self.logger.info(f"Applying modified date filter: after {modified_after}")
+            if before_iso:
+                modified_before = datetime.fromisoformat(before_iso).replace(tzinfo=timezone.utc)
+                self.logger.info(f"Applying modified date filter: before {modified_before}")
+
+        # Get created date filter
+        created_date_filter = self.sync_filters.get(SyncFilterKey.CREATED)
+        if created_date_filter and not created_date_filter.is_empty():
+            after_iso, before_iso = created_date_filter.get_datetime_iso()
+            if after_iso:
+                created_after = datetime.fromisoformat(after_iso).replace(tzinfo=timezone.utc)
+                self.logger.info(f"Applying created date filter: after {created_after}")
+            if before_iso:
+                created_before = datetime.fromisoformat(before_iso).replace(tzinfo=timezone.utc)
+                self.logger.info(f"Applying created date filter: before {created_before}")
+
+        return modified_after, modified_before, created_after, created_before
+
     def _should_include_file(self, entry: Dict) -> bool:
         """
-        Determines if a file should be included based on the file extension filter.
+        Determines if a file should be included based on the file extension filter and date filters.
 
         Args:
             entry: Box file entry dict
@@ -2143,6 +2274,63 @@ class BoxConnector(BaseConnector):
         # Only filter files
         if entry.get('type') != 'file':
             return True
+
+        # Get date filters from cache (performance optimization)
+        modified_after, modified_before, created_after, created_before = getattr(
+            self, '_cached_date_filters', (None, None, None, None)
+        )
+
+        # Parse Box timestamps
+        modified_at_str = entry.get('modified_at')
+        created_at_str = entry.get('created_at')
+
+        modified_at = None
+        created_at = None
+
+        if modified_at_str:
+            try:
+                modified_at = datetime.fromisoformat(modified_at_str.replace('Z', '+00:00'))
+                if modified_at.tzinfo is None:
+                    modified_at = modified_at.replace(tzinfo=timezone.utc)
+            except Exception as e:
+                self.logger.debug(f"Could not parse modified_at for {entry.get('name')}: {e}")
+
+        if created_at_str:
+            try:
+                created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+            except Exception as e:
+                self.logger.debug(f"Could not parse created_at for {entry.get('name')}: {e}")
+
+        # Validate: If date filter is configured but file has no date, exclude it
+        if modified_after or modified_before:
+            if not modified_at:
+                self.logger.debug(f"Skipping {entry.get('name')}: no modified date available")
+                return False
+
+        if created_after or created_before:
+            if not created_at:
+                self.logger.debug(f"Skipping {entry.get('name')}: no created date available")
+                return False
+
+        # Apply modified date filters
+        if modified_at:
+            if modified_after and modified_at < modified_after:
+                self.logger.debug(f"Skipping {entry.get('name')}: modified {modified_at} before cutoff {modified_after}")
+                return False
+            if modified_before and modified_at > modified_before:
+                self.logger.debug(f"Skipping {entry.get('name')}: modified {modified_at} after cutoff {modified_before}")
+                return False
+
+        # Apply created date filters
+        if created_at:
+            if created_after and created_at < created_after:
+                self.logger.debug(f"Skipping {entry.get('name')}: created {created_at} before cutoff {created_after}")
+                return False
+            if created_before and created_at > created_before:
+                self.logger.debug(f"Skipping {entry.get('name')}: created {created_at} after cutoff {created_before}")
+                return False
 
         # Get the extensions filter
         extensions_filter = self.sync_filters.get(SyncFilterKey.FILE_EXTENSIONS)

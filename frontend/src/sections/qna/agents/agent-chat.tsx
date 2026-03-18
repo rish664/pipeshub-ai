@@ -33,7 +33,7 @@ import axios from 'src/utils/axios';
 import { CONFIG } from 'src/config-global';
 
 import { ORIGIN } from 'src/sections/knowledgebase/constants/knowledge-search';
-import { getConnectorPublicUrl } from 'src/sections/accountdetails/account-settings/services/utils/services-configuration-service';
+import { ConnectorApiService } from 'src/sections/accountdetails/connectors/services/api';
 
 import { Agent } from 'src/types/agent';
 import HtmlViewer from 'src/sections/qna/chatbot/components/html-highlighter';
@@ -48,12 +48,12 @@ import { StreamingContext } from 'src/sections/qna/chatbot/components/chat-messa
 import { processStreamingContentLegacy } from 'src/sections/qna/chatbot/utils/styles/content-processing';
 import { useConnectors } from 'src/sections/accountdetails/connectors/hooks/use-connectors';
 import { ConversationStreamingState } from 'src/sections/qna/chatbot/chat-bot';
-import { CHAT_MODES } from 'src/sections/qna/chatbot/utils/utils';
 import AgentApiService, { KnowledgeBase } from './services/api';
-import AgentChatInput from './components/agent-chat-input';
+import AgentChatInput, { ChatMode } from './components/agent-chat-input';
 import AgentChatSidebar from './components/agent-chat-sidebar';
 
 const DRAWER_WIDTH = 300;
+const AUTO_CHAT_MODE = 'auto';
 
 // Store messages per conversation
 interface ConversationMessages {
@@ -73,13 +73,9 @@ interface StreamingContextType {
 
 export interface Model {
   provider: string;
+  modelKey: string;
   modelName: string;
-}
-
-export interface ChatMode {
-  id: string;
-  name: string;
-  description: string;
+  modelFriendlyName?: string;
 }
 
 export interface Tool {
@@ -377,13 +373,13 @@ class StreamingManager {
       prev.map((msg) =>
         msg.id === messageId
           ? {
-              ...msg,
-              id: finalMessageId,
-              content: finalContent,
-              citations: finalCitations,
-              confidence: finalConfidence,
-              modelInfo: finalModelInfo || msg.modelInfo || null,
-            }
+            ...msg,
+            id: finalMessageId,
+            content: finalContent,
+            citations: finalCitations,
+            confidence: finalConfidence,
+            modelInfo: finalModelInfo || msg.modelInfo || null,
+          }
           : msg
       )
     );
@@ -508,6 +504,33 @@ class StreamingManager {
     this.completedNavigations.clear();
   }
 
+  resetNewConversation() {
+    const draftKey = 'new';
+    const state = this.conversationStates[draftKey];
+    if (state?.controller && !state.controller.signal.aborted) {
+      state.controller.abort();
+    }
+    this.conversationStates[draftKey] = StreamingManager.initializeStreamingState();
+    // Clear messages - this ensures start message can be shown again
+    this.conversationMessages[draftKey] = [];
+    this.notifyUpdates();
+  }
+
+  clearAllConversations() {
+    // Abort all active streams
+    Object.values(this.conversationStates).forEach((state) => {
+      if (state?.controller && !state.controller.signal.aborted) {
+        state.controller.abort();
+      }
+    });
+    // Clear all states and messages
+    this.conversationStates = {};
+    this.conversationMessages = {};
+    this.messageToConversationMap = {};
+    this.completedNavigations.clear();
+    this.notifyUpdates();
+  }
+
   isConversationLoading(conversationKey: string): boolean {
     const state = this.getConversationState(conversationKey);
     return !!(state && (state.isActive || state.isProcessingCompletion || state.showStatus));
@@ -568,6 +591,8 @@ const getEngagingStatusMessage = (event: string, data: any): string | null => {
     }
     case 'connected':
       return '🔌 Connected and processing...';
+    case 'metadata':
+      return '💾 Saving metadata...';
     case 'query_transformed':
     case 'results_ready':
       return null;
@@ -590,11 +615,17 @@ const AgentChat = () => {
   const [availableKBs, setAvailableKBs] = useState<KnowledgeBase[]>([]);
   // Model selection state
   const [selectedModel, setSelectedModel] = useState<Model | null>(availableModels[0]);
-  const [selectedChatMode, setSelectedChatMode] = useState<ChatMode | null>(null);
+  // Chat mode state
+  const [chatMode, setChatMode] = useState<ChatMode>('auto');
+  // Counter to signal AgentChatInput to clear its text (incremented on new chat, conversation switch, etc.)
+  const [clearInputTrigger, setClearInputTrigger] = useState<number>(0);
+
+  // Ref to store persistent chatMode that survives new chat clicks
+  const persistentChatModeRef = useRef<ChatMode>('auto');
 
   // Refs to store latest values to avoid stale closures in callbacks
   const latestModelRef = useRef(selectedModel);
-  const latestChatModeRef = useRef(selectedChatMode);
+  const latestChatModeRef = useRef<ChatMode>(chatMode);
   const availableModelsRef = useRef<Model[]>([]);
 
   // Update refs whenever values change
@@ -603,15 +634,17 @@ const AgentChat = () => {
   }, [selectedModel]);
 
   useEffect(() => {
-    latestChatModeRef.current = selectedChatMode;
-  }, [selectedChatMode]);
+    latestChatModeRef.current = chatMode;
+    // Update persistent ref whenever chatMode changes (user selection or conversation load)
+    persistentChatModeRef.current = chatMode;
+  }, [chatMode]);
 
   // Keep availableModels ref in sync
   useEffect(() => {
     availableModelsRef.current = availableModels;
   }, [availableModels]);
 
-  // Helper function to set model and chat mode from conversation modelInfo
+  // Helper function to set model from conversation modelInfo
   const setModelFromConversation = useCallback((conversationModelInfo: any) => {
     if (!conversationModelInfo) return;
 
@@ -631,17 +664,9 @@ const AgentChat = () => {
         setSelectedModel(matchingModel);
       }
     }
-
-    // Set chat mode from conversation if available
-    if (conversationModelInfo.chatMode) {
-      const matchingMode = CHAT_MODES.find((m) => m.id === conversationModelInfo.chatMode);
-      if (matchingMode) {
-        setSelectedChatMode(matchingMode);
-      }
-    }
   }, []);
 
-  // Set default model and chat mode when models are first loaded
+  // Set default model when models are first loaded
   // Only set defaults if no conversation is selected (new chat scenario)
   useEffect(() => {
     // Don't set defaults if we have a selected chat - let the conversation model useEffect handle it
@@ -651,11 +676,7 @@ const AgentChat = () => {
       // Set first model as default if no model is selected and no conversation is selected
       setSelectedModel(availableModels[0]);
     }
-    // Set default chat mode if not already selected
-    if (!selectedChatMode && CHAT_MODES.length > 0) {
-      setSelectedChatMode(CHAT_MODES[0]);
-    }
-  }, [availableModels, selectedModel, selectedChatMode, selectedChat]);
+  }, [availableModels, selectedModel, selectedChat]);
 
   // When models are loaded and we have a selected chat, try to set model from conversation
   useEffect(() => {
@@ -667,16 +688,82 @@ const AgentChat = () => {
     }
   }, [availableModels.length, selectedChat, setModelFromConversation]);
 
+  // Restore chatMode from conversation when selecting an existing chat
+  // For new chats, preserve the persistent chatMode (don't reset to 'auto')
+  useEffect(() => {
+    if (selectedChat) {
+      const conversationModelInfo = (selectedChat as any).modelInfo;
+      if (conversationModelInfo?.chatMode) {
+        const conversationChatMode = conversationModelInfo.chatMode as ChatMode;
+        setChatMode(conversationChatMode);
+        persistentChatModeRef.current = conversationChatMode;
+      }
+    } else {
+      // When selectedChat is null (new chat), restore the persistent chatMode
+      setChatMode(persistentChatModeRef.current);
+    }
+  }, [selectedChat]);
+
   const { activeConnectors } = useConnectors();
   const navigate = useNavigate();
   const { agentKey, conversationId } = useParams<{ agentKey: string; conversationId: string }>();
   const [agent, setAgent] = useState<Agent | null>(null);
+  const previousAgentKeyRef = useRef<string | undefined>(undefined);
+
   useEffect(() => {
     if (agentKey) {
       AgentApiService.getAgent(agentKey).then((agentItem) => {
         setAgent(agentItem);
-        setAvailableModels(agentItem.models);
-        setAvailableTools(agentItem.tools.map((tool: string) => ({ name: tool })));
+        
+        // Models are now enriched objects with modelName, provider, etc.
+        // Backend enriches model keys into full model objects
+        if (agentItem.models && agentItem.models.length > 0) {
+          const models = agentItem.models.map((m: any) => {
+            // Check if it's an enriched object or just a string key
+            if (typeof m === 'object' && m !== null) {
+              return {
+                provider: m.provider || 'unknown',
+                modelKey: m.modelKey || '',
+                modelName: m.modelName || m.modelKey || 'Unknown Model',
+                modelFriendlyName: m.modelFriendlyName || m.modelName || m.modelKey || 'Unknown Model',
+              };
+            }
+            console.log('m', m);
+            // Fallback for string model keys
+            return {
+              provider: 'AI',
+              modelKey: m,
+              modelName: m,
+            };
+          });
+          setAvailableModels(models);
+        }
+        
+        // Build tools array from toolsets (new format) or use legacy tools array
+        const toolsList: { name: string }[] = [];
+        if (agentItem.toolsets && agentItem.toolsets.length > 0) {
+          // New format: extract tools from toolsets
+          agentItem.toolsets.forEach((toolset: any) => {
+            if (toolset.tools && toolset.tools.length > 0) {
+              toolset.tools.forEach((tool: any) => {
+                const fullName = tool.fullName || `${toolset.name}.${tool.name}`;
+                toolsList.push({ name: fullName });
+              });
+            } else if (toolset.selectedTools && toolset.selectedTools.length > 0) {
+              // Use selectedTools if tools are not expanded
+              toolset.selectedTools.forEach((toolName: string) => {
+                const fullName = toolName.includes('.') ? toolName : `${toolset.name}.${toolName}`;
+                toolsList.push({ name: fullName });
+              });
+            }
+          });
+        } else if (agentItem.tools && Array.isArray(agentItem.tools)) {
+          // Legacy format: tools is array of strings
+          agentItem.tools.forEach((tool: string) => {
+            toolsList.push({ name: tool });
+          });
+        }
+        setAvailableTools(toolsList);
       });
     }
   }, [agentKey]);
@@ -735,11 +822,11 @@ const AgentChat = () => {
     const state = streamingManager.getConversationState(currentConversationKey);
     return state
       ? {
-          messageId: state.messageId,
-          content: state.content,
-          citations: state.citations,
-          isActive: state.isActive,
-        }
+        messageId: state.messageId,
+        content: state.content,
+        citations: state.citations,
+        isActive: state.isActive,
+      }
       : { messageId: null, content: '', citations: [], isActive: false };
     // eslint-disable-next-line
   }, [streamingManager, currentConversationKey, updateTrigger]);
@@ -768,6 +855,37 @@ const AgentChat = () => {
       streamingManager.removeUpdateCallback(forceUpdate);
     };
   }, [streamingManager, forceUpdate]);
+
+  // Clear all conversation states when agent changes
+  useEffect(() => {
+    if (agentKey && previousAgentKeyRef.current && previousAgentKeyRef.current !== agentKey) {
+      // Agent has changed - clear all conversation states
+      streamingManager.clearAllConversations();
+      setCurrentConversationId(null);
+      setSelectedChat(null);
+      setInputValue('');
+      setExpandedCitations({});
+      setIsNavigationBlocked(false);
+      setIsLoadingConversation(false);
+
+      // Reset model selection so it picks up new agent's models
+      setSelectedModel(null);
+
+      // Reset chat mode to auto for new agent
+      setChatMode('auto');
+      persistentChatModeRef.current = 'auto';
+
+      // Navigate to the new agent's base URL (without conversation ID) to ensure clean state
+      navigate(`/agents/${agentKey}`, { replace: true });
+
+      // Reset the 'new' conversation state for the new agent
+      streamingManager.resetNewConversation();
+
+      // Force update to ensure UI reflects the cleared state
+      forceUpdate();
+    }
+    previousAgentKeyRef.current = agentKey;
+  }, [agentKey, streamingManager, navigate, forceUpdate]);
 
   const handleCloseSnackbar = (): void => {
     setSnackbar({ open: false, message: '', severity: 'success' });
@@ -958,6 +1076,11 @@ const AgentChat = () => {
             }
             break;
 
+          case 'metadata':
+            // Status message is already handled by getEngagingStatusMessage above
+            // This event indicates metadata is being saved, so we keep the status visible
+            break;
+
           case 'complete': {
             streamingManager.clearStatus(context.conversationKey);
             const completedConversation = data.conversation;
@@ -970,7 +1093,7 @@ const AgentChat = () => {
                 context.conversationIdRef.current = completedConversation._id;
               }
               streamingManager.finalizeStreaming(finalKey, context.streamingBotMessageId, data);
-              
+
               // Update selectedChat with fresh conversation data to reflect updated modelInfo
               // This ensures the model selection is updated when switching back to this conversation
               const finalConvId = finalKey === 'new' ? context.conversationIdRef.current : finalKey;
@@ -984,6 +1107,14 @@ const AgentChat = () => {
                   }
                 }, 0);
               }
+            } else {
+              // complete event received but conversation data is missing/incomplete —
+              // still finalize so the loading state is cleared
+              streamingManager.finalizeStreaming(
+                context.conversationKey,
+                context.streamingBotMessageId,
+                data
+              );
             }
             break;
           }
@@ -1073,6 +1204,17 @@ const AgentChat = () => {
           controller
         );
 
+        // Guard: if the stream closed without emitting a complete event (e.g. server
+        // timeout, network drop, or CancelledError on the backend), isActive is still
+        // true and the loading indicator would spin forever.  Clear it here.
+        const resolvedKey = conversationIdRef.current
+          ? getConversationKey(conversationIdRef.current)
+          : conversationKey;
+        const endState = streamingManager.getConversationState(resolvedKey);
+        if (endState?.isActive) {
+          streamingManager.clearStreaming(resolvedKey);
+        }
+
         // Return the conversation ID if it was captured during streaming
         return conversationIdRef.current;
       } catch (error) {
@@ -1103,7 +1245,7 @@ const AgentChat = () => {
       messageOverride?: string,
       modelKey?: string,
       modelName?: string,
-      chatMode?: string,
+      inputChatMode?: string,
       selectedTools?: string[], // app_name.tool_name format - PERSISTENT
       selectedKBs?: string[], // KB IDs - PERSISTENT
       selectedApps?: string[] // App names - PERSISTENT
@@ -1111,11 +1253,12 @@ const AgentChat = () => {
       const trimmedInput =
         typeof messageOverride === 'string' ? messageOverride.trim() : inputValue.trim();
       if (!trimmedInput) return;
-      if (isNavigationBlocked || isCurrentConversationLoading) return;
+      // Only block if actively loading, not if there's just an error state
+      if (isCurrentConversationLoading) return;
 
       // Use refs to get the latest values (prevents stale closures)
       const currentModel = latestModelRef.current;
-      const currentMode = latestChatModeRef.current;
+      const resolvedChatMode = inputChatMode || latestChatModeRef.current || AUTO_CHAT_MODE;
 
       const wasCreatingNewConversation = !currentConversationId;
       const conversationKey = getConversationKey(currentConversationId);
@@ -1144,39 +1287,62 @@ const AgentChat = () => {
         ? `${CONFIG.backendUrl}/api/v1/agents/${agentKey}/conversations/stream`
         : `${CONFIG.backendUrl}/api/v1/agents/${agentKey}/conversations/${currentConversationId}/messages/stream`;
 
-      // Build the request body with persistent selections
+      // Build the request body with the new graph-based format
+      // No backward compatibility - only use toolsets and knowledge
+      
+      // Get tools to enable from user selection or use all tools from agent
+      const getEnabledTools = (): string[] => {
+        // If user selected specific tools, use those
+        if (selectedTools && selectedTools.length > 0) {
+          return selectedTools;
+        }
+        // Otherwise, return empty to let backend use all agent tools
+        return [];
+      };
+      
+      // Get apps/knowledge sources to enable from user selection
+      const getEnabledApps = (): string[] => {
+        // If user selected specific apps, use those
+        if (selectedApps && selectedApps.length > 0) {
+          return selectedApps;
+        }
+        // Otherwise, return empty to let backend use all agent knowledge sources
+        return [];
+      };
+      
       const requestBody = {
         query: trimmedInput,
+        modelKey: modelKey || currentModel?.modelKey,
         modelName: modelName || currentModel?.modelName,
-        chatMode: chatMode || currentMode?.id,
+        modelFriendlyName: currentModel?.modelFriendlyName && currentModel.modelFriendlyName.trim() 
+          ? currentModel.modelFriendlyName.trim() 
+          : undefined,
+        chatMode: resolvedChatMode,
 
-        // Tools: Use persistent selected tools (app_name.tool_name format)
-        // If no tools selected, use agent defaults, if no agent defaults, use empty array
-        tools: selectedTools && selectedTools.length > 0 ? selectedTools : agent?.tools || [],
+        // Timezone and current time for LLM context
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        currentTime: new Date().toISOString(),
 
-        // Enhanced filters structure with persistent selections
+        // Tools: List of tool full names to enable (filters agent's toolsets)
+        // Empty means use all tools from agent's toolsets
+        tools: getEnabledTools(),
+
+        // Filters structure
         filters: {
-          departments: [],
-          moduleIds: [],
-          appSpecificRecordTypes: [],
+          // Apps: List of connector IDs to enable (filters agent's knowledge)
+          // Empty means use all knowledge sources from agent
+          apps: getEnabledApps(),
 
-          // Apps: Extract connector instance IDs from connectors with category='knowledge'
-          // If no apps selected, use agent defaults from connectors array
-          apps: selectedApps && selectedApps.length > 0 
-            ? selectedApps 
-            : (agent?.connectors?.filter(ci => ci.category === 'knowledge').map(ci => ci.id) || []),
-
-          // Knowledge bases: Use persistent selected KB IDs
-          // If no KBs selected, use agent defaults, if no agent defaults, use empty array
-          kb: selectedKBs && selectedKBs.length > 0 ? selectedKBs : agent?.kb || [],
+          // Knowledge bases: KB IDs to use (extract from knowledge array if not selected)
+          kb: selectedKBs || [],
         },
 
-        // Chat mode specific parameters (persistent throughout conversation)
-        ...(chatMode === 'quick' && {
+        // Chat mode specific parameters
+        ...(resolvedChatMode === 'quick' && {
           limit: 5,
           quickMode: true,
         }),
-        ...(chatMode === 'standard' && {
+        ...(resolvedChatMode === 'standard' && {
           temperature: 0.7,
           limit: 10,
           quickMode: false,
@@ -1217,48 +1383,89 @@ const AgentChat = () => {
       streamingManager,
       getConversationKey,
       handleStreamingResponse,
-      isNavigationBlocked,
       isCurrentConversationLoading,
-      agent,
       agentKey,
       setSelectedChat,
     ]
   );
 
   const handleNewChat = useCallback(() => {
-    // Clear both current conversation and 'new' conversation states
+    // Abort any active streaming in current conversation
     if (currentConversationId) {
-      streamingManager.clearStreaming(getConversationKey(currentConversationId));
+      const currentKey = getConversationKey(currentConversationId);
+      const state = streamingManager.getConversationState(currentKey);
+      if (state?.controller && !state.controller.signal.aborted) {
+        state.controller.abort();
+      }
+      streamingManager.clearStreaming(currentKey);
     }
-    // Also clear the 'new' conversation state
-    streamingManager.clearStreaming('new');
+    
+    // Reset the 'new' conversation state (aborts any active stream there too)
+    // This clears messages so start message can be shown again
+    streamingManager.resetNewConversation();
     streamingManager.resetNavigationTracking();
 
+    // Reset all UI state (chatMode will be preserved via persistentChatModeRef in useEffect)
     setCurrentConversationId(null);
     navigate(`/agents/${agentKey}`, { replace: true });
     setInputValue('');
+    setClearInputTrigger((prev) => prev + 1);
     setShouldRefreshSidebar(true);
     setSelectedChat(null);
     setIsNavigationBlocked(false);
-
-  }, [navigate, streamingManager, currentConversationId, getConversationKey, agentKey]);
+    setExpandedCitations({});
+    
+    // Explicitly trigger start message after reset
+    // Use setTimeout to ensure resetNewConversation has completed
+    setTimeout(() => {
+      if (agent?.startMessage) {
+        const conversationKey = getConversationKey(null);
+        const existingMessages = streamingManager.getConversationMessages(conversationKey);
+        // Only add if still empty (in case something else added messages)
+        if (existingMessages.length === 0) {
+          const customStartMessage: FormattedMessage = {
+            type: 'bot',
+            content: agent.startMessage,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            id: 'start-message',
+            contentFormat: 'MARKDOWN',
+            followUpQuestions: [],
+            citations: [],
+            confidence: '',
+            messageType: 'bot_response',
+            timestamp: new Date(),
+          };
+          streamingManager.setConversationMessages(conversationKey, [customStartMessage]);
+        }
+      }
+    }, 0);
+  }, [navigate, streamingManager, currentConversationId, getConversationKey, agentKey, agent?.startMessage]);
 
   const handleChatSelect = useCallback(
     async (chat: Conversation) => {
-      if (!chat?._id || isNavigationBlocked) return;
+      if (!chat?._id) return;
+      // Only block navigation if actively streaming, not on error states
+      const currentKey = getConversationKey(currentConversationId);
+      const currentState = streamingManager.getConversationState(currentKey);
+      const isCurrentlyStreaming =
+        currentState?.isActive ||
+        currentState?.isProcessingCompletion ||
+        currentState?.showStatus;
+      if (isCurrentlyStreaming && currentConversationId) return;
 
       try {
         const chatKey = getConversationKey(chat._id);
 
         // Check if this conversation is currently streaming
         const streamingState = streamingManager.getConversationState(chatKey);
-        const isCurrentlyStreaming =
+        const isChatStreaming =
           streamingState?.isActive ||
           streamingState?.isProcessingCompletion ||
           streamingState?.showStatus;
 
         // If the conversation is streaming, don't set loading state as it might interfere
-        if (!isCurrentlyStreaming) {
+        if (!isChatStreaming) {
           setIsLoadingConversation(true);
         }
 
@@ -1272,15 +1479,15 @@ const AgentChat = () => {
 
         // Always fetch fresh conversation data to get the latest modelInfo
         // This ensures model changes made during the conversation are reflected
-        if (!isCurrentlyStreaming) {
+        if (!isChatStreaming) {
           try {
             const response = await axios.get(`/api/v1/agents/${agentKey}/conversations/${chat._id}`);
             const { conversation } = response.data;
-            
+
             if (conversation) {
               // Update selectedChat with fresh data
               setSelectedChat(conversation);
-              
+
               // Update messages if we don't have them or if conversation was updated
               if (!existingMessages.length || conversation.messages) {
                 const formattedMessages = (conversation.messages || [])
@@ -1297,13 +1504,13 @@ const AgentChat = () => {
                     return formatted;
                   })
                   .filter(Boolean) as FormattedMessage[];
-                
+
                 // Only update messages if we got new data or didn't have messages
                 if (!existingMessages.length || formattedMessages.length > existingMessages.length) {
                   streamingManager.setConversationMessages(chatKey, formattedMessages);
                 }
               }
-              
+
               // Always set model from fresh conversation data
               if ((conversation as any).modelInfo) {
                 setModelFromConversation((conversation as any).modelInfo);
@@ -1331,12 +1538,12 @@ const AgentChat = () => {
         // Only clear loading if we set it
         const chatKey = getConversationKey(chat._id);
         const streamingState = streamingManager.getConversationState(chatKey);
-        const isCurrentlyStreaming =
+        const isStillStreaming =
           streamingState?.isActive ||
           streamingState?.isProcessingCompletion ||
           streamingState?.showStatus;
 
-        if (!isCurrentlyStreaming) {
+        if (!isStillStreaming) {
           setIsLoadingConversation(false);
         }
       }
@@ -1346,33 +1553,45 @@ const AgentChat = () => {
       navigate,
       streamingManager,
       getConversationKey,
-      isNavigationBlocked,
       agentKey,
       setModelFromConversation,
+      currentConversationId,
     ]
   );
 
   // Update the useEffect to better handle streaming conversations
   useEffect(() => {
     const urlConversationId = conversationId;
-    if (isNavigationBlocked) return;
+    
+    // Don't process if agentKey is not available yet (agent is still loading)
+    if (!agentKey) return;
+    
+    // Check if current conversation is actively streaming before blocking
+    const currentKey = getConversationKey(currentConversationId);
+    const currentState = streamingManager.getConversationState(currentKey);
+    const isCurrentlyStreaming =
+      currentState?.isActive ||
+      currentState?.isProcessingCompletion ||
+      currentState?.showStatus;
+    // Only block if actively streaming, not on error states
+    if (isCurrentlyStreaming && currentConversationId && urlConversationId !== currentConversationId) return;
 
     if (urlConversationId && urlConversationId !== currentConversationId) {
       const chatKey = getConversationKey(urlConversationId);
       const existingMessages = streamingManager.getConversationMessages(chatKey);
       const streamingState = streamingManager.getConversationState(chatKey);
-      const isCurrentlyStreaming =
+      const isUrlStreaming =
         streamingState?.isActive ||
         streamingState?.isProcessingCompletion ||
         streamingState?.showStatus;
 
-      if (existingMessages.length > 0 || isCurrentlyStreaming) {
+      if (existingMessages.length > 0 || isUrlStreaming) {
         // We have existing messages or it's streaming, but still fetch fresh data for modelInfo
         setCurrentConversationId(urlConversationId);
-        
+
         // Always fetch fresh conversation data to get latest modelInfo
         // This ensures model changes made during the conversation are reflected
-        if (!isCurrentlyStreaming) {
+        if (!isUrlStreaming) {
           axios
             .get(`/api/v1/agents/${agentKey}/conversations/${urlConversationId}`)
             .then((response) => {
@@ -1422,10 +1641,10 @@ const AgentChat = () => {
       const crtStreamingState = streamingManager.getConversationState(
         getConversationKey(currentConversationId)
       );
-      const isCurrentlyStreaming =
+      const isCrtStreaming =
         crtStreamingState?.isActive || crtStreamingState?.isProcessingCompletion;
 
-      if (!isCurrentlyStreaming && crtMessages.length === 0) {
+      if (!isCrtStreaming && crtMessages.length === 0) {
         handleNewChat();
       }
     }
@@ -1449,6 +1668,7 @@ const AgentChat = () => {
       const existingMessages = streamingManager.getConversationMessages(conversationKey);
 
       // Only add start message if there are no messages at all
+      // This ensures start message shows after new chat, failed conversations, or agent changes
       if (existingMessages.length === 0) {
         const customStartMessage: FormattedMessage = {
           type: 'bot',
@@ -1473,6 +1693,7 @@ const AgentChat = () => {
     getConversationKey,
     streamingManager,
     agent?.name,
+    updateTrigger, // Include updateTrigger to ensure it re-runs after resetNewConversation
   ]);
 
   useEffect(() => {
@@ -1533,228 +1754,70 @@ const AgentChat = () => {
       const { externalRecordId } = record;
       const fileName = record.recordName;
 
-      if (record.origin === ORIGIN.UPLOAD) {
-        try {
-          const downloadResponse = await axios.get(
-            `/api/v1/document/${externalRecordId}/download`,
-            { responseType: 'blob' }
-          );
+      // Unified streaming - use stream/record API for both KB and connector records
+      let params: { convertTo?: string } = {};
+      if (['pptx', 'ppt'].includes(citationMeta?.extension)) {
+        params = { convertTo: 'application/pdf' };
+        handleLargePPTFile(record);
+      }
 
-          const reader = new FileReader();
-          const textPromise = new Promise<string>((resolve) => {
-            reader.onload = () => {
-              resolve(reader.result?.toString() || '');
-            };
-          });
-
-          reader.readAsText(downloadResponse.data);
-          const text = await textPromise;
-
-          let filename;
-          const contentDisposition = downloadResponse.headers['content-disposition'];
-          if (contentDisposition) {
-            // First try to parse filename*=UTF-8'' format (RFC 5987) for Unicode support
-            const filenameStarMatch = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
-            if (filenameStarMatch && filenameStarMatch[1]) {
-              // Decode the percent-encoded UTF-8 filename
-              try {
-                filename = decodeURIComponent(filenameStarMatch[1]);
-              } catch (e) {
-                console.error('Failed to decode UTF-8 filename', e);
-              }
-            }
-
-            // Fallback to basic filename="..." format if filename* not found
-            if (!filename) {
-              const filenameMatch = contentDisposition.match(/filename="?([^";\n]*)"?/i);
-              if (filenameMatch && filenameMatch[1]) {
-                filename = filenameMatch[1];
-              }
-            }
+      const streamResponse = await axios.get(
+          `${CONFIG.backendUrl}/api/v1/knowledgeBase/stream/record/${recordId}`,
+          {
+            responseType: 'blob',
+            params,
           }
+        );
 
-          if (!filename && fileName) {
-            filename = fileName;
-          }
+      if (!streamResponse) return;
 
+      let filename;
+      const contentDisposition = streamResponse.headers['content-disposition'];
+      if (contentDisposition) {
+        const filenameStarMatch = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+        if (filenameStarMatch && filenameStarMatch[1]) {
           try {
-            const jsonData = JSON.parse(text);
-            if (jsonData && jsonData.signedUrl) {
-              setPdfUrl(jsonData.signedUrl);
-            }
+            filename = decodeURIComponent(filenameStarMatch[1]);
           } catch (e) {
-            const bufferReader = new FileReader();
-            const arrayBufferPromise = new Promise<ArrayBuffer>((resolve) => {
-              bufferReader.onload = () => {
-                resolve(bufferReader.result as ArrayBuffer);
-              };
-              bufferReader.readAsArrayBuffer(downloadResponse.data);
-            });
-
-            const buffer = await arrayBufferPromise;
-            setFileBuffer(buffer);
+            console.error('Failed to decode UTF-8 filename', e);
           }
-        } catch (error) {
-          console.error('Error downloading document:', error);
-          setSnackbar({
-            open: true,
-            message: 'Failed to load preview. Redirecting to the original document shortly...',
-            severity: 'info',
-          });
-          let webUrl = record.fileRecord?.webUrl || record.mailRecord?.webUrl;
-
-          if (record.origin === 'UPLOAD' && webUrl && !webUrl.startsWith('http')) {
-            const baseUrl = `${window.location.protocol}//${window.location.host}`;
-            webUrl = baseUrl + webUrl;
-          }
-
-          setTimeout(() => {
-            onClosePdf();
-          }, 500);
-
-          setTimeout(() => {
-            if (webUrl) {
-              try {
-                window.open(webUrl, '_blank', 'noopener,noreferrer');
-              } catch (openError) {
-                console.error('Error opening new tab:', openError);
-                setSnackbar({
-                  open: true,
-                  message:
-                    'Failed to automatically open the document. Please check your browser pop-up settings.',
-                  severity: 'error',
-                });
-              }
-            } else {
-              console.error('Cannot redirect: No webUrl found for the record.');
-              setSnackbar({
-                open: true,
-                message: 'Failed to load preview and cannot redirect (document URL not found).',
-                severity: 'error',
-              });
-            }
-          }, 2500);
-          return;
         }
-      } else if (record.origin === ORIGIN.CONNECTOR) {
-        try {
-          let params = {};
-          if (['pptx', 'ppt'].includes(citationMeta?.extension)) {
-            params = {
-              convertTo: 'application/pdf',
-            };
-            handleLargePPTFile(record);
+
+        if (!filename) {
+          const filenameMatch = contentDisposition.match(/filename="?([^";\n]*)"?/i);
+          if (filenameMatch && filenameMatch[1]) {
+            filename = filenameMatch[1];
           }
-
-          const publicConnectorUrlResponse = await getConnectorPublicUrl();
-          let connectorResponse;
-          if (publicConnectorUrlResponse && publicConnectorUrlResponse.url) {
-            const CONNECTOR_URL = publicConnectorUrlResponse.url;
-            connectorResponse = await axios.get(
-              `${CONNECTOR_URL}/api/v1/stream/record/${recordId}`,
-              {
-                responseType: 'blob',
-                params,
-              }
-            );
-          } else {
-            connectorResponse = await axios.get(
-              `${CONFIG.backendUrl}/api/v1/knowledgeBase/stream/record/${recordId}`,
-              {
-                responseType: 'blob',
-                params,
-              }
-            );
-          }
-          if (!connectorResponse) return;
-
-          let filename;
-          const contentDisposition = connectorResponse.headers['content-disposition'];
-          if (contentDisposition) {
-            // First try to parse filename*=UTF-8'' format (RFC 5987) for Unicode support
-            const filenameStarMatch = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
-            if (filenameStarMatch && filenameStarMatch[1]) {
-              // Decode the percent-encoded UTF-8 filename
-              try {
-                filename = decodeURIComponent(filenameStarMatch[1]);
-              } catch (e) {
-                console.error('Failed to decode UTF-8 filename', e);
-              }
-            }
-
-            // Fallback to basic filename="..." format if filename* not found
-            if (!filename) {
-              const filenameMatch = contentDisposition.match(/filename="?([^";\n]*)"?/i);
-              if (filenameMatch && filenameMatch[1]) {
-                filename = filenameMatch[1];
-              }
-            }
-          }
-
-          if (!filename && record.recordName) {
-            filename = record.recordName;
-          }
-
-          const bufferReader = new FileReader();
-          const arrayBufferPromise = new Promise<ArrayBuffer>((resolve, reject) => {
-            bufferReader.onload = () => {
-              const originalBuffer = bufferReader.result as ArrayBuffer;
-              const bufferCopy = originalBuffer.slice(0);
-              resolve(bufferCopy);
-            };
-            bufferReader.onerror = () => {
-              reject(new Error('Failed to read blob as array buffer'));
-            };
-            bufferReader.readAsArrayBuffer(connectorResponse.data);
-          });
-
-          const buffer = await arrayBufferPromise;
-          setFileBuffer(buffer);
-        } catch (err) {
-          console.error('Error downloading document:', err);
-          setSnackbar({
-            open: true,
-            message: 'Failed to load preview. Redirecting to the original document shortly...',
-            severity: 'info',
-          });
-          let webUrl = record.fileRecord?.webUrl || record.mailRecord?.webUrl;
-
-          if (record.origin === 'UPLOAD' && webUrl && !webUrl.startsWith('http')) {
-            const baseUrl = `${window.location.protocol}//${window.location.host}`;
-            webUrl = baseUrl + webUrl;
-          }
-
-          setTimeout(() => {
-            onClosePdf();
-          }, 500);
-
-          setTimeout(() => {
-            if (webUrl) {
-              try {
-                window.open(webUrl, '_blank', 'noopener,noreferrer');
-              } catch (openError) {
-                console.error('Error opening new tab:', openError);
-                setSnackbar({
-                  open: true,
-                  message:
-                    'Failed to automatically open the document. Please check your browser pop-up settings.',
-                  severity: 'error',
-                });
-              }
-            } else {
-              console.error('Cannot redirect: No webUrl found for the record.');
-              setSnackbar({
-                open: true,
-                message: 'Failed to load preview and cannot redirect (document URL not found).',
-                severity: 'error',
-              });
-            }
-          }, 2500);
-          return;
         }
       }
-    } catch (err) {
+
+      if (!filename && record.recordName) {
+        filename = record.recordName;
+      }
+
+      const bufferReader = new FileReader();
+      const arrayBufferPromise = new Promise<ArrayBuffer>((resolve, reject) => {
+        bufferReader.onload = () => {
+          const originalBuffer = bufferReader.result as ArrayBuffer;
+          const bufferCopy = originalBuffer.slice(0);
+          resolve(bufferCopy);
+        };
+        bufferReader.onerror = () => {
+          reject(new Error('Failed to read blob as array buffer'));
+        };
+        bufferReader.readAsArrayBuffer(streamResponse.data);
+      });
+
+      const buffer = await arrayBufferPromise;
+      setFileBuffer(buffer);
+    } catch (err: any) {
       console.error('Failed to fetch document:', err);
+      const message = err?.message || 'Failed to load document. Please try again.';
+      setSnackbar({
+        open: true,
+        message,
+        severity: err?.statusCode === 503 ? 'warning' : 'error',
+      });
       setTimeout(() => {
         onClosePdf();
       }, 500);
@@ -1764,7 +1827,7 @@ const AgentChat = () => {
     setTransitioning(true);
     setDrawerOpen(false);
     setOpenPdfView(true);
-    const isExcelOrCSV = ['csv', 'xlsx', 'xls'].includes(citationMeta?.extension);
+    const isExcelOrCSV = ['csv', 'xlsx', 'xls', 'tsv'].includes(citationMeta?.extension);
     setIsDocx(['docx'].includes(citationMeta?.extension));
     setIsMarkdown(['mdx', 'md'].includes(citationMeta?.extension));
     setIsHtml(['html'].includes(citationMeta?.extension));
@@ -1913,7 +1976,6 @@ const AgentChat = () => {
         const token = localStorage.getItem('jwt_access_token');
         // Use refs to get the latest values (prevents stale closures)
         const currentModel = latestModelRef.current;
-        const currentMode = latestChatModeRef.current;
 
         const response = await fetch(
           `${CONFIG.backendUrl}/api/v1/agents/${agentKey}/conversations/${currentConversationId}/message/${messageId}/regenerate`,
@@ -1927,7 +1989,7 @@ const AgentChat = () => {
             body: JSON.stringify({
               modelName: currentModel?.modelName,
               modelProvider: currentModel?.provider,
-              chatMode: currentMode?.id || 'quick',
+              chatMode: latestChatModeRef.current || AUTO_CHAT_MODE,
             }),
             signal: controller.signal,
           }
@@ -2074,7 +2136,7 @@ const AgentChat = () => {
               position: 'relative',
             }}
           >
-            {/* Always show the chat messages area instead of welcome message */}
+            {/* Always show the chat messages area - start message will be shown via useEffect */}
             <MemoizedChatMessagesArea
               messages={currentMessages}
               isLoading={isCurrentConversationLoading}
@@ -2087,19 +2149,21 @@ const AgentChat = () => {
               isStatusVisible={currentConversationStatus.showStatus}
             />
             <AgentChatInput
-              key={`chat-input-${currentConversationId || 'new'}`}
+              key={`chat-input-${agentKey}`}
               onSubmit={handleSendMessage}
               isLoading={isCurrentConversationLoading}
-              disabled={isCurrentConversationLoading || isNavigationBlocked}
+              disabled={isCurrentConversationLoading}
               placeholder="Type your message..."
               selectedModel={selectedModel}
-              selectedChatMode={selectedChatMode}
               onModelChange={(model) => setSelectedModel(model)}
-              onChatModeChange={(mode) => setSelectedChatMode(mode)}
               availableModels={availableModels}
               availableKBs={availableKBs}
               agent={agent}
               activeConnectors={activeConnectors}
+              chatMode={chatMode}
+              onChatModeChange={setChatMode}
+              conversationId={currentConversationId}
+              clearInputTrigger={clearInputTrigger}
             />
           </Box>
 

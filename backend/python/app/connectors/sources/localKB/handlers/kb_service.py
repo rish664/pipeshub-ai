@@ -1,4 +1,3 @@
-import asyncio
 import uuid
 from typing import Dict, List, Optional, Union
 
@@ -6,22 +5,29 @@ from app.config.constants.arangodb import (
     CollectionNames,
     Connectors,
 )
-from app.connectors.services.base_arango_service import BaseArangoService
 from app.connectors.services.kafka_service import KafkaService
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
+read_collections = [
+    collection.value for collection in CollectionNames
+]
 
-class KnowledgeBaseService :
-    """ Data handler for knowledge base opertaions   """
+write_collections = [
+    collection.value for collection in CollectionNames
+]
+
+class KnowledgeBaseService:
+    """Data handler for knowledge base operations."""
 
     def __init__(
         self,
         logger,
-        arango_service : BaseArangoService,
+        graph_provider: IGraphDBProvider,
         kafka_service : KafkaService
     ) -> None:
         self.logger = logger
-        self.arango_service = arango_service
+        self.graph_provider = graph_provider
         self.kafka_service = kafka_service
 
 
@@ -36,7 +42,7 @@ class KnowledgeBaseService :
             self.logger.info(f"🚀 Creating KB '{name}' for user {user_id} in org {org_id}")
 
             # Step 1: Look up user
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
             if not user:
                 self.logger.warning(f"⚠️ User not found: {user_id}")
                 return {
@@ -45,20 +51,20 @@ class KnowledgeBaseService :
                     "reason": f"User not found for user_id: {user_id}"
                 }
 
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
             user_name = user.get('fullName') or f"{user.get('firstName', '')} {user.get('lastName', '')}".strip() or 'Unknown'
             self.logger.info(f"✅ Found user: {user_name} (key: {user_key})")
 
-            # Step 2: Generate data
             timestamp = get_epoch_timestamp_in_ms()
             kb_key = str(uuid.uuid4())
 
             self.logger.info(f"📋 Generated KB ID: {kb_key}")
 
             # Step 3: Create transaction
-            transaction = None
+            txn_id = None
             try:
-                transaction = self.arango_service.db.begin_transaction(
+                txn_id = await self.graph_provider.begin_transaction(
+                    read=[],
                     write=[
                         CollectionNames.RECORD_GROUPS.value,
                         CollectionNames.RECORDS.value,
@@ -66,7 +72,7 @@ class KnowledgeBaseService :
                         CollectionNames.IS_OF_TYPE.value,
                         CollectionNames.BELONGS_TO.value,
                         CollectionNames.PERMISSION.value,
-                    ]
+                    ],
                 )
                 self.logger.info("🔄 Transaction created")
             except Exception as tx_error:
@@ -77,21 +83,24 @@ class KnowledgeBaseService :
                     "reason": f"Transaction creation failed: {str(tx_error)}"
                 }
 
-
+            kb_connector_id = f"knowledgeBase_{org_id}"
             kb_data = {
-                "_key": kb_key,
+                "id": kb_key,
                 "createdBy": user_key,
                 "orgId": org_id,
                 "groupName": name,
                 "groupType": Connectors.KNOWLEDGE_BASE.value,
                 "connectorName": Connectors.KNOWLEDGE_BASE.value,
+                "connectorId": kb_connector_id,  # Link KB to the app
                 "createdAtTimestamp": timestamp,
                 "updatedAtTimestamp": timestamp,
             }
 
             permission_edge = {
-                "_from": f"{CollectionNames.USERS.value}/{user_key}",
-                "_to": f"{CollectionNames.RECORD_GROUPS.value}/{kb_key}",
+                "from_id": user_key,
+                "from_collection": CollectionNames.USERS.value,
+                "to_id": kb_key,
+                "to_collection": CollectionNames.RECORD_GROUPS.value,
                 "externalPermissionId": "",
                 "type": "USER",
                 "role": "OWNER",
@@ -100,22 +109,40 @@ class KnowledgeBaseService :
                 "lastUpdatedTimestampAtSource": timestamp,
             }
 
+            # Create belongs_to edge from record group to app
+            belongs_to_edge = {
+                "from_id": kb_key,
+                "from_collection": CollectionNames.RECORD_GROUPS.value,
+                "to_id": kb_connector_id,
+                "to_collection": CollectionNames.APPS.value,
+                "entityType": Connectors.KNOWLEDGE_BASE.value,
+                "createdAtTimestamp": timestamp,
+                "updatedAtTimestamp": timestamp,
+            }
 
             # Step 5: Execute database operations
             self.logger.info("💾 Executing database operations...")
-            result = await self.arango_service.create_knowledge_base(
-                kb_data=kb_data,
-                # root_folder_data=root_folder_data,
-                permission_edge=permission_edge,
-                # folder_edge=folder_edge,
-                transaction=transaction
+            await self.graph_provider.batch_upsert_nodes(
+                [kb_data],
+                CollectionNames.RECORD_GROUPS.value,
+                transaction=txn_id,
             )
+            await self.graph_provider.batch_create_edges(
+                [permission_edge],
+                CollectionNames.PERMISSION.value,
+                transaction=txn_id,
+            )
+            await self.graph_provider.batch_create_edges(
+                [belongs_to_edge],
+                CollectionNames.BELONGS_TO.value,
+                transaction=txn_id,
+            )
+            await self.graph_provider.commit_transaction(txn_id)
 
-            await asyncio.to_thread(lambda: transaction.commit_transaction())
-
+            result = {"success": True}
             if result and result.get("success"):
                 response = {
-                    "id": kb_data["_key"],
+                    "id": kb_data["id"],
                     "name": kb_data["groupName"],
                     "createdAtTimestamp": kb_data["createdAtTimestamp"],
                     "updatedAtTimestamp": kb_data["updatedAtTimestamp"],
@@ -135,14 +162,11 @@ class KnowledgeBaseService :
 
         except Exception as e:
             self.logger.error(f"❌ KB creation failed for '{name}': {str(e)}")
-            self.logger.error(f"❌ Error type: {type(e).__name__}")
-            if hasattr(transaction, 'abort_transaction'):
-                    await asyncio.to_thread(lambda: transaction.abort_transaction())
-
-            # Only log full traceback for unexpected errors (not business logic errors)
-            if not isinstance(e, (ValueError, KeyError)):
-                import traceback
-                self.logger.error(f"❌ Traceback: {traceback.format_exc()}")
+            if txn_id is not None:
+                try:
+                    await self.graph_provider.rollback_transaction(txn_id)
+                except Exception as rb_err:
+                    self.logger.warning(f"Rollback failed: {rb_err}")
 
             return {
                 "success": False,
@@ -159,7 +183,7 @@ class KnowledgeBaseService :
         try:
             self.logger.info(f"Getting knowledge base {kb_id} for user {user_id}")
             self.logger.info(f"🔍 Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -168,9 +192,9 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
             # validates permissions and gets kb for the user
-            user_role = await self.arango_service.get_user_kb_permission(
+            user_role = await self.graph_provider.get_user_kb_permission(
                 kb_id=kb_id,
                 user_id=user_key
             )
@@ -183,7 +207,7 @@ class KnowledgeBaseService :
                 }
                 return response
 
-            result = await self.arango_service.get_knowledge_base(
+            result = await self.graph_provider.get_knowledge_base(
                 kb_id = kb_id,
                 user_id = user_key
             )
@@ -223,7 +247,7 @@ class KnowledgeBaseService :
             self.logger.info(f" Listing knowledge bases for user {user_id}")
 
             self.logger.info(f"Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -232,7 +256,7 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
 
             # Calculate pagination
             skip = (page - 1) * limit
@@ -244,7 +268,7 @@ class KnowledgeBaseService :
             if sort_order.lower() not in ["asc", "desc"]:
                 sort_order = "asc"
 
-            kbs, total_count, available_filters = await self.arango_service.list_user_knowledge_bases(
+            kbs, total_count, available_filters = await self.graph_provider.list_user_knowledge_bases(
                 user_id=user_key,
                 org_id=org_id,
                 skip=skip,
@@ -312,7 +336,7 @@ class KnowledgeBaseService :
             timestamp = get_epoch_timestamp_in_ms()
             # Check user permissions
             self.logger.info(f"🔍 Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -321,9 +345,9 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
 
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
             if user_role not in ["OWNER", "WRITER","ORGANIZER","FILEORGANIZER"]:
                 self.logger.warning(f"⚠️ User {user_id} lacks permission to update KB {kb_id}")
                 response = {
@@ -334,7 +358,7 @@ class KnowledgeBaseService :
                 return response
             updates["updatedAtTimestamp"] = timestamp
             # Update in database
-            result = await self.arango_service.update_knowledge_base(
+            result = await self.graph_provider.update_knowledge_base(
                 kb_id=kb_id,
                 updates=updates
             )
@@ -371,7 +395,7 @@ class KnowledgeBaseService :
         try:
             self.logger.info(f"🚀 Deleting knowledge base {kb_id}")
             self.logger.info(f"🔍 Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -380,12 +404,12 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
             user_name = user.get('fullName') or f"{user.get('firstName', '')} {user.get('lastName', '')}".strip() or 'Unknown'
             self.logger.info(f"✅ Found user: {user_name} (key: {user_key})")
 
             # Check user permissions
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
             if user_role != "OWNER":
                 self.logger.warning(f"⚠️ User {user_name} lacks permission to delete KB {kb_id}")
                 return {
@@ -397,16 +421,17 @@ class KnowledgeBaseService :
             self.logger.info(f"🔐 User {user_name} has OWNER permission - proceeding with deletion")
 
             # Delete in database with transaction
-            result = await self.arango_service.delete_knowledge_base(
+            result = await self.graph_provider.delete_knowledge_base(
                 kb_id=kb_id
            )
 
-            if result:
+            if result and result.get("success"):
                 self.logger.info(f"✅ Knowledge base {kb_id} deleted successfully by {user_name}")
                 return {
                     "success": True,
                     "reason": "Knowledge base and all contents deleted successfully",
-                    "code": 200
+                    "code": 200,
+                    "eventData": result.get("eventData")
                 }
             else:
                 self.logger.warning(f"⚠️ Failed to delete knowledge base {kb_id}")
@@ -443,12 +468,12 @@ class KnowledgeBaseService :
             self.logger.info(f"🚀 Creating folder '{name}' in KB {kb_id} root")
 
             # Validate user and permissions
-            validation_result = await self.arango_service._validate_folder_creation(kb_id, user_id)
+            validation_result = await self.graph_provider._validate_folder_creation(kb_id, user_id)
             if not validation_result["valid"]:
                 return validation_result
 
             # Check for name conflicts in KB root
-            existing_folder = await self.arango_service.find_folder_by_name_in_parent(
+            existing_folder = await self.graph_provider.find_folder_by_name_in_parent(
                 kb_id=kb_id,
                 folder_name=name,
                 parent_folder_id=None,  # KB root
@@ -462,7 +487,7 @@ class KnowledgeBaseService :
                 }
 
             # Create folder using unified method
-            result = await self.arango_service.create_folder(
+            result = await self.graph_provider.create_folder(
                 kb_id=kb_id,
                 folder_name=name,
                 org_id=org_id,
@@ -491,12 +516,12 @@ class KnowledgeBaseService :
             self.logger.info(f"🚀 Creating nested folder '{name}' in folder {parent_folder_id}")
 
             # Validate user and permissions
-            validation_result = await self.arango_service._validate_folder_creation(kb_id, user_id)
+            validation_result = await self.graph_provider._validate_folder_creation(kb_id, user_id)
             if not validation_result["valid"]:
                 return validation_result
 
             # Additional validation for parent folder
-            folder_valid = await self.arango_service.validate_folder_exists_in_kb(kb_id, parent_folder_id)
+            folder_valid = await self.graph_provider.validate_folder_exists_in_kb(kb_id, parent_folder_id)
             if not folder_valid:
                 return {
                     "success": False,
@@ -505,7 +530,7 @@ class KnowledgeBaseService :
                 }
 
             # Check for name conflicts in KB root
-            existing_folder = await self.arango_service.find_folder_by_name_in_parent(
+            existing_folder = await self.graph_provider.find_folder_by_name_in_parent(
                 kb_id=kb_id,
                 folder_name=name,
                 parent_folder_id=parent_folder_id,
@@ -519,7 +544,7 @@ class KnowledgeBaseService :
                 }
 
             # Create folder using unified method
-            result = await self.arango_service.create_folder(
+            result = await self.graph_provider.create_folder(
                 kb_id=kb_id,
                 folder_name=name,
                 org_id=org_id,
@@ -545,7 +570,7 @@ class KnowledgeBaseService :
         try:
             self.logger.info(f"🔍 Getting contents of folder {folder_id} in KB {kb_id}")
             self.logger.info(f"Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -554,9 +579,9 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
             # Check user permissions
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
             if not user_role:
                 self.logger.warning(f"⚠️ User {user_key} lacks access to KB {kb_id}")
                 response = {
@@ -567,7 +592,7 @@ class KnowledgeBaseService :
                 return response
 
             # Get folder contents
-            result = await self.arango_service.get_folder_contents(
+            result = await self.graph_provider.get_folder_contents(
                 kb_id=kb_id,
                 folder_id=folder_id,
             )
@@ -602,7 +627,7 @@ class KnowledgeBaseService :
             self.logger.info(f"🚀 Updating folder {folder_id} in KB {kb_id}")
             # timestamp = get_epoch_timestamp_in_ms()
             self.logger.info(f"Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -611,9 +636,9 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
             # Check user permissions
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
             if user_role not in ["OWNER", "WRITER"]:
                 self.logger.warning(f"⚠️ User {user_key} lacks permission to update folder in KB {kb_id}")
                 response = {
@@ -624,7 +649,7 @@ class KnowledgeBaseService :
                 return response
 
              # Validate that folder exists and belongs to the KB
-            folder_exists = await self.arango_service.validate_folder_in_kb(kb_id, folder_id)
+            folder_exists = await self.graph_provider.validate_folder_in_kb(kb_id, folder_id)
             if not folder_exists:
                 self.logger.warning(f"⚠️ Folder {folder_id} not found in KB {kb_id}")
                 return {
@@ -639,7 +664,7 @@ class KnowledgeBaseService :
             }
 
             # Check for name conflicts in KB root
-            existing_folder = await self.arango_service.find_folder_by_name_in_parent(
+            existing_folder = await self.graph_provider.find_folder_by_name_in_parent(
                 kb_id=kb_id,
                 folder_name=name,
                 parent_folder_id=None,  # KB root
@@ -654,7 +679,7 @@ class KnowledgeBaseService :
 
 
             # Update in database
-            result = await self.arango_service.update_folder(
+            result = await self.graph_provider.update_folder(
                 folder_id=folder_id,
                 updates=updates
             )
@@ -691,7 +716,7 @@ class KnowledgeBaseService :
         try:
             self.logger.info(f" Deleting folder {folder_id} in  knowledge base {kb_id}")
             self.logger.info(f"Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -700,19 +725,19 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
 
             # Check user permissions
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
             if user_role != "OWNER":
-                self.logger.warning(f"⚠️ User {user_key} lacks permission to add records in KB {kb_id}")
+                self.logger.warning(f"⚠️ User {user_key} lacks permission to delete folder in KB {kb_id}")
                 return {
                     "success": False,
-                    "reason": "User lacks permission to add records",
+                    "reason": "User lacks permission to delete folder",
                     "code": "403"
                 }
             # Validate that folder exists and belongs to the KB
-            folder_exists = await self.arango_service.validate_folder_in_kb(kb_id, folder_id)
+            folder_exists = await self.graph_provider.validate_folder_in_kb(kb_id, folder_id)
             if not folder_exists:
                 self.logger.warning(f"⚠️ Folder {folder_id} not found in KB {kb_id}")
                 return {
@@ -722,17 +747,18 @@ class KnowledgeBaseService :
                 }
 
             # Delete in database
-            result = await self.arango_service.delete_folder(
+            result = await self.graph_provider.delete_folder(
                 kb_id=kb_id,
                 folder_id=folder_id
             )
 
-            if result:
+            if result and result.get("success"):
                 self.logger.info(f"🎉 Folder {folder_id} and ALL contents deleted successfully by {user_id}")
                 return {
                     "success": True,
                     "reason": "Folder and all contents deleted successfully",
                     "code": 200,
+                    "eventData": result.get("eventData")  # Pass eventData to router
                 }
             else:
                 self.logger.warning("⚠️ Failed to delete folder")
@@ -758,13 +784,40 @@ class KnowledgeBaseService :
         file_metadata: Optional[Dict] = None,
     ) -> Optional[Dict]:
         """
-        Update a record directly in KB root (not in any folder)
+        Update a record directly in KB root (not in any folder).
+        Only OWNER, WRITER, and FILEORGANIZER can update; READER and COMMENTER cannot.
         """
         try:
             self.logger.info(f"🚀 Updating record {record_id}")
 
+            # Resolve KB context and check edit permission (OWNER/WRITER/FILEORGANIZER only)
+            kb_context = await self.graph_provider._get_kb_context_for_record(record_id)
+            if not kb_context:
+                return {
+                    "success": False,
+                    "code": 404,
+                    "reason": "Knowledge base context not found for record",
+                }
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
+            if not user:
+                return {
+                    "success": False,
+                    "code": 404,
+                    "reason": f"User not found for user_id: {user_id}",
+                }
+            user_key = user.get("id") or user.get("_key")
+            user_role = await self.graph_provider.get_user_kb_permission(
+                kb_context.get("kb_id"), user_key
+            )
+            if user_role not in ["OWNER", "WRITER", "FILEORGANIZER"]:
+                return {
+                    "success": False,
+                    "code": 403,
+                    "reason": "User lacks permission to edit records",
+                }
+
             # Call update method
-            result = await self.arango_service.update_record(
+            result = await self.graph_provider.update_record(
                 record_id=record_id,
                 user_id=user_id,
                 updates=updates,
@@ -801,7 +854,7 @@ class KnowledgeBaseService :
             self.logger.info(f"🚀 Bulk deleting {len(record_ids)} records from KB {kb_id} root")
 
             # Step 1: Validate user and permissions
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
             if not user:
                 return {
                     "success": False,
@@ -809,8 +862,8 @@ class KnowledgeBaseService :
                     "reason": f"User not found for user_id: {user_id}"
                 }
 
-            user_key = user.get('_key')
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_key = user.get('id') or user.get('_key')
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
 
             if user_role not in ["OWNER", "WRITER", "FILEORGANIZER"]:
                 return {
@@ -820,7 +873,7 @@ class KnowledgeBaseService :
                 }
 
             # Step 2: Call bulk deletion method (folder_id=None for KB root)
-            result = await self.arango_service.delete_records(
+            result = await self.graph_provider.delete_records(
                 record_ids=record_ids,
                 kb_id=kb_id,
                 folder_id=None  # KB root records
@@ -857,7 +910,7 @@ class KnowledgeBaseService :
             self.logger.info(f"🚀 Bulk deleting {len(record_ids)} records from folder {folder_id} in KB {kb_id}")
 
             # Step 1: Validate user and permissions
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
             if not user:
                 return {
                     "success": False,
@@ -865,8 +918,8 @@ class KnowledgeBaseService :
                     "reason": f"User not found for user_id: {user_id}"
                 }
 
-            user_key = user.get('_key')
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_key = user.get('id') or user.get('_key')
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
 
             if user_role not in ["OWNER", "WRITER", "FILEORGANIZER"]:
                 return {
@@ -876,7 +929,7 @@ class KnowledgeBaseService :
                 }
 
             # Step 2: Validate folder exists in KB
-            folder_exists = await self.arango_service.validate_folder_exists_in_kb(kb_id, folder_id)
+            folder_exists = await self.graph_provider.validate_folder_exists_in_kb(kb_id, folder_id)
             if not folder_exists:
                 return {
                     "success": False,
@@ -885,7 +938,7 @@ class KnowledgeBaseService :
                 }
 
         # Step 3 Call bulk deletion method (folder_id=None for KB root)
-            result = await self.arango_service.delete_records(
+            result = await self.graph_provider.delete_records(
                 record_ids=record_ids,
                 kb_id=kb_id,
                 folder_id=folder_id
@@ -935,7 +988,7 @@ class KnowledgeBaseService :
 
             # Step 2: Single AQL query to do everything at once
             # Pass role even if only teams (it will be ignored for teams)
-            result = await self.arango_service.create_kb_permissions(
+            result = await self.graph_provider.create_kb_permissions(
                 kb_id=kb_id,
                 requester_id=requester_id,
                 user_ids=unique_users,
@@ -984,7 +1037,7 @@ class KnowledgeBaseService :
                 }
 
             self.logger.info(f"Looking up requester by requester: {requester_id}")
-            requester = await self.arango_service.get_user_by_user_id(user_id=requester_id)
+            requester = await self.graph_provider.get_user_by_user_id(user_id=requester_id)
 
             if not requester:
                 self.logger.warning(f"⚠️ User not found for user_id: {requester_id}")
@@ -993,10 +1046,10 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {requester_id}"
                 }
-            requester_key = requester.get('_key')
+            requester_key = requester.get('id') or requester.get('_key')
 
             # Validate requester has permission to update permissions
-            requester_role = await self.arango_service.get_user_kb_permission(kb_id, requester_key)
+            requester_role = await self.graph_provider.get_user_kb_permission(kb_id, requester_key)
             if requester_role not in ["OWNER"]:
                 return {
                     "success": False,
@@ -1014,11 +1067,14 @@ class KnowledgeBaseService :
                 }
 
             # Get current permissions for all users and teams in a single batch query
-            current_permissions = await self.arango_service.get_kb_permissions(
+            current_permissions = await self.graph_provider.get_kb_permissions(
                 kb_id=kb_id,
                 user_ids=user_ids,
                 team_ids=team_ids
             )
+
+            # Get owner count for the KB
+            total_owner_count = await self.graph_provider.count_kb_owners(kb_id=kb_id)
 
             # Filter out users/teams that don't have permissions (skip them instead of erroring)
             valid_user_ids = []
@@ -1051,8 +1107,43 @@ class KnowledgeBaseService :
                     "skipped_teams": skipped_teams
                 }
 
+            owners_being_updated = []
+
+            for user_id in valid_user_ids:
+                current_role = current_permissions["users"].get(user_id)
+                if current_role == "OWNER":
+                    owners_being_updated.append(user_id)
+
+            # Bulk Operation Prevention: Cannot perform bulk operations on Owner permissions
+            if len(valid_user_ids) > 1 and owners_being_updated:
+                # Check if this is a bulk promotion to OWNER (all non-Owners being promoted)
+                if new_role == "OWNER" and len(owners_being_updated) == 0:
+                    # Bulk promotion to OWNER is allowed but should be logged
+                    self.logger.info(f"⚠️ Bulk promotion of {len(valid_user_ids)} users to OWNER role on KB {kb_id}")
+                else:
+                    # Mixed operation or bulk update of existing Owners - reject
+                    return {
+                        "success": False,
+                        "reason": "Cannot perform bulk operations on Owner permissions. Please update Owners one at a time.",
+                        "code": "400"
+                    }
+
+            # Single Owner Update Validation
+            if len(owners_being_updated) == 1 and len(valid_user_ids) == 1:
+                owner_user_id = owners_being_updated[0]
+                if new_role != "OWNER":
+                    # Owner is being downgraded - check minimum requirement using already fetched count
+                    if total_owner_count <= 1:
+                        return {
+                            "success": False,
+                            "reason": "Cannot remove all owners from the knowledge base. At least one owner must remain.",
+                            "code": "400"
+                        }
+                    self.logger.info(f"⚠️ Downgrading Owner {owner_user_id} to {new_role} on KB {kb_id} (remaining owners: {total_owner_count - 1})")
+                # If new_role == "OWNER", it's a no-op (no change), which is fine
+
             # Update permissions using batch update method for valid entities only
-            result = await self.arango_service.update_kb_permission(
+            result = await self.graph_provider.update_kb_permission(
                 kb_id=kb_id,
                 requester_id=requester_key,
                 user_ids=valid_user_ids,
@@ -1108,7 +1199,7 @@ class KnowledgeBaseService :
                 }
 
             self.logger.info(f"Looking up requester by requester: {requester_id}")
-            requester = await self.arango_service.get_user_by_user_id(user_id=requester_id)
+            requester = await self.graph_provider.get_user_by_user_id(user_id=requester_id)
 
             if not requester:
                 self.logger.warning(f"⚠️ User not found for user_id: {requester_id}")
@@ -1117,10 +1208,10 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {requester_id}"
                 }
-            requester_key = requester.get('_key')
+            requester_key = requester.get('id') or requester.get('_key')
 
             # Validate requester has permission to remove permissions
-            requester_role = await self.arango_service.get_user_kb_permission(kb_id, requester_key)
+            requester_role = await self.graph_provider.get_user_kb_permission(kb_id, requester_key)
             if requester_role not in ["OWNER"]:
                 return {
                     "success": False,
@@ -1129,7 +1220,7 @@ class KnowledgeBaseService :
                 }
 
             # Get current permissions for all users and teams in a single batch query
-            current_permissions = await self.arango_service.get_kb_permissions(
+            current_permissions = await self.graph_provider.get_kb_permissions(
                 kb_id=kb_id,
                 user_ids=user_ids,
                 team_ids=team_ids
@@ -1174,7 +1265,7 @@ class KnowledgeBaseService :
             # Check for owner removal restrictions
             if owner_users_to_remove:
                 # Count total owners in the KB
-                owner_count = await self.arango_service.count_kb_owners(kb_id)
+                owner_count = await self.graph_provider.count_kb_owners(kb_id)
                 if owner_count <= len(owner_users_to_remove):
                     return {
                         "success": False,
@@ -1184,7 +1275,7 @@ class KnowledgeBaseService :
                     }
 
             # Remove permissions using batch remove method for valid entities only
-            result = await self.arango_service.remove_kb_permission(
+            result = await self.graph_provider.remove_kb_permission(
                 kb_id=kb_id,
                 user_ids=valid_user_ids,
                 team_ids=valid_team_ids
@@ -1228,7 +1319,7 @@ class KnowledgeBaseService :
         try:
             self.logger.info(f"🔍 Listing permissions for KB {kb_id}")
             self.logger.info(f"Looking up requester by requester: {requester_id}")
-            requester = await self.arango_service.get_user_by_user_id(user_id=requester_id)
+            requester = await self.graph_provider.get_user_by_user_id(user_id=requester_id)
 
             if not requester:
                 self.logger.warning(f"⚠️ User not found for user_id: {requester_id}")
@@ -1237,10 +1328,10 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {requester_id}"
                 }
-            requester_key = requester.get('_key')
+            requester_key = requester.get('id') or requester.get('_key')
 
             # Validate requester has access to the KB
-            requester_role = await self.arango_service.get_user_kb_permission(kb_id, requester_key)
+            requester_role = await self.graph_provider.get_user_kb_permission(kb_id, requester_key)
             if not requester_role:
                 return {
                     "success": False,
@@ -1249,7 +1340,7 @@ class KnowledgeBaseService :
                 }
 
             # Get all permissions
-            permissions = await self.arango_service.list_kb_permissions(kb_id)
+            permissions = await self.graph_provider.list_kb_permissions(kb_id)
 
             self.logger.info(f"✅ Found {len(permissions)} permissions for KB {kb_id}")
             return {
@@ -1290,7 +1381,7 @@ class KnowledgeBaseService :
         """
         try:
             self.logger.info(f"Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -1299,7 +1390,7 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
 
             skip = (page - 1) * limit
             sort_order = sort_order.lower() if sort_order.lower() in ["asc", "desc"] else "desc"
@@ -1307,7 +1398,7 @@ class KnowledgeBaseService :
                 "recordName", "createdAtTimestamp", "updatedAtTimestamp", "recordType", "origin", "indexingStatus"
             ] else "createdAtTimestamp"
 
-            records, total_count, available_filters = await self.arango_service.list_all_records(
+            records, total_count, available_filters = await self.graph_provider.list_all_records(
                 user_id=user_key,
                 org_id=org_id,
                 skip=skip,
@@ -1383,7 +1474,7 @@ class KnowledgeBaseService :
         """
         try:
             self.logger.info(f"Looking up user by user_id: {user_id}")
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
 
             if not user:
                 self.logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -1392,7 +1483,7 @@ class KnowledgeBaseService :
                     "code": 404,
                     "reason": f"User not found for user_id: {user_id}"
                 }
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
 
             skip = (page - 1) * limit
             sort_order = sort_order.lower() if sort_order.lower() in ["asc", "desc"] else "desc"
@@ -1400,7 +1491,7 @@ class KnowledgeBaseService :
                 "recordName", "createdAtTimestamp", "updatedAtTimestamp", "recordType", "origin", "indexingStatus"
             ] else "createdAtTimestamp"
 
-            records, total_count, available_filters = await self.arango_service.list_kb_records(
+            records, total_count, available_filters = await self.graph_provider.list_kb_records(
                 kb_id=kb_id,
                 user_id=user_key,
                 org_id=org_id,
@@ -1474,14 +1565,14 @@ class KnowledgeBaseService :
             self.logger.info(f"🔍 Getting KB {kb_id} children with pagination (page {page}, limit {limit})")
 
             # Validate user
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
             if not user:
                 return self._error_response(404, f"User not found: {user_id}")
 
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
 
             # Check user permissions
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
             if not user_role:
                 return self._error_response(403, "User has no permission for KnowledgeBase")
 
@@ -1497,7 +1588,7 @@ class KnowledgeBaseService :
                 sort_order = "asc"
 
             # Get paginated contents
-            result = await self.arango_service.get_kb_children(
+            result = await self.graph_provider.get_kb_children(
                 kb_id=kb_id,
                 skip=skip,
                 limit=limit,
@@ -1582,14 +1673,14 @@ class KnowledgeBaseService :
             self.logger.info(f"🔍 Getting folder {folder_id} children with pagination (page {page}, limit {limit})")
 
             # Validate user
-            user = await self.arango_service.get_user_by_user_id(user_id=user_id)
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
             if not user:
                 return self._error_response(404, f"User not found: {user_id}")
 
-            user_key = user.get('_key')
+            user_key = user.get('id') or user.get('_key')
 
             # Check user permissions
-            user_role = await self.arango_service.get_user_kb_permission(kb_id, user_key)
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
             if not user_role:
                 return self._error_response(403, "User has no permission for KnowledgeBase")
 
@@ -1605,7 +1696,7 @@ class KnowledgeBaseService :
                 sort_order = "asc"
 
             # Get paginated contents
-            result = await self.arango_service.get_folder_children(
+            result = await self.graph_provider.get_folder_children(
                 kb_id=kb_id,
                 folder_id=folder_id,
                 skip=skip,
@@ -1662,7 +1753,7 @@ class KnowledgeBaseService :
             }
 
             # # Add breadcrumb navigation
-            # result["breadcrumbs"] = await self.arango_service.get_breadcrumb_path(
+            # result["breadcrumbs"] = await self.graph_provider.get_breadcrumb_path(
             #     kb_id=kb_id,
             #     folder_id=folder_id
             # )
@@ -1685,8 +1776,181 @@ class KnowledgeBaseService :
     # Convenience methods that call the unified method
     async def upload_records_to_kb(self, kb_id: str, user_id: str, org_id: str, files: List[Dict]) -> Dict:
         """Upload to KB root"""
-        return await self.arango_service.upload_records(kb_id, user_id, org_id, files, parent_folder_id=None)
+        return await self.graph_provider.upload_records(kb_id, user_id, org_id, files, parent_folder_id=None)
 
     async def upload_records_to_folder(self, kb_id: str, folder_id: str, user_id: str, org_id: str, files: List[Dict]) -> Dict:
         """Upload to specific folder"""
-        return await self.arango_service.upload_records(kb_id, user_id, org_id, files, parent_folder_id=folder_id)
+        return await self.graph_provider.upload_records(kb_id, user_id, org_id, files, parent_folder_id=folder_id)
+
+    async def move_record(
+        self,
+        kb_id: str,
+        record_id: str,
+        new_parent_id: Optional[str],
+        user_id: str,
+    ) -> Dict:
+        """
+        Move a record (file or folder) to a new location within the same KB.
+
+        Args:
+            kb_id:          The knowledge base ID.
+            record_id:      The record to move (_key in RECORDS collection).
+            new_parent_id:  Target folder ID, or None to move to KB root.
+            user_id:        The requesting user's external userId.
+
+        Returns:
+            Dict with success/failure details.
+        """
+        # Normalise: treat empty string the same as None (= move to KB root)
+        new_parent_id = new_parent_id or None
+        txn_id: Optional[str] = None
+
+        try:
+            destination = "KB root" if new_parent_id is None else f"folder {new_parent_id}"
+            self.logger.info(f"🚀 Moving record {record_id} → {destination} in KB {kb_id}")
+
+            # ── 1. Resolve user ──────────────────────────────────────────────
+            user = await self.graph_provider.get_user_by_user_id(user_id=user_id)
+            if not user:
+                return {"success": False, "code": 404, "reason": f"User not found: {user_id}"}
+            user_key = user.get("id") or user.get("_key")
+
+            # ── 2. Permission check ──────────────────────────────────────────
+            user_role = await self.graph_provider.get_user_kb_permission(kb_id, user_key)
+            if user_role not in ["OWNER", "WRITER"]:
+                return {
+                    "success": False,
+                    "code": 403,
+                    "reason": f"Insufficient permissions to move records. Role: {user_role}",
+                }
+
+            self.logger.info(f"User role: {user_role}")
+
+            # ── 3. Verify record belongs to this KB ──────────────────────────
+            kb_context = await self.graph_provider._get_kb_context_for_record(record_id)
+            if not kb_context or kb_context.get("kb_id") != kb_id:
+                return {
+                    "success": False,
+                    "code": 404,
+                    "reason": f"Record {record_id} not found in KB {kb_id}",
+                }
+            self.logger.info(f"KB context: {kb_context}")
+
+            # ── 4. Get current parent via RECORD_RELATIONS ───────────────────
+            parent_info = await self.graph_provider.get_record_parent_info(record_id)
+            self.logger.info(f"Parent info: {parent_info}")
+            # parent_info = {"parentId": str, "parentType": "record"|"recordGroup", "edgeKey": str} | None
+            # None  →  record is already at KB root (no PARENT_CHILD edge exists)
+            current_parent_id = parent_info.get("id") if parent_info else ""
+            self.logger.info(f"Current parent id: {current_parent_id}")
+            self.logger.info(
+                f"📍 Record {record_id} current parent: {current_parent_id or 'KB root'}"
+            )
+
+            # ── 5. No-op check ───────────────────────────────────────────────
+            if new_parent_id == current_parent_id:
+                self.logger.info(f"↩️  Record {record_id} already at {destination}, skipping")
+                return {
+                    "success": True,
+                    "message": "Record is already in the requested location",
+                    "recordId": record_id,
+                    "newParentId": new_parent_id,
+                }
+
+            # ── 6. Validate target folder (if not moving to root) ────────────
+            if new_parent_id is not None:
+                folder_valid = await self.graph_provider.validate_folder_in_kb(kb_id, new_parent_id)
+                if not folder_valid:
+                    return {
+                        "success": False,
+                        "code": 404,
+                        "reason": f"Target folder {new_parent_id} not found in KB {kb_id}",
+                    }
+
+                # Circular-reference guard (only relevant when moving a folder)
+                if new_parent_id == record_id:
+                    return {"success": False, "code": 400, "reason": "Cannot move a folder into itself"}
+
+                record_is_folder = await self.graph_provider.is_record_folder(record_id)
+                if record_is_folder:
+                    is_circular = await self.graph_provider.is_record_descendant_of(
+                        record_id=new_parent_id,
+                        ancestor_id=record_id,
+                    )
+                    if is_circular:
+                        return {
+                            "success": False,
+                            "code": 400,
+                            "reason": "Cannot move a folder into one of its own sub-folders (circular reference)",
+                        }
+
+            # ── 7. Transactional graph update ────────────────────────────────
+            txn_id = await self.graph_provider.begin_transaction(
+                read=[],
+                write=[
+                    CollectionNames.RECORDS.value,
+                    CollectionNames.RECORD_RELATIONS.value,
+                ],
+            )
+
+            # 7a. Delete existing PARENT_CHILD edge (only if there is one)
+            if parent_info is not None:
+                deleted = await self.graph_provider.delete_parent_child_edge_to_record(
+                    record_id=record_id,
+                    transaction=txn_id,
+                )
+                if not deleted:
+                    raise RuntimeError(
+                        f"Failed to delete PARENT_CHILD edge for record {record_id} "
+                        f"(current parent: {current_parent_id})"
+                    )
+                self.logger.info(f"🔗 Removed PARENT_CHILD edge from {current_parent_id} → {record_id}")
+
+            # 7b. Create new PARENT_CHILD edge (skip when moving to KB root)
+            if new_parent_id is not None:
+                created = await self.graph_provider.create_parent_child_edge(
+                    parent_id=new_parent_id,
+                    child_id=record_id,
+                    transaction=txn_id,
+                )
+                if not created:
+                    raise RuntimeError(
+                        f"Failed to create PARENT_CHILD edge from folder {new_parent_id} → record {record_id}"
+                    )
+                self.logger.info(f"🔗 Created PARENT_CHILD edge {new_parent_id} → {record_id}")
+
+            # 7c. Update externalParentId on the record document
+            updated = await self.graph_provider.update_record_external_parent_id(
+                record_id=record_id,
+                new_parent_id=new_parent_id,  # None clears it for KB root
+                transaction=txn_id,
+            )
+            if not updated:
+                raise RuntimeError(f"Failed to update externalParentId for record {record_id}")
+            self.logger.info(f"📝 Updated externalParentId → {new_parent_id!r}")
+
+            await self.graph_provider.commit_transaction(txn_id)
+            txn_id = None  # mark committed so rollback is skipped
+
+            self.logger.info(f"✅ Record {record_id} moved → {destination}")
+            return {
+                "success": True,
+                "recordId": record_id,
+                "kbId": kb_id,
+                "newParentId": new_parent_id,
+                "previousParentId": current_parent_id,
+            }
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ move_record failed: record={record_id} target={new_parent_id!r} "
+                f"kb={kb_id} — {str(e)}",
+                exc_info=True,
+            )
+            if txn_id is not None:
+                try:
+                    await self.graph_provider.rollback_transaction(txn_id)
+                    self.logger.info("🔄 Transaction rolled back")
+                except Exception as rb_err:
+                    self.logger.warning(f"Rollback failed: {rb_err}")
+            return {"success": False, "code": 500, "reason": str(e)}

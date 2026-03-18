@@ -62,9 +62,10 @@ export interface AggregatedDocument {
 
 export namespace PipesHub {
   export interface Record {
-    _key: string;
-    _id: string;
-    _rev: string;
+    _key?: string;
+    _id?: string;
+    _rev?: string;
+    id: string;
     orgId: string;
     recordName: string;
     externalRecordId: string;
@@ -121,6 +122,7 @@ export interface KnowledgeSearchProps {
   onSearchQueryChange: (query: string) => void;
   onTopKChange: (callback: (prevTopK: number) => number) => void;
   onViewCitations: (recordId: string, extension: string, recordCitation?: SearchResult) => Promise<void>;
+  onManualSearch: () => void;
   recordsMap: Record<string, PipesHub.Record>;
   allConnectors: any[];
 }

@@ -55,6 +55,7 @@ from app.connectors.core.registry.connector_builder import (
     ConnectorBuilder,
     ConnectorScope,
     DocumentationLink,
+    SyncStrategy,
 )
 from app.connectors.core.registry.filters import (
     FilterCategory,
@@ -80,7 +81,6 @@ from app.models.entities import (
     AppUser,
     AppUserGroup,
     FileRecord,
-    IndexingStatus,
     Record,
     RecordGroup,
     RecordGroupType,
@@ -132,6 +132,134 @@ class SiteMetadata:
     parent_site_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+class MicrosoftRegion(str, Enum):
+    """Microsoft 365 Multi-Geo region codes for Search API."""
+
+    APC = "APC"  # Asia Pacific (Singapore, Malaysia, Hong Kong)
+    AUS = "AUS"  # Australia
+    AUT = "AUT"  # Austria
+    BRA = "BRA"  # Brazil
+    CAN = "CAN"  # Canada
+    CHL = "CHL"  # Chile
+    EUR = "EUR"  # Europe (Netherlands, Ireland, Finland)
+    FRA = "FRA"  # France
+    DEU = "DEU"  # Germany
+    IND = "IND"  # India
+    IDN = "IDN"  # Indonesia
+    ISR = "ISR"  # Israel
+    ITA = "ITA"  # Italy
+    JPN = "JPN"  # Japan
+    KOR = "KOR"  # South Korea
+    MEX = "MEX"  # Mexico
+    NZL = "NZL"  # New Zealand
+    NOR = "NOR"  # Norway
+    POL = "POL"  # Poland
+    QAT = "QAT"  # Qatar
+    ZAF = "ZAF"  # South Africa
+    ESP = "ESP"  # Spain
+    SWE = "SWE"  # Sweden
+    CHE = "CHE"  # Switzerland
+    TWN = "TWN"  # Taiwan
+    ARE = "ARE"  # United Arab Emirates
+    GBR = "GBR"  # United Kingdom
+    NAM = "NAM"  # North America (United States)
+
+
+class CountryToRegionMapper:
+
+    _COUNTRY_TO_REGION: dict[str, MicrosoftRegion] = {
+        "SG": MicrosoftRegion.APC,
+        "MY": MicrosoftRegion.APC,
+        "HK": MicrosoftRegion.APC,
+        "AU": MicrosoftRegion.AUS,
+        "AT": MicrosoftRegion.AUT,
+        "BR": MicrosoftRegion.BRA,
+        "CA": MicrosoftRegion.CAN,
+        "CL": MicrosoftRegion.CHL,
+        "NL": MicrosoftRegion.EUR,
+        "IE": MicrosoftRegion.EUR,
+        "FI": MicrosoftRegion.EUR,
+        "FR": MicrosoftRegion.FRA,
+        "DE": MicrosoftRegion.DEU,
+        "IN": MicrosoftRegion.IND,
+        "ID": MicrosoftRegion.IDN,
+        "IL": MicrosoftRegion.ISR,
+        "IT": MicrosoftRegion.ITA,
+        "JP": MicrosoftRegion.JPN,
+        "KR": MicrosoftRegion.KOR,
+        "MX": MicrosoftRegion.MEX,
+        "NZ": MicrosoftRegion.NZL,
+        "NO": MicrosoftRegion.NOR,
+        "PL": MicrosoftRegion.POL,
+        "QA": MicrosoftRegion.QAT,
+        "ZA": MicrosoftRegion.ZAF,
+        "ES": MicrosoftRegion.ESP,
+        "SE": MicrosoftRegion.SWE,
+        "CH": MicrosoftRegion.CHE,
+        "TW": MicrosoftRegion.TWN,
+        "AE": MicrosoftRegion.ARE,
+        "GB": MicrosoftRegion.GBR,
+        "US": MicrosoftRegion.NAM,
+    }
+
+    DEFAULT_REGION = MicrosoftRegion.NAM
+
+    @classmethod
+    def get_region(cls, country_code: Optional[str]) -> MicrosoftRegion:
+        """
+        Get the Microsoft region for a given ISO country code.
+
+        Args:
+            country_code: ISO 3166-1 alpha-2 country code (e.g., "US", "GB", "IN")
+
+        Returns:
+            MicrosoftRegion enum value
+        """
+        if not country_code:
+            return cls.DEFAULT_REGION
+
+        return cls._COUNTRY_TO_REGION.get(country_code.upper(), cls.DEFAULT_REGION)
+
+    @classmethod
+    def get_region_string(cls, country_code: Optional[str]) -> str:
+        """
+        Get the Microsoft region string for a given ISO country code.
+
+        Args:
+            country_code: ISO 3166-1 alpha-2 country code (e.g., "US", "GB", "IN")
+
+        Returns:
+            Region code string (e.g., "NAM", "GBR", "IND")
+        """
+        return cls.get_region(country_code).value
+
+    @classmethod
+    def is_valid_region(cls, region: str) -> bool:
+        """
+        Check if a region code is valid.
+
+        Args:
+            region: Region code to validate
+
+        Returns:
+            True if valid, False otherwise
+        """
+        try:
+            MicrosoftRegion(region.upper())
+            return True
+        except ValueError:
+            return False
+
+    @classmethod
+    def get_all_regions(cls) -> list[str]:
+        """Get all valid region codes."""
+        return [r.value for r in MicrosoftRegion]
+
+    @classmethod
+    def get_all_country_codes(cls) -> list[str]:
+        """Get all supported country codes."""
+        return list(cls._COUNTRY_TO_REGION.keys())
 
 @ConnectorBuilder("SharePoint Online")\
     .in_group("Microsoft 365")\
@@ -200,6 +328,15 @@ class SiteMetadata:
             default_value=[],
             option_source_type=OptionSourceType.DYNAMIC
         ))
+        .add_filter_field(FilterField(
+            name="drive_ids",
+            display_name="Document Library Names",
+            description="Filter specific document libraries by name.",
+            filter_type=FilterType.LIST,
+            category=FilterCategory.SYNC,
+            default_value=[],
+            option_source_type=OptionSourceType.DYNAMIC
+        ))
         .add_filter_field(CommonFields.file_extension_filter())
         .add_filter_field(CommonFields.modified_date_filter("Filter pages and blogposts by modification date."))
         .add_filter_field(CommonFields.created_date_filter("Filter pages and blogposts by creation date."))
@@ -228,7 +365,7 @@ class SiteMetadata:
         #     description="Enable indexing of lists",
         #     default_value=True
         # ))
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .with_sync_support(True)
         .with_agent_support(True)
@@ -270,12 +407,13 @@ class SharePointConnector(BaseConnector):
         self.filters = {"exclude_onedrive_sites": True, "exclude_pages": True, "exclude_lists": True, "exclude_document_libraries": False}
         # Batch processing configuration
         self.batch_size = 50  # Reduced for better memory management
-        self.max_concurrent_batches = 1  # Reduced to avoid rate limiting
+        self.max_concurrent_batches = 1 # set to 1 for now to avoid write write conflicts for small number of records
         self.rate_limiter = AsyncLimiter(30, 1)  # 30 requests per second (conservative)
 
         # Cache for site metadata
         self.site_cache: Dict[str, SiteMetadata] = {}
 
+        self.tenant_region: str = None
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
 
@@ -471,6 +609,50 @@ class SharePointConnector(BaseConnector):
             scopes=["https://graph.microsoft.com/.default"]
         )
         self.msgraph_client = MSGraphClient(self.connector_name, self.connector_id, self.client, self.logger)
+
+        try:
+            self.logger.info("🔍 Fetching tenant region...")
+
+            from msgraph.generated.sites.item.site_item_request_builder import (
+                SiteItemRequestBuilder,
+            )
+
+            query_params = SiteItemRequestBuilder.SiteItemRequestBuilderGetQueryParameters(
+                select=["siteCollection"]
+            )
+            request_config = SiteItemRequestBuilder.SiteItemRequestBuilderGetRequestConfiguration(
+                query_parameters=query_params
+            )
+
+            root_site = await self.client.sites.by_site_id("root").get(request_configuration=request_config)
+
+            if (
+                root_site
+                and root_site.site_collection
+                and root_site.site_collection.data_location_code
+            ):
+                self.tenant_region = root_site.site_collection.data_location_code.upper()
+                self.logger.info(f"✅ Region detected via Root Site: {self.tenant_region}")
+            else:
+                self.logger.info("🔍 Root site dataLocationCode empty, trying organization endpoint...")
+
+                org_collection = await self.client.organization.get()
+
+                if org_collection and org_collection.value:
+                    country_code = org_collection.value[0].country_letter_code
+                    self.logger.info(f"🔍 Tenant country code: {country_code}")
+
+                    # Use the mapper
+                    self.tenant_region = CountryToRegionMapper.get_region_string(country_code)
+                    self.logger.info(
+                        f"✅ Region mapped from country '{country_code}': {self.tenant_region}"
+                    )
+                else:
+                    self.logger.warning("⚠️ Could not determine region, filter site/pages/drives might not work.")
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to fetch tenant region: {e}. Filter site/pages/drives might not work.")
+
         return True
 
 
@@ -621,45 +803,62 @@ class SharePointConnector(BaseConnector):
                     self.logger.warning(f"⚠️ Root site access failed: {root_error}. Continuing with site search...")
 
             # Get all sites using search
-            async with self.rate_limiter:
-                try:
+            # Pagination: fetch all sites using nextLink (same pattern as groups/users)
+            total_found = 0
+            existing_site_ids = {s.id for s in sites}
+            try:
+                async with self.rate_limiter:
                     search_results = await self._safe_api_call(
                         self.client.sites.get()
                     )
-                    if search_results and search_results.value:
-                        for site in search_results.value:
-                            self.logger.debug(f"Checking site: '{site.display_name or site.name}' - URL: '{site.web_url}'")
-                            self.logger.debug(f"exclude_onedrive_sites: {self.filters.get('exclude_onedrive_sites')}")
-                            parsed_url = urllib.parse.urlparse(site.web_url)
-                            hostname = parsed_url.hostname
-                            contains_onedrive = (
-                                hostname is not None and
-                                re.fullmatch(r"[a-zA-Z0-9-]+-my\.sharepoint\.com", hostname)
+
+                while True:
+                    if not search_results or not getattr(search_results, 'value', None):
+                        if total_found == 0:
+                            self.logger.info("No additional sites found from search endpoint")
+                        break
+                    for site in search_results.value:
+                        self.logger.debug(f"Checking site: '{site.display_name or site.name}' - URL: '{site.web_url}'")
+                        self.logger.debug(f"exclude_onedrive_sites: {self.filters.get('exclude_onedrive_sites')}")
+                        parsed_url = urllib.parse.urlparse(site.web_url)
+                        hostname = parsed_url.hostname
+                        contains_onedrive = (
+                            hostname is not None and
+                            re.fullmatch(r"[a-zA-Z0-9-]+-my\.sharepoint\.com", hostname)
+                        )
+                        if contains_onedrive:
+                            self.logger.debug(f"Hostname matches expected OneDrive pattern: {bool(contains_onedrive)}")
+
+                        if self.filters.get('exclude_onedrive_sites') and contains_onedrive:
+                            self.logger.debug(f"Skipping OneDrive site: '{site.display_name or site.name}'")
+                            continue
+
+                        self.logger.debug(f"Site found: '{site.display_name or site.name}' - ID: '{site.id}'")
+                        # Avoid duplicates
+                        if site.id not in existing_site_ids:
+                            sites.append(site)
+                            existing_site_ids.add(site.id)
+                            self.site_cache[site.id] = SiteMetadata(
+                                site_id=site.id,
+                                site_url=site.web_url,
+                                site_name=site.display_name or site.name,
+                                is_root=False,
+                                created_at=site.created_date_time,
+                                updated_at=site.last_modified_date_time
                             )
-                            if contains_onedrive:
-                                self.logger.debug(f"Hostname matches expected OneDrive pattern: {bool(contains_onedrive)}")
-
-                            if self.filters.get('exclude_onedrive_sites') and contains_onedrive:
-                                self.logger.debug(f"Skipping OneDrive site: '{site.display_name or site.name}'")
-                                continue
-
-                            self.logger.debug(f"Site found: '{site.display_name or site.name}' - ID: '{site.id}'")
-                            # Avoid duplicates
-                            if not any(existing_site.id == site.id for existing_site in sites):
-                                sites.append(site)
-                                self.site_cache[site.id] = SiteMetadata(
-                                    site_id=site.id,
-                                    site_url=site.web_url,
-                                    site_name=site.display_name or site.name,
-                                    is_root=False,
-                                    created_at=site.created_date_time,
-                                    updated_at=site.last_modified_date_time
-                                )
-                        self.logger.info(f"Found {len(search_results.value)} additional sites from search")
+                            total_found += 1
+                    # Pagination: follow nextLink using the same pattern as groups/users
+                    if hasattr(search_results, 'odata_next_link') and search_results.odata_next_link:
+                        self.logger.info(f"Following nextLink for more sites (found {total_found} so far)...")
+                        async with self.rate_limiter:
+                            search_results = await self._safe_api_call(
+                                self.client.sites.with_url(search_results.odata_next_link).get()
+                            )
                     else:
-                        self.logger.info("No additional sites found from search endpoint")
-                except Exception as search_error:
-                    self.logger.warning(f"⚠️ Site search failed: {search_error}. Continuing with available sites...")
+                        break
+                self.logger.info(f"Found {total_found} additional sites from search (pagination)")
+            except Exception as search_error:
+                self.logger.warning(f"⚠️ Site search failed: {search_error}. Continuing with available sites...")
 
             # Get subsites for each site (optional)
             subsite_count = 0
@@ -835,6 +1034,13 @@ class SharePointConnector(BaseConnector):
                         self.logger.warning(f"⚠️ No drive ID found for drive {drive_name}")
                         continue
 
+                    drive_web_url = getattr(drive, 'web_url', None)
+                    normalized_url = self._normalize_document_library_url(drive_web_url)
+
+                    if not self._pass_drive_key_filters(normalized_url):
+                        self.logger.debug(f"Skipping drive (Document Library filter) '{normalized_url}' {drive_name}")
+                        continue
+
                     # Create document library record
                     drive_record_group = self._create_document_library_record_group(drive, site_id, internal_site_record_group_id)
                     if drive_record_group:
@@ -919,7 +1125,7 @@ class SharePointConnector(BaseConnector):
                                 yield (None, [], record_update)
                             elif record_update.record:
                                 if not self.indexing_filters.is_enabled(IndexingFilterKey.DOCUMENTS, default=True):
-                                    record_update.record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                                    record_update.record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
 
                                 yield (record_update.record, record_update.new_permissions or [], record_update)
                                 self.stats['items_processed'] += 1
@@ -971,11 +1177,21 @@ class SharePointConnector(BaseConnector):
             if not item_id:
                 return None
 
+            is_root = hasattr(item, 'root') and item.root is not None
+
+            external_record_id = None
+            # Create a composite ID that includes drive_id for root folders
+            if is_root:
+                external_record_id = f"{drive_id}:root:{item_id}"
+            else:
+                external_record_id = item_id
+
+
             # Check if item is deleted
             if hasattr(item, 'deleted') and item.deleted is not None:
                 return RecordUpdate(
                     record=None,
-                    external_record_id=item_id,
+                    external_record_id=external_record_id,
                     is_new=False,
                     is_updated=False,
                     is_deleted=True,
@@ -996,7 +1212,7 @@ class SharePointConnector(BaseConnector):
             async with self.data_store_provider.transaction() as tx_store:
                 existing_record = await tx_store.get_record_by_external_id(
                     connector_id=self.connector_id,
-                    external_id=item_id
+                    external_id=external_record_id
                 )
 
             is_new = existing_record is None
@@ -1061,6 +1277,13 @@ class SharePointConnector(BaseConnector):
             if not item_id:
                 return None
 
+            is_root = hasattr(item, 'root') and item.root is not None
+            external_record_id = None
+            if is_root:
+                external_record_id = f"{drive_id}:root:{item_id}"
+            else:
+                external_record_id = item_id
+
             # Determine if it's a file or folder
             is_file = hasattr(item, 'folder') and item.folder is None
             record_type = RecordType.FILE
@@ -1110,6 +1333,13 @@ class SharePointConnector(BaseConnector):
                 parent_id = getattr(item.parent_reference, 'id', None)
                 path = getattr(item.parent_reference, 'path', None)
 
+                # Check if parent is root - if path ends with '/root:' or is '/drive/root:', parent is root
+                # Convert parent_id to composite format if parent is root
+                if parent_id and path:
+                    # Check if parent is at root level (path ends with '/root:' or '/drive/root:')
+                    if path.endswith('/root:') or path == '/drive/root:':
+                        parent_id = f"{drive_id}:root:{parent_id}"
+
             return FileRecord(
                 id=existing_record.id if existing_record else str(uuid.uuid4()),
                 record_name=item_name,
@@ -1117,7 +1347,7 @@ class SharePointConnector(BaseConnector):
                 record_status=ProgressStatus.NOT_STARTED if not existing_record else existing_record.record_status,
                 record_group_type=RecordGroupType.DRIVE,
                 parent_record_type=RecordType.FILE,
-                external_record_id=item_id,
+                external_record_id=external_record_id,
                 external_revision_id=getattr(item, 'e_tag', None),
                 version=0 if not existing_record else existing_record.version + 1,
                 origin=OriginTypes.CONNECTOR,
@@ -1634,8 +1864,9 @@ class SharePointConnector(BaseConnector):
                         self.logger.debug(f"⏭️ Skipping page (date filter) '{page_id}' {page_name}")
                         continue
 
-                    if not self._pass_page_ids_filters(page_id):
-                        self.logger.debug(f"⏭️ Skipping page (ID filter) '{page_id}' {page_name}")
+                    page_key = f"{page_id}:{site_id}"
+                    if not self._pass_page_ids_filters(page_key):
+                        self.logger.debug(f"⏭️ Skipping page (ID filter) '{page_key}' {page_name}")
                         continue
 
                     # Check the 'created_by' field to skip System Account created pages
@@ -1678,7 +1909,7 @@ class SharePointConnector(BaseConnector):
                     if page_record:
                         permissions = await self._get_page_permissions(site_id, page.id)
                         if not self.indexing_filters.is_enabled(IndexingFilterKey.PAGES, default=True):
-                            page_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                            page_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
 
                         yield (page_record, permissions, RecordUpdate(
                             record=page_record,
@@ -1854,7 +2085,57 @@ class SharePointConnector(BaseConnector):
         self.logger.warning(f"Unknown filter operator '{operator_str}' for SITE_IDS filter, allowing site")
         return True
 
-    def _pass_page_ids_filters(self, page_id: str) -> bool:
+    def _pass_drive_key_filters(self, drive_key: str) -> bool:
+        """
+        Checks if the drive passes the configured drive IDs filter.
+
+        For MULTISELECT filters:
+        - Operator IN: Only allow drives with IDs in the selected list (inclusion list)
+        - Operator NOT_IN: Allow drives with IDs NOT in the selected list (exclusion list)
+
+        Args:
+            drive_key: The SharePoint drive key/ID to check
+
+        Returns:
+            True if the drive should be synced, False if it should be skipped
+        """
+        # Get the drive IDs filter
+        drive_ids_filter = self.sync_filters.get(SyncFilterKey.DRIVE_IDS)
+
+        # If no filter configured or filter is empty, allow all drives
+        if drive_ids_filter is None or drive_ids_filter.is_empty():
+            return True
+
+        # Get the list of drive IDs from the filter value
+        filter_drive_ids = drive_ids_filter.value
+        if not isinstance(filter_drive_ids, list):
+            return True  # Invalid filter value, allow the drive
+
+        # Handle empty or None drive_key
+        if not drive_key:
+            self.logger.warning("Drive key is empty or None, skipping")
+            return False
+
+        # Create set for O(1) lookup (case-sensitive for GUIDs)
+        filter_drive_ids_set = {did.strip() for did in filter_drive_ids if did}
+        drive_key_normalized = drive_key.strip()
+
+        # Apply the filter based on operator
+        operator = drive_ids_filter.get_operator()
+        operator_str = operator.value if hasattr(operator, 'value') else str(operator)
+
+        if operator_str == FilterOperator.IN:
+            # Only allow drives with IDs in the inclusion list
+            return drive_key_normalized in filter_drive_ids_set
+        elif operator_str == FilterOperator.NOT_IN:
+            # Allow drives with IDs NOT in the exclusion list
+            return drive_key_normalized not in filter_drive_ids_set
+
+        # Unknown operator, default to allowing the drive
+        self.logger.warning(f"Unknown filter operator '{operator_str}' for DRIVE_IDS filter, allowing drive")
+        return True
+
+    def _pass_page_ids_filters(self, page_key: str) -> bool:
         """
         Checks if the page passes the configured page IDs filter.
 
@@ -1863,7 +2144,7 @@ class SharePointConnector(BaseConnector):
         - Operator NOT_IN: Allow pages with IDs NOT in the selected list (exclusion list)
 
         Args:
-            page_id: The SharePoint page ID to check
+            page_key: The SharePoint page key to check
 
         Returns:
             True if the page should be synced, False if it should be skipped
@@ -1880,14 +2161,14 @@ class SharePointConnector(BaseConnector):
         if not isinstance(filter_page_ids, list):
             return True  # Invalid filter value, allow the page
 
-        # Handle empty or None page_id
-        if not page_id:
-            self.logger.warning("Page ID is empty or None, skipping")
+        # Handle empty or None page_key
+        if not page_key:
+            self.logger.warning("Page key is empty or None, skipping")
             return False
 
         # Create set for O(1) lookup (case-sensitive for GUIDs)
         filter_page_ids_set = {pid.strip() for pid in filter_page_ids if pid}
-        page_id_normalized = page_id.strip()
+        page_key_normalized = page_key.strip()
 
         # Apply the filter based on operator
         operator = page_ids_filter.get_operator()
@@ -1895,10 +2176,10 @@ class SharePointConnector(BaseConnector):
 
         if operator_str == FilterOperator.IN:
             # Only allow pages with IDs in the inclusion list
-            return page_id_normalized in filter_page_ids_set
+            return page_key_normalized in filter_page_ids_set
         elif operator_str == FilterOperator.NOT_IN:
             # Allow pages with IDs NOT in the exclusion list
-            return page_id_normalized not in filter_page_ids_set
+            return page_key_normalized not in filter_page_ids_set
 
         # Unknown operator, default to allowing the page
         self.logger.warning(f"Unknown filter operator '{operator_str}' for PAGE_IDS filter, allowing page")
@@ -2053,7 +2334,6 @@ class SharePointConnector(BaseConnector):
     async def _get_site_permissions(self, site_id: str) -> List[Permission]:
         permissions_dict = {} # Key: Email, Value: Permission Object
 
-
         try:
             # 1. Get Site URL from your existing cache
             site_metadata = self.site_cache.get(site_id)
@@ -2062,6 +2342,8 @@ class SharePointConnector(BaseConnector):
                 return []
 
             site_url = site_metadata.site_url
+
+            self.logger.info(f"🔍 Getting site permissions for site ({site_url})")
 
             # 2. Get SharePoint REST Token
             access_token = await self._get_sharepoint_access_token()
@@ -2094,7 +2376,6 @@ class SharePointConnector(BaseConnector):
             # ==================================================================
             for group_type in ['associatedownergroup', 'associatedmembergroup']:
                 sp_users = await self._get_sharepoint_group_users(site_url, group_type, access_token)
-
                 for sp_user in sp_users:
                     login_name = sp_user.get('LoginName', '')
 
@@ -2104,12 +2385,19 @@ class SharePointConnector(BaseConnector):
                         match = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', login_name)
                         if match:
                             group_id = match.group(1)
-                            # Call Graph API (Owners or Members based on SP group type)
-                            is_owner_group = 'owner' in group_type
-                            graph_users = await self._fetch_graph_group_members(group_id, is_owner=is_owner_group)
+                            group_title = sp_user.get('Title', 'M365 Group')
 
-                            for g_user in graph_users:
-                                add_or_update_permission(g_user['email'], g_user['id'], PermissionType.WRITE)
+                            # Create edge with the M365 group itself instead of expanding members
+                            group_key = f"M365_GROUP_{group_id}"
+
+                            self.logger.info(f"      🔵 Found M365 Group: {group_title} (ID: {group_id})")
+
+                            permissions_dict[group_key] = Permission(
+                                external_id=group_id,
+                                email=None,
+                                type=PermissionType.WRITE,
+                                entity_type=EntityType.GROUP
+                            )
 
                     # CASE B: It's the "Everyone" Claim (Public Site)
                     elif 'spo-grid-all-users' in login_name:
@@ -2125,7 +2413,8 @@ class SharePointConnector(BaseConnector):
                     elif sp_user.get('PrincipalType') == SECURITY_GROUP_TYPE:
                         # Security Group LoginNames often look like: "c:0t.c|tenant|32537252-0676-4c47-a372-2d93563456"
                         # We need to extract that GUID at the end.
-                        self.logger.info(f"🔒 Found Security Group: {login_name}")
+                        group_title = sp_user.get('Title', 'Security Group')
+                        self.logger.info(f"🔒 Found Security Group: {group_title} ({login_name})")
 
                         # Regex to capture the GUID after 'tenant|'
                         match = re.search(r'\|tenant\|([0-9a-fA-F-]{36})', login_name)
@@ -2140,12 +2429,15 @@ class SharePointConnector(BaseConnector):
 
                             self.logger.info(f"   -> Extracted Group ID: {group_id}")
 
-                            # Use your existing Graph expander (reuse logic!)
-                            # Note: Security groups can have nested groups, so transitive_members (which you use) is PERFECT.
-                            graph_users = await self._fetch_graph_group_members(group_id, is_owner=False)
+                            # Create edge with the Security group itself instead of expanding members
+                            group_key = f"SECURITY_GROUP_{group_id}"
 
-                            for g_user in graph_users:
-                                add_or_update_permission(g_user['email'], g_user['id'], PermissionType.WRITE) # Or READ based on context
+                            permissions_dict[group_key] = Permission(
+                                external_id=group_id,
+                                email=None,
+                                type=PermissionType.WRITE,
+                                entity_type=EntityType.GROUP
+                            )
                         else:
                             self.logger.warning(f"   -> ⚠️ Could not extract GUID from Security Group LoginName: {login_name}")
 
@@ -2172,7 +2464,23 @@ class SharePointConnector(BaseConnector):
                     email = v.get('Email') or v.get('UserPrincipalName')
                     add_or_update_permission(email, v.get('Id'), PermissionType.READ)
 
-                # CASE B: "Everyone" Claims (Modern)
+                # CASE B: M365 Group in visitors
+                elif 'federateddirectoryclaimprovider' in login_name:
+                    match = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', login_name)
+                    if match:
+                        group_id = match.group(1)
+                        group_key = f"M365_GROUP_{group_id}"
+
+                        self.logger.info(f"      🔵 Found M365 Group in visitors: {title} (ID: {group_id})")
+
+                        permissions_dict[group_key] = Permission(
+                            external_id=group_id,
+                            email=None,
+                            type=PermissionType.READ,
+                            entity_type=EntityType.GROUP
+                        )
+
+                # CASE C: "Everyone" Claims (Modern)
                 elif 'spo-grid-all-users' in login_name or 'c:0(.s|true' in login_name:
                     self.logger.info(f"🌍 Site {site_id} is Public (Everyone claim found)")
                     permissions_dict['ORGANIZATION_ACCESS'] = Permission(
@@ -2181,9 +2489,9 @@ class SharePointConnector(BaseConnector):
                         external_id=self.data_entities_processor.org_id
                     )
 
-                # CASE C: "Everyone" Security Group (Type 4)
+                # CASE D: Security Groups (Type 4)
                 elif principal_type == SECURITY_GROUP_TYPE:
-                    # Check GUID or Title
+                    # Check GUID or Title for "Everyone except external users"
                     if EVERYONE_EXCEPT_EXTERNAL_ID in login_name or 'Everyone except external users' in title:
                         self.logger.info(f"🌍 Site {site_id} is Public ('Everyone' Group found)")
                         permissions_dict['ORGANIZATION_ACCESS'] = Permission(
@@ -2191,7 +2499,57 @@ class SharePointConnector(BaseConnector):
                             entity_type=EntityType.ORG,
                             external_id=self.data_entities_processor.org_id
                         )
+                    else:
+                        # Handle other security groups in visitors
+                        self.logger.info(f"      🔒 Found Security Group in visitors: {title} ({login_name})")
+                        match = re.search(r'\|tenant\|([0-9a-fA-F-]{36})', login_name)
+                        if match:
+                            group_id = match.group(1)
+                            group_key = f"SECURITY_GROUP_{group_id}"
 
+                            self.logger.info(f"         -> Extracted Group ID: {group_id}")
+
+                            permissions_dict[group_key] = Permission(
+                                external_id=group_id,
+                                email=None,
+                                type=PermissionType.READ,
+                                entity_type=EntityType.GROUP
+                            )
+                        else:
+                            self.logger.warning(f"         -> ⚠️ Could not extract GUID from Security Group LoginName: {login_name}")
+
+            # ==================================================================
+            # STEP 4: Process Custom SharePoint Groups -> GROUP entity type
+            # ==================================================================
+            self.logger.info("📋 Fetching custom SharePoint groups")
+            custom_groups = await self._get_custom_sharepoint_groups(site_url, access_token)
+            self.logger.info(f"   Found {len(custom_groups)} custom groups")
+
+            for group in custom_groups:
+                group_id = group.get('id')
+                group_title = group.get('title', '')
+                permission_level = group.get('permission_level', PermissionType.READ)
+
+                # Create a unique key for the group (use group_id as identifier)
+                group_key = f"GROUP_{group_id}"
+
+                # Skip if already processed (avoid duplicating default groups)
+                if group_key in permissions_dict:
+                    self.logger.debug(f"      Skipping already processed group: {group_title}")
+                    continue
+
+                self.logger.info(f"    👥 Found custom group: {group_title} (ID: {group_id}, Permission: {permission_level.value})")
+
+                # Add group permission with entity type GROUP
+                # Use site_id-group_id format to match the format used elsewhere (line 2924)
+                unique_group_id = f"{site_id}-{group_id}"
+
+                permissions_dict[group_key] = Permission(
+                    external_id=unique_group_id,
+                    email=None,  # Groups don't have emails in SharePoint
+                    type=permission_level,
+                    entity_type=EntityType.GROUP
+                )
 
             self.logger.info(f"Found {len(permissions_dict)} unique permissions for site {site_id}")
             return list(permissions_dict.values())
@@ -2233,6 +2591,71 @@ class SharePointConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"❌ Error in _get_sharepoint_group_users: {e}")
+            return []
+
+    async def _get_custom_sharepoint_groups(self, site_url: str, access_token: str) -> List[dict]:
+        """
+        Fetches custom SharePoint groups via role assignments API.
+        This includes groups that are not part of the default associated groups.
+        Returns list of dicts with group info: {'id', 'title', 'login_name', 'permission_level'}
+        """
+        # Construct the endpoint to get role assignments
+        endpoint = f"{site_url}/_api/web/roleassignments?$expand=RoleDefinitionBindings,Member"
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json;odata=verbose"
+        }
+
+        SHAREPOINT_GROUP_TYPE = 8
+
+        try:
+            self.logger.debug("📡 Fetching custom SharePoint groups via role assignments")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(endpoint, headers=headers) as response:
+                    if response.status == HTTPStatus.OK:
+                        data = await response.json()
+                        results = data.get('d', {}).get('results', [])
+
+                        custom_groups = []
+                        for assignment in results:
+                            member = assignment.get('Member', {})
+                            principal_type = member.get('PrincipalType')
+
+                            # PrincipalType 8 = SharePoint Group
+                            if principal_type == SHAREPOINT_GROUP_TYPE:
+                                login_name = member.get('LoginName', '')
+                                title = member.get('Title', '')
+                                group_id = member.get('Id')
+
+                                # Get permission level (highest level if multiple)
+                                role_bindings = assignment.get('RoleDefinitionBindings', {}).get('results', [])
+                                permission_levels = [r.get('Name', '') for r in role_bindings]
+
+                                # Determine permission type based on role name
+                                perm_type = PermissionType.READ
+                                if any(level in ['Full Control', 'Design'] for level in permission_levels):
+                                    perm_type = PermissionType.OWNER
+                                elif any(level in ['Edit', 'Contribute'] for level in permission_levels):
+                                    perm_type = PermissionType.WRITE
+
+                                custom_groups.append({
+                                    'id': group_id,
+                                    'title': title,
+                                    'login_name': login_name,
+                                    'permission_level': perm_type
+                                })
+
+                        self.logger.debug(f"✅ Found {len(custom_groups)} custom SharePoint groups")
+                        return custom_groups
+                    else:
+                        error_text = await response.text()
+                        self.logger.warning(f"⚠️ Failed to fetch role assignments: {response.status} - {error_text}")
+                        return []
+
+        except Exception as e:
+            self.logger.error(f"❌ Error in _get_custom_sharepoint_groups: {e}")
             return []
 
     async def _fetch_graph_group_members(self, group_id: str, is_owner: bool = False) -> List[dict]:
@@ -2483,7 +2906,7 @@ class SharePointConnector(BaseConnector):
 
             # Part 1: Sync Azure AD groups
             try:
-                await self._sync_azure_ad_groups_delta()
+                await self._sync_azure_ad_groups()
             except Exception as groups_error:
                 self.logger.error(f"❌ Error syncing Azure AD Groups with delta: {groups_error}")
 
@@ -2693,10 +3116,11 @@ class SharePointConnector(BaseConnector):
         except Exception as e:
             self.logger.error(f"❌ Error syncing SharePoint groups: {e}")
 
-    async def _sync_azure_ad_groups_delta(self) -> None:
+    async def _sync_azure_ad_groups(self) -> None:
         """
-        Incremental Azure AD groups synchronization using Delta API.
-        Uses Graph Delta API for BOTH initial full sync and subsequent incremental syncs.
+        Unified Azure AD groups synchronization.
+        - First sync: Uses standard /groups API for clean current state
+        - Subsequent syncs: Uses Graph Delta API for incremental changes
         """
         try:
             sync_point_key = generate_record_sync_point_key(
@@ -2706,96 +3130,229 @@ class SharePointConnector(BaseConnector):
             )
             sync_point = await self.user_group_sync_point.read_sync_point(sync_point_key)
 
-            # 1. Determine starting URL
-            # Default to fresh delta start
-            url = "https://graph.microsoft.com/v1.0/groups/delta"
-            # If we have a saved state, prefer nextLink (resuming interrupted sync) or deltaLink (incremental sync)
-            if sync_point:
-                url = sync_point.get('nextLink') or sync_point.get('deltaLink') or url
+            delta_link = sync_point.get('deltaLink') if sync_point else None
 
-            self.logger.info("Starting Azure AD groups delta sync...")
+            if delta_link is None:
+                self.logger.info("No sync point found, performing initial full sync...")
 
-            while True:
-                # 2. Fetch page of results
-                result = await self.msgraph_client.get_groups_delta_response(url)
-                groups = result.get('groups', [])
+                # IMPORTANT: Get delta link BEFORE full sync to avoid missing changes
+                # that occur during the sync
+                delta_link = await self._get_initial_delta_link()
 
-                self.logger.info(f"Fetched page with {len(groups)} Azure AD groups")
+                # Perform the full sync
+                await self._perform_initial_full_sync()
 
-                # 3. Process each group in the current page
-                for group in groups:
-                    # A) Check for DELETION marker
-                    if hasattr(group, 'additional_data') and group.additional_data and '@removed' in group.additional_data:
-                        self.logger.info(f"[DELTA ACTION] 🗑️ REMOVE Group: {group.id}")
-                        await self._handle_delete_group(group.id)
-                        continue
-
-                    # B) Process ADD/UPDATE
-                    self.logger.info(f"[DELTA ACTION] ✅ ADD/UPDATE Group: {getattr(group, 'display_name', 'N/A')} ({group.id})")
-                    await self._handle_group_create(group)
-
-                    # C) Check for specific MEMBER changes in this delta
-                    if hasattr(group, 'additional_data') and group.additional_data:
-                        member_changes = group.additional_data.get('members@delta', [])
-
-                        if member_changes:
-                            self.logger.info(f"    -> [ACTION] 👥 Processing {len(member_changes)} member changes for group: {group.id}")
-
-                        for member_change in member_changes:
-                            user_id = member_change.get('id')
-
-                            # 1. Fetch email (needed for both add and remove)
-                            email = await self.msgraph_client.get_user_email(user_id)
-
-                            if not email:
-                                self.logger.warning(f"Could not find email for user ID {user_id}, skipping member change processing.")
-                                continue
-
-                            # 2. Handle based on change type
-                            if '@removed' in member_change:
-                                self.logger.info(f"    -> [ACTION] 👤⛔ REMOVING member: {email} ({user_id}) from group {group.id}")
-                                await self.data_entities_processor.on_user_group_member_removed(
-                                    external_group_id=group.id,
-                                    user_email=email,
-                                    connector_id=self.connector_id,
-                                )
-                            else:
-                                self.logger.info(f"    -> [ACTION] 👤✨ ADDING member: {email} ({user_id}) to group {group.id}")
-                                # Member addition is handled in _handle_group_create
-
-                # 4. Handle pagination and completion
-                if result.get('next_link'):
-                    # More data available, update URL for next loop iteration
-                    url = result.get('next_link')
-
-                    # OPTIONAL: Save intermediate 'nextLink' for resumability during long initial sync
-                    # await self.user_group_sync_point.update_sync_point(sync_point_key, {"nextLink": url, "deltaLink": None})
-
-                elif result.get('delta_link'):
-                    # End of current data stream. Save the delta_link for the NEXT run.
+                # Only save the delta link if full sync succeeded
+                if delta_link:
                     await self.user_group_sync_point.update_sync_point(
                         sync_point_key,
-                        {"nextLink": None, "deltaLink": result.get('delta_link')}
+                        {"nextLink": None, "deltaLink": delta_link}
                     )
-                    self.logger.info("Azure AD groups delta sync cycle completed, delta link saved for next run.")
-                    break
+                    self.logger.info("Initial sync completed and delta link saved for future syncs")
                 else:
-                    # Fallback ensuring loop terminates if API returns neither link
-                    self.logger.warning("Received response with neither next_link nor delta_link.")
-                    break
+                    self.logger.warning("Initial sync completed but no delta link was obtained")
+            else:
+                self.logger.info("Sync point found, performing incremental delta sync...")
+                await self._perform_delta_sync(delta_link, sync_point_key)
 
         except Exception as e:
-            self.logger.error(f"❌ Error in Azure AD groups delta sync: {e}", exc_info=True)
+            self.logger.error(f"❌ Error in Azure AD groups sync: {e}", exc_info=True)
             raise
 
+    async def _get_initial_delta_link(self) -> Optional[str]:
+        """
+        Consumes the delta API to obtain a deltaLink checkpoint.
+        Called BEFORE initial full sync to ensure no changes are missed.
 
-    async def _handle_group_create(self, group: Group) -> None:
+        Returns:
+            The deltaLink string, or None if unable to obtain one.
+        """
+        self.logger.info("Obtaining delta link checkpoint before full sync...")
+
+        url = "https://graph.microsoft.com/v1.0/groups/delta"
+
+        try:
+            while True:
+                result = await self.msgraph_client.get_groups_delta_response(url)
+
+                # We ignore the data - just consuming to get the deltaLink
+                groups_count = len(result.get('groups', []))
+                self.logger.debug(f"Delta initialization: skipping page with {groups_count} groups")
+
+                if result.get('next_link'):
+                    url = result.get('next_link')
+                elif result.get('delta_link'):
+                    self.logger.info("Delta link obtained successfully")
+                    return result.get('delta_link')
+                else:
+                    self.logger.warning("Delta initialization: no next_link or delta_link received")
+                    return None
+        except Exception as e:
+            self.logger.error(f"❌ Error obtaining initial delta link: {e}", exc_info=True)
+            return None
+
+    async def _perform_initial_full_sync(self) -> None:
+        """
+        Performs initial full sync using the standard /groups API.
+        Gets current state of all groups and their members.
+        """
+        self.logger.info("Starting initial full Azure AD group synchronization")
+
+        groups = await self.msgraph_client.get_all_user_groups()
+
+        # Process all groups concurrently using asyncio.gather
+        results = await asyncio.gather(
+            *[self._process_single_group(group) for group in groups],
+            return_exceptions=True
+        )
+
+        # Filter out None results (failed groups) and exceptions
+        group_with_members = []
+        for result in results:
+            if isinstance(result, Exception):
+                self.logger.error(f"❌ Error processing group: {result}", exc_info=True)
+            elif result is not None:
+                group_with_members.append(result)
+
+        if group_with_members:
+            await self.data_entities_processor.on_new_user_groups(group_with_members)
+
+        self.logger.info(f"Initial full sync completed: processed {len(groups)} Azure AD groups")
+
+    async def _process_single_group(self, group) -> Optional[Tuple[AppUserGroup, List[AppUser]]]:
+        """
+        Processes a single group and returns a tuple of (user_group, app_users).
+        Returns None if processing fails.
+        """
+        try:
+            members = await self.msgraph_client.get_group_members(group.id)
+
+            user_group = AppUserGroup(
+                source_user_group_id=group.id,
+                app_name=self.connector_name,
+                connector_id=self.connector_id,
+                name=group.display_name,
+                description=group.description,
+                source_created_at=group.created_date_time.timestamp() if group.created_date_time else get_epoch_timestamp_in_ms(),
+            )
+
+            app_users = []
+            for member in members:
+                odata_type = getattr(member, 'odata_type', None) or (member.additional_data or {}).get('@odata.type', '')
+
+                if '#microsoft.graph.user' in odata_type:
+                    app_user = self._create_app_user_from_member(member)
+                    if app_user:
+                        app_users.append(app_user)
+                elif '#microsoft.graph.group' in odata_type:
+                    nested_users = await self._get_users_from_nested_group(member)
+                    app_users.extend(nested_users)
+                else:
+                    self.logger.debug(f"Skipping member type '{odata_type}' for member {member.id}")
+
+            return (user_group, app_users)
+
+        except Exception as e:
+            self.logger.error(f"❌ Error processing group {group.display_name}: {e}", exc_info=True)
+            return None
+
+    async def _perform_delta_sync(self, url: str, sync_point_key: str) -> None:
+        """
+        Performs incremental sync using the Graph Delta API.
+        Processes only changes since the last sync.
+        """
+
+        if not url:
+            self.logger.warning("No valid URL in sync point, falling back to full delta sync")
+            url = "https://graph.microsoft.com/v1.0/groups/delta"
+
+        self.logger.info("Starting incremental delta sync...")
+
+        while True:
+            result = await self.msgraph_client.get_groups_delta_response(url)
+            groups = result.get('groups', [])
+
+            self.logger.info(f"Fetched delta page with {len(groups)} group changes")
+
+            for group in groups:
+                # Handle group DELETION
+                if hasattr(group, 'additional_data') and group.additional_data and '@removed' in group.additional_data:
+                    self.logger.info(f"[DELTA] 🗑️ REMOVE Group: {group.id}")
+                    success = await self._handle_delete_group(group.id)
+                    if not success:
+                        self.logger.error(f"❌ Error handling group delete for {group.id}")
+                    continue
+
+                # Handle ADD/UPDATE
+                self.logger.info(f"[DELTA] ✅ ADD/UPDATE Group: {getattr(group, 'display_name', 'N/A')} ({group.id})")
+                success = await self._handle_group_create(group)
+                if not success:
+                    self.logger.error(f"❌ Error handling group create for {group.id}")
+                    continue
+
+                # Handle MEMBER changes
+                member_changes = (group.additional_data or {}).get('members@delta', [])
+
+                if member_changes:
+                    self.logger.info(f"    -> [DELTA] 👥 Processing {len(member_changes)} member changes for group: {group.id}")
+
+                for member_change in member_changes:
+                    await self._process_member_change(group.id, member_change)
+
+            # Handle pagination and completion
+            if result.get('next_link'):
+                url = result.get('next_link')
+                await self.user_group_sync_point.update_sync_point(
+                    sync_point_key,
+                    {"nextLink": url, "deltaLink": None}
+                )
+            elif result.get('delta_link'):
+                await self.user_group_sync_point.update_sync_point(
+                    sync_point_key,
+                    {"nextLink": None, "deltaLink": result.get('delta_link')}
+                )
+                self.logger.info("Delta sync completed, delta link saved for next run")
+                break
+            else:
+                self.logger.warning("Received response with neither next_link nor delta_link")
+                break
+
+    async def _process_member_change(self, group_id: str, member_change: dict) -> None:
+        """
+        Processes a single member change from the delta response.
+        """
+        user_id = member_change.get('id')
+        email = await self.msgraph_client.get_user_email(user_id)
+
+        if not email:
+            return
+
+        if '@removed' in member_change:
+            self.logger.info(f"    -> [DELTA] 👤⛔ REMOVING member: {email} ({user_id}) from group {group_id}")
+            success = await self.data_entities_processor.on_user_group_member_removed(
+                external_group_id=group_id,
+                user_email=email,
+                connector_id=self.connector_id
+            )
+            if not success:
+                self.logger.error(f"❌ Error removing member {email} from group {group_id}")
+        else:
+            self.logger.info(f"    -> [DELTA] 👤✨ ADDING member: {email} ({user_id}) to group {group_id}")
+
+    async def _handle_group_create(self, group: Group) -> bool:
         """
         Handles the creation or update of a single user group.
         Fetches members and sends to data processor.
+
+        Supported member types:
+        - User: Added directly
+        - Group (nested): Fetch its users and add them (only one level deep)
+        - Device, Service Principal, Org Contact: Ignored
+
+        Returns:
+            True if group creation/update was successful, False otherwise.
         """
         try:
-
             # 1. Fetch latest members for this group
             members = await self.msgraph_client.get_group_members(group.id)
 
@@ -2809,48 +3366,125 @@ class SharePointConnector(BaseConnector):
                 source_created_at=group.created_date_time.timestamp() if group.created_date_time else get_epoch_timestamp_in_ms(),
             )
 
-            # 3. Create AppUser entities for members
+            # 3. Create AppUser entities for members (filter by type)
             app_users = []
             for member in members:
-                app_user = AppUser(
-                    source_user_id=member.id,
-                    email=member.mail or member.user_principal_name,
-                    full_name=member.display_name,
-                    source_created_at=member.created_date_time.timestamp() if member.created_date_time else get_epoch_timestamp_in_ms(),
-                    app_name=self.connector_name,
-                    connector_id=self.connector_id,
-                )
-                app_users.append(app_user)
+                # Check the odata type to determine member type
+                odata_type = getattr(member, 'odata_type', None) or (member.additional_data or {}).get('@odata.type', '')
+
+                if '#microsoft.graph.user' in odata_type:
+                    # Direct user member
+                    app_user = self._create_app_user_from_member(member)
+                    if app_user:
+                        app_users.append(app_user)
+
+                elif '#microsoft.graph.group' in odata_type:
+                    # Nested group - fetch its users (one level deep only)
+                    nested_users = await self._get_users_from_nested_group(member)
+                    app_users.extend(nested_users)
+
+                else:
+                    self.logger.debug(f"Skipping member type '{odata_type}' for member {member.id}")
 
             # 4. Send to processor (wrapped in list as expected by on_new_user_groups)
             await self.data_entities_processor.on_new_user_groups([(user_group, app_users)])
 
-            self.logger.info(f"Processed group creation/update for: {group.display_name}")
+            self.logger.info(f"Processed group creation/update for: {group.display_name} with {len(app_users)} user members")
+            return True
 
         except Exception as e:
             self.logger.error(f"❌ Error handling group create for {getattr(group, 'id', 'unknown')}: {e}", exc_info=True)
+            return False
 
-    async def _handle_delete_group(self, group_id: str) -> None:
+
+    async def _get_users_from_nested_group(self, nested_group) -> List[AppUser]:
+        """
+        Fetches users from a nested group (one level deep only).
+
+        Args:
+            nested_group: A group member object from Microsoft Graph API
+
+        Returns:
+            List of AppUser entities from the nested group
+        """
+        nested_group_name = getattr(nested_group, 'display_name', nested_group.id)
+        self.logger.info(f"Processing nested group member: {nested_group_name}")
+
+        app_users = []
+
+        try:
+            nested_members = await self.msgraph_client.get_group_members(nested_group.id)
+
+            for nested_member in nested_members:
+                nested_odata_type = getattr(nested_member, 'odata_type', None) or (nested_member.additional_data or {}).get('@odata.type', '')
+
+                if '#microsoft.graph.user' in nested_odata_type:
+                    app_user = self._create_app_user_from_member(nested_member)
+                    if app_user:
+                        app_users.append(app_user)
+                else:
+                    self.logger.debug(f"Skipping non-user member '{nested_odata_type}' in nested group {nested_group_name}")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch members from nested group {nested_group_name}: {e}")
+
+        return app_users
+
+
+    def _create_app_user_from_member(self, member) -> Optional[AppUser]:
+        """
+        Helper method to create an AppUser from a Graph API user member.
+
+        Args:
+            member: A user object from Microsoft Graph API
+
+        Returns:
+            AppUser if successful, None if user has no valid email
+        """
+        email = getattr(member, 'mail', None) or getattr(member, 'user_principal_name', None)
+
+        if not email:
+            self.logger.warning(f"User {member.id} has no email or user_principal_name, skipping")
+            return None
+
+        return AppUser(
+            app_name=self.connector_name,
+            source_user_id=member.id,
+            email=email,
+            full_name=getattr(member, 'display_name', None),
+            source_created_at=member.created_date_time.timestamp() if hasattr(member, 'created_date_time') and member.created_date_time else get_epoch_timestamp_in_ms(),
+            connector_id=self.connector_id,
+        )
+
+    async def _handle_delete_group(self, group_id: str) -> bool:
         """
         Handles the deletion of a single user group.
         Calls the data processor to remove it from the database.
 
         Args:
             group_id: The external ID of the group to be deleted.
+
+        Returns:
+            True if group deletion was successful, False otherwise.
         """
         try:
             self.logger.info(f"Handling group deletion for: {group_id}")
 
             # Call the data entities processor to handle the deletion logic
-            await self.data_entities_processor.on_user_group_deleted(
+            success = await self.data_entities_processor.on_user_group_deleted(
                 external_group_id=group_id,
-                connector_id=self.connector_id,
+                connector_id=self.connector_id
             )
 
-            self.logger.info(f"Successfully processed group deletion for: {group_id}")
+            if not success:
+                self.logger.error(f"❌ Error handling group delete for {group_id}")
+                return False
+
+            return True
 
         except Exception as e:
             self.logger.error(f"❌ Error handling group delete for {group_id}: {e}", exc_info=True)
+            return False
 
     def _map_group_to_permission_type(self, group_name: str) -> PermissionType:
         """Map SharePoint group names to permission types."""
@@ -2948,6 +3582,17 @@ class SharePointConnector(BaseConnector):
         """Main entry point for the SharePoint connector."""
         start_time = datetime.now()
 
+        # Reset statistics for this sync run
+        self.stats = {
+            'sites_processed': 0,
+            'sites_failed': 0,
+            'drives_processed': 0,
+            'lists_processed': 0,
+            'pages_processed': 0,
+            'items_processed': 0,
+            'errors_encountered': 0
+        }
+
         try:
             self.logger.info("🚀 Starting SharePoint connector sync")
 
@@ -2969,13 +3614,13 @@ class SharePointConnector(BaseConnector):
             except Exception as user_error:
                 self.logger.error(f"❌ Error syncing users: {user_error}")
 
-            # # Step 2: Sync user groups
-            # self.logger.info("Syncing SharePoint groups...")
-            # try:
-            #     await self._sync_user_groups()
-            #     self.logger.info("✅ Successfully synced SharePoint groups")
-            # except Exception as group_error:
-            #     self.logger.error(f"❌ Error syncing groups: {group_error}")
+            # Step 2: Sync user groups
+            self.logger.info("Syncing SharePoint groups...")
+            try:
+                await self._sync_user_groups()
+                self.logger.info("✅ Successfully synced SharePoint groups")
+            except Exception as group_error:
+                self.logger.error(f"❌ Error syncing groups: {group_error}")
 
             # Step 3: Discover and sync sites
             sites = await self._get_all_sites()
@@ -3655,6 +4300,8 @@ class SharePointConnector(BaseConnector):
             return await self._get_site_options(page, limit, search)
         elif filter_key == SyncFilterKey.PAGE_IDS:
             return await self._get_page_options(page, limit, search)
+        elif filter_key == SyncFilterKey.DRIVE_IDS:  # Add this
+            return await self._get_document_library_options(page, limit, search)
         else:
             raise ValueError(f"Unsupported filter key: {filter_key}")
 
@@ -3674,7 +4321,8 @@ class SharePointConnector(BaseConnector):
             entity_types=["site"],
             query=search_query,
             page=page,
-            limit=limit
+            limit=limit,
+            region=self.tenant_region
         )
 
         options = []
@@ -3742,7 +4390,8 @@ class SharePointConnector(BaseConnector):
             entity_types=["listItem"],
             query=full_query,
             page=page,
-            limit=limit
+            limit=limit,
+            region=self.tenant_region
         )
 
         options = []
@@ -3763,8 +4412,18 @@ class SharePointConnector(BaseConnector):
 
                         item_id = resource.get('id')
                         web_url = resource.get('webUrl')
+                        site_id = resource.get('parentReference', {}).get('siteId')
 
-                        if not item_id and not web_url:
+                        # Skip System Account pages (templates)
+                        created_by = resource.get('createdBy', {})
+                        user = created_by.get('user', {})
+                        user.get('displayName', '').lower()
+
+                        if not site_id:
+                            continue
+
+
+                        if not item_id:
                             continue
 
                         # --- 1. Extract Page Name ---
@@ -3794,9 +4453,10 @@ class SharePointConnector(BaseConnector):
 
                         # --- 3. Format Final Label ---
                         final_label = f"{page_label} ({site_name})"
+                        page_key = f"{item_id}:{site_id}"
 
                         options.append(FilterOption(
-                            id=item_id or web_url,
+                            id=page_key,
                             label=final_label
                         ))
 
@@ -3810,6 +4470,167 @@ class SharePointConnector(BaseConnector):
             has_more=has_more,
             cursor=None
         )
+
+    async def _get_document_library_options(
+        self,
+        page: int,
+        limit: int,
+        search: Optional[str]
+    ) -> FilterOptionsResponse:
+        """Get dynamic filter options for SharePoint document libraries (drives only)."""
+
+        search_query = search.strip() if search else ""
+
+        # Search query - best effort to narrow down
+        full_query = f"{search_query}* contentclass:STS_List_DocumentLibrary"
+
+        raw_result = await self.msgraph_client.search_query(
+            entity_types=["list"],
+            query=full_query,
+            page=page,
+            limit=limit,
+            region=self.tenant_region
+        )
+
+        options = []
+        total = 0
+        seen_keys = set()  # To handle duplicates
+
+        # System library names to exclude
+        SYSTEM_LIBRARY_NAMES = {
+            'FormServerTemplates',
+            'SiteAssets',
+            'Style Library',
+            'SitePages',
+            '_catalogs',
+            'appdata',
+            'AppCatalog',
+        }
+
+        if raw_result:
+            additional_data = getattr(raw_result, 'additional_data', {}) or {}
+            value_list = additional_data.get('value', [])
+
+            for search_resp in value_list:
+                hits_containers = search_resp.get('hitsContainers', [])
+
+                for container in hits_containers:
+                    total = container.get('total', 0)
+
+                    for hit in container.get('hits', []):
+                        resource = hit.get('resource', {})
+                        summary = hit.get('summary', '')
+
+                        list_id = resource.get('id')
+                        web_url = resource.get('webUrl', '')
+                        name = resource.get('name', '')
+                        display_name = resource.get('displayName', '')
+                        site_id = resource.get('parentReference', {}).get('siteId', '')
+                        if not site_id:
+                            continue
+                        unique_key = f"{list_id}:{site_id}"
+
+                        # Skip if no ID or already seen (duplicates in results)
+                        if not list_id or unique_key in seen_keys:
+                            continue
+
+                        # === FILTERING LOGIC ===
+                        # 1. Must be a document library: summary contains 'DocumentLibrary',
+                        #    or summary is empty (treat as document library by default)
+                        is_document_library = 'DocumentLibrary' in summary or not summary
+                        if not is_document_library:
+                            continue
+                        # 2. Skip SharePoint Lists (URL contains /Lists/)
+                        if '/Lists/' in web_url:
+                            continue
+                        # 3. Skip system libraries by name
+                        if name in SYSTEM_LIBRARY_NAMES:
+                            continue
+                        # 4. Skip contentstorage (internal Microsoft storage)
+                        if '/contentstorage/' in web_url:
+                            continue
+                        # 5. Skip OneDrive personal libraries
+                        if re.match(r'^https?://[^/]*-my\.sharepoint\.com(/|$)', web_url, re.IGNORECASE):
+                            continue
+                        # 6. Skip calendar/events URLs
+                        if '/calendar.aspx' in web_url:
+                            continue
+                        # === PASSED ALL FILTERS - This is a valid drive ===
+
+                        seen_keys.add(unique_key)
+
+                        # Extract library name
+                        library_name = display_name or name or "Unknown Library"
+
+                        # Extract site name from URL
+                        site_name = "Unknown Site"
+                        if web_url and "/sites/" in web_url:
+                            try:
+                                after_sites = web_url.split("/sites/")[1]
+                                raw_site_name = after_sites.split("/")[0]
+                                site_name = unquote(raw_site_name)
+                            except Exception:
+                                pass
+                        elif web_url:
+                            site_name = "Root Site"
+
+                        # Clean up display name if it already contains site info
+                        # e.g., "IT Team Site - Documents" -> "Documents"
+                        if " - " in library_name and site_name != "Unknown Site":
+                            library_name = library_name.split(" - ")[-1]
+
+                        final_label = f"{library_name} ({site_name})"
+                        normalized_url = self._normalize_document_library_url(web_url)
+
+                        options.append(FilterOption(
+                            id=normalized_url,
+                            label=final_label
+                        ))
+
+        has_more = (page * limit) < total
+
+        return FilterOptionsResponse(
+            success=True,
+            options=options,
+            page=page,
+            limit=limit,
+            has_more=has_more,
+            cursor=None
+        )
+
+    def _normalize_document_library_url(self, web_url: str) -> str:
+        """
+        Normalize a SharePoint document library URL to a consistent format.
+
+        Examples:
+            Input:  'https://pipeshubinc.sharepoint.com/sites/okay/Shared%20Documents'
+            Output: 'pipeshubinc.sharepoint.com/sites/okay/shared documents'
+
+            Input:  'https://pipeshubinc.sharepoint.com/sites/ITTeamSite/Shared Documents/Forms/AllItems.aspx'
+            Output: 'pipeshubinc.sharepoint.com/sites/itteamsite/shared documents'
+        """
+        if not web_url:
+            return ""
+
+        # Decode URL encoding (%20 -> space, etc.)
+        decoded_url = unquote(web_url)
+
+        # Remove protocol (https://)
+        if "://" in decoded_url:
+            decoded_url = decoded_url.split("://", 1)[1]
+
+        # Remove trailing /Forms/AllItems.aspx or similar view pages
+        # Common patterns: /Forms/AllItems.aspx, /Forms/AllItems.aspx?viewid=...
+        if "/Forms/" in decoded_url:
+            decoded_url = decoded_url.split("/Forms/")[0]
+
+        # Lowercase for consistent comparison
+        decoded_url = decoded_url.lower()
+
+        # Remove trailing slashes
+        decoded_url = decoded_url.rstrip("/")
+
+        return decoded_url
 
     @classmethod
     async def create_connector(cls, logger: Logger,

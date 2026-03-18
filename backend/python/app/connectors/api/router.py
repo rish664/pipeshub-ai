@@ -1,21 +1,20 @@
 import asyncio
 import base64
+import contextlib
 import io
 import json
+import mimetypes
 import os
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 from urllib.parse import parse_qs, urlencode, urlparse
 
-import google.oauth2.credentials
 import jwt
 from dependency_injector.wiring import Provide, inject
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     HTTPException,
@@ -23,26 +22,25 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import Response, StreamingResponse
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 from jose import JWTError
 from pydantic import BaseModel, ValidationError
 
+from app.api.middlewares.auth import require_scopes
 from app.config.configuration_service import ConfigurationService
 from app.config.constants.arangodb import (
-    AccountType,
     CollectionNames,
     Connectors,
     MimeTypes,
-    RecordRelations,
-    RecordTypes,
 )
 from app.config.constants.http_status_code import HttpStatusCode
-from app.config.constants.service import DefaultEndpoints, config_node_constants
-from app.connectors.api.middleware import WebhookAuthVerifier
+from app.config.constants.service import (
+    DefaultEndpoints,
+    OAuthScopes,
+    config_node_constants,
+)
 from app.connectors.core.base.connector.connector_service import BaseConnector
 from app.connectors.core.base.token_service.oauth_service import (
     OAuthProvider,
@@ -50,29 +48,12 @@ from app.connectors.core.base.token_service.oauth_service import (
 )
 from app.connectors.core.factory.connector_factory import ConnectorFactory
 from app.connectors.core.registry.connector_builder import ConnectorScope
-from app.connectors.services.base_arango_service import BaseArangoService
+from app.connectors.core.sync.task_manager import sync_task_manager
 from app.connectors.services.kafka_service import KafkaService
-from app.connectors.sources.google.admin.admin_webhook_handler import (
-    AdminWebhookHandler,
-)
-from app.connectors.sources.google.common.google_token_handler import (
-    CredentialKeys,
-    GoogleTokenHandler,
-)
-from app.connectors.sources.google.common.scopes import (
-    GOOGLE_CONNECTOR_ENTERPRISE_SCOPES,
-)
-from app.connectors.sources.google.gmail.gmail_webhook_handler import (
-    AbstractGmailWebhookHandler,
-)
-from app.connectors.sources.google.google_drive.drive_webhook_handler import (
-    AbstractDriveWebhookHandler,
-)
 from app.containers.connector import ConnectorAppContainer
-from app.modules.parsers.google_files.google_docs_parser import GoogleDocsParser
-from app.modules.parsers.google_files.google_sheets_parser import GoogleSheetsParser
-from app.modules.parsers.google_files.google_slides_parser import GoogleSlidesParser
+from app.models.entities import Record
 from app.services.featureflag.config.config import CONFIG
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.api_call import make_api_call
 from app.utils.jwt import generate_jwt
 from app.utils.logger import create_logger
@@ -83,6 +64,33 @@ from app.utils.time_conversion import get_epoch_timestamp_in_ms
 logger = create_logger("connector_service")
 
 router = APIRouter()
+
+
+def get_mime_type_from_record(record: Record) -> str:
+    """
+    Get the MIME type for a record, using the following priority:
+    1. Record's stored mime_type attribute
+    2. Guess from record_name or name extension using mimetypes module
+    3. Fallback to application/octet-stream
+
+    Args:
+        record: The record object
+    Returns:
+        str: The MIME type
+    """
+    # Try to get mime_type from record
+    if hasattr(record, 'mime_type') and record.mime_type:
+        return record.mime_type
+
+    # Try to guess from record_name or name attribute
+    record_name = getattr(record, 'record_name', None) or getattr(record, 'name', None)
+    if record_name:
+        guessed_type, _ = mimetypes.guess_type(record_name)
+        if guessed_type:
+            return guessed_type
+
+    # Fallback to octet-stream
+    return "application/octet-stream"
 
 
 async def _stream_google_api_request(request, error_context: str = "download") -> AsyncGenerator[bytes, None]:
@@ -122,19 +130,19 @@ async def _stream_google_api_request(request, error_context: str = "download") -
                 raise HTTPException(
                     status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
                     detail=f"Error during {error_context}: {str(http_error)}",
-                )
+                ) from http_error
             except Exception as chunk_error:
                 logger.error(f"Error during {error_context} chunk: {str(chunk_error)}")
                 raise HTTPException(
                     status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
                     detail=f"Error during {error_context}",
-                )
+                ) from chunk_error
     except Exception as stream_error:
         logger.error(f"Error in {error_context} stream: {str(stream_error)}")
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Error setting up {error_context} stream",
-        )
+        ) from stream_error
     finally:
         buffer.close()
 
@@ -227,24 +235,13 @@ async def get_validated_connector_instance(
     return instance
 
 
-async def get_arango_service(request: Request) -> BaseArangoService:
-    container: ConnectorAppContainer = request.app.container
-    arango_service = await container.arango_service()
-    return arango_service
+async def get_graph_provider(request: Request) -> IGraphDBProvider:
+    """Return graph DB provider from app state (set at startup)."""
+    return request.app.state.graph_provider
 
 async def get_kafka_service(request: Request) -> KafkaService:
     container: ConnectorAppContainer = request.app.container
-    kafka_service = container.kafka_service()
-    return kafka_service
-
-async def get_drive_webhook_handler(request: Request) -> Optional[AbstractDriveWebhookHandler]:
-    try:
-        container: ConnectorAppContainer = request.app.container
-        drive_webhook_handler = container.drive_webhook_handler()
-        return drive_webhook_handler
-    except Exception as e:
-        logger.warning(f"Failed to get drive webhook handler: {str(e)}")
-        return None
+    return container.kafka_service()
 
 def _parse_comma_separated_str(value: Optional[str]) -> Optional[List[str]]:
     """Parses a comma-separated string into a list of strings, filtering out empty items."""
@@ -337,130 +334,7 @@ def _trim_connector_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     return trimmed_config
 
-@router.post("/drive/webhook")
-@inject
-async def handle_drive_webhook(request: Request, background_tasks: BackgroundTasks) -> dict:
-    """Handle incoming webhook notifications from Google Drive"""
-    try:
-
-        verifier = WebhookAuthVerifier(logger)
-        if not await verifier.verify_request(request):
-            raise HTTPException(status_code=HttpStatusCode.UNAUTHORIZED.value, detail="Unauthorized webhook request")
-
-        drive_webhook_handler = await get_drive_webhook_handler(request)
-
-        if drive_webhook_handler is None:
-            logger.warning(
-                "Drive webhook handler not yet initialized - skipping webhook processing"
-            )
-            return {
-                "status": "skipped",
-                "message": "Webhook handler not yet initialized",
-            }
-
-        # Log incoming request details
-        headers = dict(request.headers)
-        logger.info("📥 Incoming webhook request")
-
-        # Get important headers
-        resource_state = (
-            headers.get("X-Goog-Resource-State")
-            or headers.get("x-goog-resource-state")
-            or headers.get("X-GOOG-RESOURCE-STATE")
-        )
-
-        logger.info("Resource state: %s", resource_state)
-
-        # Process notification in background
-        if resource_state != "sync":
-            background_tasks.add_task(
-                drive_webhook_handler.process_notification, headers
-            )
-            return {"status": "accepted"}
-        else:
-            logger.info("Received sync verification request")
-            return {"status": "sync_verified"}
-
-    except Exception as e:
-        logger.error("Error processing webhook: %s", str(e))
-        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
-
-
-async def get_gmail_webhook_handler(request: Request) -> Optional[AbstractGmailWebhookHandler]:
-    try:
-        container: ConnectorAppContainer = request.app.container
-        gmail_webhook_handler = container.gmail_webhook_handler()
-        return gmail_webhook_handler
-    except Exception as e:
-        logger.warning(f"Failed to get gmail webhook handler: {str(e)}")
-        return None
-
-
-@router.get("/gmail/webhook")
-@router.post("/gmail/webhook")
-@inject
-async def handle_gmail_webhook(request: Request, background_tasks: BackgroundTasks) -> dict:
-    """Handles incoming Pub/Sub messages"""
-    try:
-        gmail_webhook_handler = await get_gmail_webhook_handler(request)
-
-        if gmail_webhook_handler is None:
-            logger.warning(
-                "Gmail webhook handler not yet initialized - skipping webhook processing"
-            )
-            return {
-                "status": "skipped",
-                "message": "Webhook handler not yet initialized",
-            }
-
-        body = await request.json()
-        logger.info("Received webhook request: %s", body)
-
-        # Get the message from the body
-        message = body.get("message")
-        if not message:
-            logger.warning("No message found in webhook body")
-            return {"status": "error", "message": "No message found"}
-
-        # Decode the message data
-        data = message.get("data", "")
-        if data:
-            try:
-                decoded_data = base64.b64decode(data).decode("utf-8")
-                notification = json.loads(decoded_data)
-
-                # Process the notification
-                background_tasks.add_task(
-                    gmail_webhook_handler.process_notification,
-                    request.headers,
-                    notification,
-                )
-
-                return {"status": "ok"}
-            except Exception as e:
-                logger.error("Error processing message data: %s", str(e))
-                raise HTTPException(
-                    status_code=HttpStatusCode.BAD_REQUEST.value,
-                    detail=f"Invalid message data format: {str(e)}",
-                )
-        else:
-            logger.warning("No data found in message")
-            return {"status": "error", "message": "No data found"}
-
-    except json.JSONDecodeError as e:
-        logger.error("Invalid JSON in webhook body: %s", str(e))
-        raise HTTPException(
-            status_code=HttpStatusCode.BAD_REQUEST.value,
-            detail=f"Invalid JSON format: {str(e)}",
-        )
-    except Exception as e:
-        logger.error("Error processing webhook: %s", str(e))
-        raise HTTPException(
-            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=str(e)
-        )
-
-
-@router.get("/api/v1/{org_id}/{user_id}/{connector}/record/{record_id}/signedUrl")
+@router.get("/api/v1/{org_id}/{user_id}/{connector}/record/{record_id}/signedUrl", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 @inject
 async def get_signed_url(
     org_id: str,
@@ -484,45 +358,15 @@ async def get_signed_url(
         return {"signedUrl": signed_url}
     except Exception as e:
         logger.error(f"Error getting signed URL: {repr(e)}")
-        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=str(e))
+        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
-
-async def get_google_docs_parser(request: Request) -> Optional[GoogleDocsParser]:
-    try:
-        container: ConnectorAppContainer = request.app.container
-        google_docs_parser = container.google_docs_parser()
-        return google_docs_parser
-    except Exception as e:
-        logger.warning(f"Failed to get google docs parser: {str(e)}")
-        return None
-
-
-async def get_google_sheets_parser(request: Request) -> Optional[GoogleSheetsParser]:
-    try:
-        container: ConnectorAppContainer = request.app.container
-        google_sheets_parser = container.google_sheets_parser()
-        return google_sheets_parser
-    except Exception as e:
-        logger.warning(f"Failed to get google sheets parser: {str(e)}")
-        return None
-
-
-async def get_google_slides_parser(request: Request) -> Optional[GoogleSlidesParser]:
-    try:
-        container: ConnectorAppContainer = request.app.container
-        google_slides_parser = container.google_slides_parser()
-        return google_slides_parser
-    except Exception as e:
-        logger.warning(f"Failed to get google slides parser: {str(e)}")
-        return None
-
-@router.delete("/api/v1/delete/record/{record_id}")
+@router.delete("/api/v1/delete/record/{record_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_DELETE))])
 @inject
 async def handle_record_deletion(
-    record_id: str, arango_service=Depends(Provide[ConnectorAppContainer.arango_service])
+    record_id: str, graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Optional[dict]:
     try:
-        response = await arango_service.delete_records_and_relations(
+        response = await graph_provider.delete_records_and_relations(
             record_id, hard_delete=True
         )
         if not response:
@@ -541,14 +385,14 @@ async def handle_record_deletion(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Internal server error while deleting record: {str(e)}",
-        )
+        ) from e
 
 @router.get("/api/v1/internal/stream/record/{record_id}/", response_model=None)
 @inject
 async def stream_record_internal(
     request: Request,
     record_id: str,
-    arango_service: BaseArangoService = Depends(Provide[ConnectorAppContainer.arango_service]),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
     config_service: ConfigurationService = Depends(Provide[ConnectorAppContainer.config_service])
 ) -> Optional[dict | StreamingResponse]:
     """
@@ -562,6 +406,7 @@ async def stream_record_internal(
                 status_code=HttpStatusCode.UNAUTHORIZED.value,
                 detail="Missing or invalid Authorization header",
             )
+
         # Extract the token
         token = auth_header.split(" ")[1]
         secret_keys = await config_service.get_config(
@@ -572,16 +417,28 @@ async def stream_record_internal(
         # TODO: Validate scopes ["connector:signedUrl"]
 
         org_id = payload.get("orgId")
-        org_task = arango_service.get_document(org_id, CollectionNames.ORGS.value)
-        record_task = arango_service.get_record_by_id(
-            record_id
-        )
-        org, record = await asyncio.gather(org_task, record_task)
+        if not org_id:
+            raise HTTPException(
+                status_code=HttpStatusCode.UNAUTHORIZED.value,
+                detail="Missing orgId in token"
+            )
 
-        if not org:
-            raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Organization not found")
+        record_task = graph_provider.get_record_by_id(record_id)
+        org_task = graph_provider.get_document(org_id, CollectionNames.ORGS.value)
+        record, org = await asyncio.gather(record_task, org_task)
+
         if not record:
             raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Record not found")
+
+        # Prefer the org_id stored on the record itself — the JWT org_id may differ
+        # if the token was issued for a slightly different context.
+        effective_org_id = record.org_id or org_id
+        if not org:
+            # Retry with the record's own org_id in case it differs from the JWT claim
+            if effective_org_id != org_id:
+                org = await graph_provider.get_document(effective_org_id, CollectionNames.ORGS.value)
+            if not org:
+                raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Organization not found")
 
         connector_name = record.connector_name.value.lower().replace(" ", "")
         container: ConnectorAppContainer = request.app.container
@@ -592,7 +449,7 @@ async def stream_record_internal(
             storage_url = endpoints.get("storage").get("endpoint", DefaultEndpoints.STORAGE_ENDPOINT.value)
             buffer_url = f"{storage_url}/api/v1/document/internal/{record.external_record_id}/buffer"
             jwt_payload  = {
-                "orgId": org_id,
+                "orgId": effective_org_id,
                 "scopes": ["storage:token"],
             }
             token = await generate_jwt(config_service, jwt_payload)
@@ -605,27 +462,45 @@ async def stream_record_internal(
             else:
                 buffer = response['data']
 
-            return Response(content=buffer or b'', media_type="application/octet-stream")
+            # Get the correct MIME type from the record
+            mime_type = get_mime_type_from_record(record)
+            return Response(content=buffer or b'', media_type=mime_type)
 
         connector_id = record.connector_id
-        connector = container.connectors_map[connector_id]
-        if not connector:
+        connector_instance = await graph_provider.get_document(connector_id, CollectionNames.APPS.value)
+        if not connector_instance:
             raise HTTPException(
                 status_code=HttpStatusCode.NOT_FOUND.value,
-                detail=f"Connector '{connector_name}' not found"
+                detail="The connector for this document no longer exists or was deleted. The document cannot be streamed.",
             )
-        buffer = await connector.stream_record(record)
-        return buffer
+
+        connector_display_name = (
+            connector_instance.get("name") or connector_instance.get("type") or record.connector_name.value or "Connector"
+        )
+
+        connector_obj: BaseConnector = container.connectors_map.get(connector_id)
+        if not connector_obj:
+            raise HTTPException(
+                status_code=HttpStatusCode.UNHEALTHY.value,
+                detail=f"The connector '{connector_display_name}' is currently Disabled. Enable it from Connector Settings and try again.",
+            )
+
+        if connector_obj.get_app_name() == Connectors.GOOGLE_DRIVE_WORKSPACE or connector_obj.get_app_name() == Connectors.GOOGLE_MAIL_WORKSPACE:
+            return await connector_obj.stream_record(record, payload.get("userId"))
+        else:
+            return await connector_obj.stream_record(record)
 
     except JWTError as e:
         logger.error("JWT validation error: %s", str(e))
-        raise HTTPException(status_code=HttpStatusCode.UNAUTHORIZED.value, detail="Invalid or expired token")
+        raise HTTPException(status_code=HttpStatusCode.UNAUTHORIZED.value, detail="Invalid or expired token") from e
     except ValidationError as e:
         logger.error("Payload validation error: %s", str(e))
-        raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail="Invalid token payload")
+        raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail="Invalid token payload") from e
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("Unexpected error during token validation: %s", str(e))
-        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error validating token")
+        logger.error("Unexpected error in stream_record_internal: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error streaming record") from e
 
 @router.get("/api/v1/index/{org_id}/{connector}/record/{record_id}", response_model=None)
 @inject
@@ -636,9 +511,7 @@ async def download_file(
     connector: str,
     token: str,
     signed_url_handler=Depends(Provide[ConnectorAppContainer.signed_url_handler]),
-    arango_service: BaseArangoService = Depends(Provide[ConnectorAppContainer.arango_service]),
-    google_token_handler: GoogleTokenHandler = Depends(Provide[ConnectorAppContainer.google_token_handler]),
-    config_service: ConfigurationService = Depends(Provide[ConnectorAppContainer.config_service])
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
 ) -> Optional[dict | StreamingResponse]:
     try:
         logger.info(f"Downloading file {record_id} with connector {connector}")
@@ -658,377 +531,71 @@ async def download_file(
             )
 
         # Get org details to determine account type
-        org = await arango_service.get_document(org_id, CollectionNames.ORGS.value)
+        org = await graph_provider.get_document(org_id, CollectionNames.ORGS.value)
         if not org:
             raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Organization not found")
 
         # Get record details
-        record = await arango_service.get_record_by_id(
+        record = await graph_provider.get_record_by_id(
             record_id
         )
         if not record:
             raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Record not found")
 
-        external_record_id = record.external_record_id
         connector_id = record.connector_id
-        creds = None
-        # Get connector instance to check scope
-        connector_instance = await arango_service.get_document(connector_id, CollectionNames.APPS.value)
-        connector_type = connector_instance.get("type", None)
-        if connector_type is None:
-            raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Connector not found")
-        if connector_type.lower() == Connectors.GOOGLE_DRIVE.value.lower() or connector_type.lower() == Connectors.GOOGLE_MAIL.value.lower():
-            connector_scope = connector_instance.get("scope", ConnectorScope.PERSONAL.value) if connector_instance else ConnectorScope.PERSONAL.value
+        # Get connector instance to check scope and existence
+        connector_instance = await graph_provider.get_document(connector_id, CollectionNames.APPS.value)
+        connector_type = connector_instance.get("type", None) if connector_instance else None
+        if not connector_instance or connector_type is None:
+            raise HTTPException(
+                status_code=HttpStatusCode.NOT_FOUND.value,
+                detail="The connector for this record no longer exists or was deleted. The record cannot be streamed.",
+            )
 
-            # Use service account credentials only for TEAM scope connectors in enterprise/business accounts
-            # Personal scope connectors always use user credentials regardless of account type
-            if (org["accountType"] in [AccountType.ENTERPRISE.value, AccountType.BUSINESS.value] and
-                connector_scope == ConnectorScope.TEAM.value):
-                # Use service account credentials for team scope in enterprise accounts
-                creds = await get_service_account_credentials(org_id, user_id, logger, arango_service, google_token_handler, request.app.container, connector, connector_id)
-            else:
-                # Use user credentials for personal scope or individual accounts
-                creds = await get_user_credentials(org_id, user_id, logger, google_token_handler, request.app.container,connector,connector_id)
-        # Download file based on connector type
+        connector_display_name = (
+            connector_instance.get("name") or connector_instance.get("type") or record.connector_name.value or "Connector"
+        )
+
+        # Handle KB separately - fetch from storage service
+        container: ConnectorAppContainer = request.app.container
         try:
-            if connector_type.lower() == Connectors.GOOGLE_DRIVE.value.lower():
-                file_id = external_record_id
-                logger.info(f"Downloading Drive file: {file_id}")
-                # Build the Drive service
-                drive_service = build("drive", "v3", credentials=creds)
-
-                file = await arango_service.get_document(
-                    record_id, CollectionNames.FILES.value
-                )
-                if not file:
-                    raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="File not found")
-                mime_type = file.get("mimeType", "application/octet-stream")
-                google_workspace_export_formats = {
-                    "application/vnd.google-apps.spreadsheet": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # Excel format
-                    "application/vnd.google-apps.document": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # Word format
-                    "application/vnd.google-apps.presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # PowerPoint format
-                }
-
-                if mime_type in google_workspace_export_formats:
-                    async def file_stream(export_mime_type) -> AsyncGenerator[bytes, None]:
-                        file_buffer = io.BytesIO()
-                        try:
-                            logger.info(f"Exporting Google Workspace file ({mime_type}) to {export_mime_type}")
-                            request = drive_service.files().export_media(fileId=file_id,mimeType=export_mime_type)
-                            downloader = MediaIoBaseDownload(file_buffer, request)
-
-                            done = False
-                            while not done:
-                                status, done = downloader.next_chunk()
-                                logger.info(f"Download {int(status.progress() * 100)}%.")
-
-                            # Reset buffer position to start
-                            file_buffer.seek(0)
-
-                            # Stream the response with content type from metadata
-                            logger.info("Initiating streaming response...")
-                            yield file_buffer.read()
-
-                        except Exception as download_error:
-                            logger.error(f"Download failed: {repr(download_error)}")
-                            if hasattr(download_error, "response"):
-                                logger.error(
-                                    f"Response status: {download_error.response.status_code}"
-                                )
-                                logger.error(
-                                    f"Response content: {download_error.response.content}"
-                                )
-                            raise HTTPException(
-                                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                                detail=f"File download failed: {repr(download_error)}",
-                            )
-                        finally:
-                            file_buffer.close()
-                    return create_stream_record_response(
-                        file_stream(google_workspace_export_formats[mime_type]),
-                        filename=record.record_name,
-                        mime_type=google_workspace_export_formats[mime_type],
-                        fallback_filename=f"record_{record_id}"
-                    )
-
-                # Enhanced logging for regular file download as a default fallback
-                logger.info(f"Starting binary file download for file_id: {file_id}")
-
-                async def file_stream() -> AsyncGenerator[bytes, None]:
-                    file_buffer = io.BytesIO()
-                    try:
-                        logger.info("Initiating download process...")
-                        request = drive_service.files().get_media(fileId=file_id)
-                        downloader = MediaIoBaseDownload(file_buffer, request)
-
-                        done = False
-                        while not done:
-                            status, done = downloader.next_chunk()
-                            logger.info(f"Download {int(status.progress() * 100)}%.")
-
-                        # Reset buffer position to start
-                        file_buffer.seek(0)
-
-                        # Stream the response with content type from metadata
-                        logger.info("Initiating streaming response...")
-                        yield file_buffer.read()
-
-                    except Exception as download_error:
-                        logger.error(f"Download failed: {repr(download_error)}")
-                        if hasattr(download_error, "response"):
-                            logger.error(
-                                f"Response status: {download_error.response.status_code}"
-                            )
-                            logger.error(
-                                f"Response content: {download_error.response.content}"
-                            )
-                        raise HTTPException(
-                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                            detail=f"File download failed: {repr(download_error)}",
-                        )
-                    finally:
-                        file_buffer.close()
-
-                # Return streaming response with proper headers
-                return create_stream_record_response(
-                    file_stream(),
-                    filename=record.record_name,
-                    mime_type=mime_type,
-                    fallback_filename=f"record_{record_id}"
+            connector_obj: BaseConnector = container.connectors_map.get(connector_id)
+            if not connector_obj:
+                raise HTTPException(
+                    status_code=HttpStatusCode.UNHEALTHY.value,
+                    detail=f"The connector '{connector_display_name}' is currently Disabled. Enable it from Connector Settings and try again.",
                 )
 
-            elif connector_type.lower() == Connectors.GOOGLE_MAIL.value.lower():
-                file_id = external_record_id
-                logger.info(f"Downloading Gmail attachment for record_id: {record_id}")
-                gmail_service = build("gmail", "v1", credentials=creds)
-
-                # Get the related message's externalRecordId using AQL
-                aql_query = f"""
-                FOR v, e IN 1..1 ANY '{CollectionNames.RECORDS.value}/{record_id}' {CollectionNames.RECORD_RELATIONS.value}
-                    FILTER e.relationType == '{RecordRelations.ATTACHMENT.value}'
-                    RETURN {{
-                        messageId: v.externalRecordId,
-                        _key: v._key,
-                        relationType: e.relationType
-                    }}
-                """
-
-                cursor = arango_service.db.aql.execute(aql_query)
-                messages = list(cursor)
-
-                async def attachment_stream() -> AsyncGenerator[bytes, None]:
-                    try:
-                        # First try getting the attachment from Gmail
-                        message_id = None
-                        if messages and messages[0]:
-                            message = messages[0]
-                            message_id = message["messageId"]
-                            logger.info(f"Found message ID: {message_id}")
-                        else:
-                            logger.warning("Related message not found, returning empty buffer")
-                            yield b""
-                            return
-
-                        try:
-                            # Check if file_id is a combined ID (messageId_partId format)
-                            actual_attachment_id = file_id
-                            if "_" in file_id:
-                                try:
-                                    message_id, part_id = file_id.split("_", 1)
-
-                                    # Fetch the message to get the actual attachment ID
-                                    try:
-                                        message = (
-                                            gmail_service.users()
-                                            .messages()
-                                            .get(userId="me", id=message_id, format="full")
-                                            .execute()
-                                        )
-                                    except Exception as access_error:
-                                        if hasattr(access_error, 'resp') and access_error.resp.status == HttpStatusCode.NOT_FOUND.value:
-                                            logger.info(f"Message not found with ID {message_id}, searching for related messages...")
-
-                                            # Get messageIdHeader from the original mail
-                                            file_key = await arango_service.get_key_by_external_message_id(message_id)
-                                            aql_query = """
-                                            FOR mail IN mails
-                                                FILTER mail._key == @file_key
-                                                RETURN mail.messageIdHeader
-                                            """
-                                            bind_vars = {"file_key": file_key}
-                                            cursor = arango_service.db.aql.execute(aql_query, bind_vars=bind_vars)
-                                            message_id_header = next(cursor, None)
-
-                                            if not message_id_header:
-                                                raise HTTPException(
-                                                    status_code=HttpStatusCode.NOT_FOUND.value,
-                                                    detail="Original mail not found"
-                                                )
-
-                                            # Find all mails with the same messageIdHeader
-                                            aql_query = """
-                                            FOR mail IN mails
-                                                FILTER mail.messageIdHeader == @message_id_header
-                                                AND mail._key != @file_key
-                                                RETURN mail._key
-                                            """
-                                            bind_vars = {"message_id_header": message_id_header, "file_key": file_key}
-                                            cursor = arango_service.db.aql.execute(aql_query, bind_vars=bind_vars)
-                                            related_mail_keys = list(cursor)
-
-                                            # Try each related mail ID until we find one that works
-                                            message = None
-                                            for related_key in related_mail_keys:
-                                                related_mail = await arango_service.get_document(related_key, CollectionNames.RECORDS.value)
-                                                related_message_id = related_mail.get("externalRecordId")
-                                                try:
-                                                    message = (
-                                                        gmail_service.users()
-                                                        .messages()
-                                                        .get(userId="me", id=related_message_id, format="full")
-                                                        .execute()
-                                                    )
-                                                    if message:
-                                                        logger.info(f"Found accessible message with ID: {related_message_id}")
-                                                        message_id = related_message_id  # Update message_id to use the accessible one
-                                                        break
-                                                except Exception as e:
-                                                    logger.warning(f"Failed to fetch message with ID {related_message_id}: {str(e)}")
-                                                    continue
-
-                                            if not message:
-                                                raise HTTPException(
-                                                    status_code=HttpStatusCode.NOT_FOUND.value,
-                                                    detail="No accessible messages found."
-                                                )
-                                        else:
-                                            raise access_error
-
-                                    if not message or "payload" not in message:
-                                        raise Exception(f"Message or payload not found for message ID {message_id}")
-
-                                    # Search for the part with matching partId
-                                    parts = message["payload"].get("parts", [])
-                                    for part in parts:
-                                        if part.get("partId") == part_id:
-                                            actual_attachment_id = part.get("body", {}).get("attachmentId")
-                                            if not actual_attachment_id:
-                                                raise Exception("Attachment ID not found in part body")
-                                            logger.info(f"Found attachment ID: {actual_attachment_id}")
-                                            break
-                                    else:
-                                        raise Exception("Part ID not found in message")
-
-                                except Exception as e:
-                                    logger.error(f"Error extracting attachment ID: {str(e)}")
-                                    raise HTTPException(
-                                        status_code=HttpStatusCode.BAD_REQUEST.value,
-                                        detail=f"Invalid attachment ID format: {str(e)}"
-                                    )
-
-                            # Try to get the attachment with potential fallback message_id
-                            try:
-                                attachment = (
-                                    gmail_service.users()
-                                    .messages()
-                                    .attachments()
-                                    .get(userId="me", messageId=message_id, id=actual_attachment_id)
-                                    .execute()
-                                )
-                            except Exception as attachment_error:
-                                if hasattr(attachment_error, 'resp') and attachment_error.resp.status == HttpStatusCode.NOT_FOUND.value:
-                                    raise HTTPException(
-                                        status_code=HttpStatusCode.NOT_FOUND.value,
-                                        detail="Attachment not found in accessible messages"
-                                    )
-                                raise attachment_error
-
-                            # Decode the attachment data
-                            file_data = base64.urlsafe_b64decode(attachment["data"])
-                            yield file_data
-
-                        except Exception as gmail_error:
-                            logger.info(
-                                f"Failed to get attachment from Gmail: {str(gmail_error)}, trying Drive..."
-                            )
-
-                            # Try to get the file from Drive as fallback
-                            file_buffer = io.BytesIO()
-                            try:
-                                drive_service = build("drive", "v3", credentials=creds)
-                                request = drive_service.files().get_media(
-                                    fileId=file_id
-                                )
-                                downloader = MediaIoBaseDownload(file_buffer, request)
-
-                                done = False
-                                while not done:
-                                    status, done = downloader.next_chunk()
-                                    logger.info(
-                                        f"Download {int(status.progress() * 100)}%."
-                                    )
-
-                                    # Yield current chunk and reset buffer
-                                    file_buffer.seek(0)
-                                    yield file_buffer.getvalue()
-                                    file_buffer.seek(0)
-                                    file_buffer.truncate()
-
-                            except Exception as drive_error:
-                                logger.error(
-                                    f"Failed to get file from both Gmail and Drive. Gmail error: {str(gmail_error)}, Drive error: {str(drive_error)}"
-                                )
-                                raise HTTPException(
-                                    status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                                    detail="Failed to download file from both Gmail and Drive",
-                                )
-                            finally:
-                                file_buffer.close()
-
-                    except Exception as e:
-                        logger.error(f"Error in attachment stream: {str(e)}")
-                        raise HTTPException(
-                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                            detail=f"Error streaming attachment: {str(e)}",
-                        )
-
-                return StreamingResponse(
-                    attachment_stream(), media_type="application/octet-stream"
-                )
-
+            if connector_obj.get_app_name() == Connectors.GOOGLE_DRIVE_WORKSPACE or connector_obj.get_app_name() == Connectors.GOOGLE_MAIL_WORKSPACE:
+                buffer = await connector_obj.stream_record(record, user_id)
             else:
-                container: ConnectorAppContainer = request.app.container
-                connector: BaseConnector = container.connectors_map[connector_id]
-                if not connector:
-                    raise HTTPException(
-                        status_code=HttpStatusCode.NOT_FOUND.value,
-                        detail=f"Connector '{connector_id}' not found"
-                    )
-                buffer = await connector.stream_record(record)
-                return buffer
+                buffer = await connector_obj.stream_record(record)
 
+            return buffer
+
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error downloading file: {str(e)}")
             raise HTTPException(
                 status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=f"Error downloading file: {str(e)}"
-            )
+            ) from e
 
     except HTTPException as e:
         logger.error("HTTPException: %s", str(e))
         raise e
     except Exception as e:
         logger.error("Error downloading file: %s", str(e))
-        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error downloading file")
+        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error downloading file") from e
 
 
-@router.get("/api/v1/stream/record/{record_id}", response_model=None)
+@router.get("/api/v1/stream/record/{record_id}", response_model=None, dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 @inject
 async def stream_record(
     request: Request,
     record_id: str,
     convertTo: str = Query(None, description="Convert file to this format"),
-    arango_service: BaseArangoService = Depends(Provide[ConnectorAppContainer.arango_service]),
-    google_token_handler: GoogleTokenHandler = Depends(Provide[ConnectorAppContainer.google_token_handler]),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
     config_service: ConfigurationService = Depends(Provide[ConnectorAppContainer.config_service])
 ) -> Optional[dict | StreamingResponse]:
     """
@@ -1051,671 +618,131 @@ async def stream_record(
             )
             jwt_secret = secret_keys.get("jwtSecret")
             payload = jwt.decode(token, jwt_secret, algorithms=["HS256"])
+
             org_id = payload.get("orgId")
             user_id = payload.get("userId")
         except JWTError as e:
             logger.error("JWT validation error: %s", str(e))
-            raise HTTPException(status_code=HttpStatusCode.UNAUTHORIZED.value, detail="Invalid or expired token")
+            raise HTTPException(status_code=HttpStatusCode.UNAUTHORIZED.value, detail="Invalid or expired token") from e
         except ValidationError as e:
             logger.error("Payload validation error: %s", str(e))
-            raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail="Invalid token payload")
+            raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail="Invalid token payload") from e
         except Exception as e:
             logger.error("Unexpected error during token validation: %s", str(e))
-            raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error validating token")
+            raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error validating token") from e
 
-        org_task = arango_service.get_document(org_id, CollectionNames.ORGS.value)
-        record_task = arango_service.get_record_by_id(
+        org_task = graph_provider.get_document(org_id, CollectionNames.ORGS.value)
+        record_task = graph_provider.get_record_by_id(
             record_id
         )
         org, record = await asyncio.gather(org_task, record_task)
-
         if not org:
             raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Organization not found")
         if not record:
             raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Record not found")
 
-        external_record_id = record.external_record_id
-        connector = record.connector_name.value
+        # Validate that the org_id matches the record's org_id
+        if record and record.org_id and record.org_id != org_id:
+            logger.warning(f"OrgId mismatch: JWT has {org_id}, but record has {record.org_id}. Using record's org_id.")
+            org_id = record.org_id
+            org = await graph_provider.get_document(org_id, CollectionNames.ORGS.value)
+            if not org:
+                raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Organization not found")
+
+        # Permission check: Verify user has access to this record
+        # This handles both KB-level and direct record permissions
+        access_check = await graph_provider.check_record_access_with_details(user_id, org_id, record_id)
+        if not access_check:
+            logger.warning(f"User {user_id} does not have access to record {record_id}")
+            raise HTTPException(
+                status_code=HttpStatusCode.FORBIDDEN.value,
+                detail="You do not have permission to access this record"
+            )
+
+        connector_name = record.connector_name.value.lower().replace(" ", "")
         connector_id = record.connector_id
-        recordType = record.record_type
-        logger.info(f"Connector: {connector} connector_id: {connector_id}")
-        # Different auth handling based on account type and connector scope
-        creds = None
+        logger.info(f"Connector: {connector_name} connector_id: {connector_id}")
 
-        if connector.lower() == Connectors.GOOGLE_DRIVE.value.lower() or connector.lower() == Connectors.GOOGLE_MAIL.value.lower():
-            # Get connector instance to check scope
-            connector_instance = await arango_service.get_document(connector_id, CollectionNames.APPS.value)
-            connector_scope = connector_instance.get("scope", ConnectorScope.PERSONAL.value) if connector_instance else ConnectorScope.PERSONAL.value
-            # Use service account credentials only for TEAM scope connectors in enterprise/business accounts
-            # Personal scope connectors always use user credentials regardless of account type
-            if (org["accountType"] in [AccountType.ENTERPRISE.value, AccountType.BUSINESS.value] and
-                connector_scope == ConnectorScope.TEAM.value):
-                # Use service account credentials for team scope in enterprise accounts
-                creds = await get_service_account_credentials(org_id, user_id, logger, arango_service, google_token_handler, request.app.container,connector, connector_id)
-            else:
-                # Use user credentials for personal scope or individual accounts
-                creds = await get_user_credentials(org_id, user_id,logger, google_token_handler, request.app.container,connector=connector, connector_id=connector_id)
-        # Download file based on connector type
+        # Check if the connector still exists in the graph (not deleted)
+        connector_instance = await graph_provider.get_document(connector_id, CollectionNames.APPS.value)
+        if not connector_instance:
+            raise HTTPException(
+                status_code=HttpStatusCode.NOT_FOUND.value,
+                detail="The connector for this record no longer exists or was deleted. The record cannot be streamed.",
+            )
+
+        connector_display_name = (
+            connector_instance.get("name") or connector_instance.get("type") or record.connector_name.value or "Connector"
+        )
+
+        container: ConnectorAppContainer = request.app.container
+
         try:
-            if connector.lower() == Connectors.GOOGLE_DRIVE.value.lower():
-                file_id = external_record_id
-                logger.info(f"Downloading Drive file: {file_id}")
-                drive_service = build("drive", "v3", credentials=creds)
-                file_name = record.record_name
-                file = await arango_service.get_document(
-                    record_id, CollectionNames.FILES.value
-                )
-                if not file:
-                    raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="File not found")
-
-                mime_type = file.get("mimeType", "application/octet-stream")
-
-                # Handle Google Workspace files (they need to be exported, not downloaded)
-                # Map Google Workspace mime types to export formats
-                google_workspace_export_formats = {
-                    "application/vnd.google-apps.spreadsheet": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # Excel format
-                    "application/vnd.google-apps.document": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # Word format
-                    "application/vnd.google-apps.presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # PowerPoint format
-                }
-
-                # Check if PDF conversion is requested for Google Workspace files
-                if convertTo == MimeTypes.PDF.value and mime_type in google_workspace_export_formats:
-                    logger.info(f"Exporting Google Workspace file ({mime_type}) directly to PDF")
-
-                    request = drive_service.files().export_media(fileId=file_id, mimeType="application/pdf")
-                    return StreamingResponse(
-                        _stream_google_api_request(request, error_context="PDF export"),
-                        media_type="application/pdf",
-                        headers={
-                            "Content-Disposition": f'inline; filename="{Path(file_name).stem}.pdf"'
-                        },
-                    )
-
-                # Regular export for Google Workspace files (not PDF conversion)
-                if mime_type in google_workspace_export_formats:
-                    export_mime_type = google_workspace_export_formats[mime_type]
-                    logger.info(f"Exporting Google Workspace file ({mime_type}) to {export_mime_type}")
-
-                    # Export and stream the file
-                    request = drive_service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-
-                    # Determine the appropriate file extension and media type for the response
-                    export_media_types = {
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"),
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"),
-                        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ("application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"),
-                    }
-
-                    response_media_type, file_ext = export_media_types.get(export_mime_type, (export_mime_type, ""))
-
-                    file_name_with_ext = file_name if file_name.endswith(file_ext) else f"{file_name}{file_ext}"
-
-                    return create_stream_record_response(
-                        _stream_google_api_request(request, error_context="Google Workspace file export"),
-                        filename=file_name_with_ext,
-                        mime_type=response_media_type,
-                        fallback_filename=f"record_{record_id}"
-                    )
-
-                # Check if PDF conversion is requested (for regular files only, Google Workspace handled above)
-                if convertTo == MimeTypes.PDF.value:
-                    logger.info(f"Converting file to PDF: {file_name}")
-                    # For regular files, download and convert to PDF
-                    with tempfile.TemporaryDirectory() as temp_dir:
-                        temp_file_path = os.path.join(temp_dir, file_name)
-
-                        # Download file to temp directory
-                        try:
-                            with open(temp_file_path, "wb") as f:
-                                request = drive_service.files().get_media(fileId=file_id)
-                                downloader = MediaIoBaseDownload(f, request)
-
-                                done = False
-                                while not done:
-                                    status, done = downloader.next_chunk()
-                                    logger.info(
-                                        f"Download {int(status.progress() * 100)}%."
-                                    )
-                        except HttpError as http_error:
-                            # Check if this is a Google Workspace file that can't be downloaded directly
-                            if http_error.resp.status == HttpStatusCode.FORBIDDEN.value:
-                                error_details = http_error.error_details if hasattr(http_error, 'error_details') else []
-                                for detail in error_details:
-                                    if detail.get('reason') == 'fileNotDownloadable':
-                                        logger.error(
-                                            f"Google Workspace file cannot be downloaded for PDF conversion: {str(http_error)}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=HttpStatusCode.BAD_REQUEST.value,
-                                            detail="Google Workspace files (Sheets, Docs, Slides) cannot be converted to PDF using direct download. Please use the file's native export functionality.",
-                                        )
-                            raise
-
-                        # Convert to PDF
-                        pdf_path = await convert_to_pdf(temp_file_path, temp_dir)
-                        logger.info(f"PDF file converted: {pdf_path}")
-                        # Create async generator to properly handle file cleanup
-                        async def file_iterator() -> AsyncGenerator[bytes, None]:
-                            try:
-                                with open(pdf_path, "rb") as pdf_file:
-                                    yield await asyncio.to_thread(pdf_file.read)
-                            except Exception as e:
-                                logger.error(f"Error reading PDF file: {str(e)}")
-                                raise HTTPException(
-                                    status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                                    detail="Error reading converted PDF file",
-                                )
-
-                        return StreamingResponse(
-                            file_iterator(),
-                            media_type="application/pdf",
-                            headers={
-                                "Content-Disposition": f'inline; filename="{Path(file_name).stem}.pdf"'
-                            },
-                        )
-
-                # Regular file download without conversion - now with direct streaming
-                async def file_stream() -> AsyncGenerator[bytes, None]:
-                    try:
-                        chunk_count = 0
-                        total_bytes = 0
-
-                        request = drive_service.files().get_media(fileId=file_id)
-                        buffer = io.BytesIO()
-                        downloader = MediaIoBaseDownload(buffer, request)
-
-                        done = False
-                        while not done:
-                            try:
-                                _ , done = downloader.next_chunk()
-                                chunk_count += 1
-
-                                buffer.seek(0)
-                                chunk = buffer.read()
-                                total_bytes += len(chunk)
-
-                                if chunk:  # Only yield if we have data
-                                    yield chunk
-
-                                # Clear buffer for next chunk
-                                buffer.seek(0)
-                                buffer.truncate(0)
-
-                                # Yield control back to event loop
-                                await asyncio.sleep(0)
-
-                            except Exception as chunk_error:
-                                logger.error(
-                                    f"Error streaming chunk: {str(chunk_error)}"
-                                )
-                                raise HTTPException(
-                                    status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                                    detail="Error during file streaming",
-                                )
-                        logger.info(f"File streamed: {chunk_count} chunks, {total_bytes} bytes")
-
-                    except HttpError as http_error:
-                        logger.debug(f"HTTP error in file stream: {str(http_error)}")
-                        # Check if this is a Google Workspace file that can't be downloaded directly
-                        if http_error.resp.status == HttpStatusCode.FORBIDDEN.value:
-                            error_details = http_error.error_details if hasattr(http_error, 'error_details') else []
-                            for detail in error_details:
-                                if detail.get('reason') == 'fileNotDownloadable':
-                                    logger.error(
-                                        f"Google Workspace file cannot be downloaded directly: {str(http_error)}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=HttpStatusCode.BAD_REQUEST.value,
-                                        detail="Google Workspace files (Sheets, Docs, Slides) must be processed using their specific parsers. This file type is not supported for direct download.",
-                                    )
-                        logger.error(f"HTTP error in file stream: {str(http_error)}")
-                        raise HTTPException(
-                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                            detail=f"Error setting up file stream: {str(http_error)}",
-                        )
-                    except Exception as stream_error:
-                        logger.error(f"Error in file stream: {str(stream_error)}")
-                        raise HTTPException(
-                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error setting up file stream"
-                        )
-                    finally:
-                        buffer.close()
-
-
-                # Return streaming response with proper headers
-                return create_stream_record_response(
-                    file_stream(),
-                    filename=file_name,
-                    mime_type=mime_type,
-                    fallback_filename=f"record_{record_id}"
+            logger.info("Stream Record called at router")
+            logger.info(f"Connector: {connector_name} connector_id: {connector_id}")
+            connector_obj: BaseConnector = container.connectors_map.get(connector_id)
+            if not connector_obj:
+                raise HTTPException(
+                    status_code=HttpStatusCode.UNHEALTHY.value,
+                    detail=f"The connector '{connector_display_name}' is currently Disabled. Enable it from Connector Settings and try again.",
                 )
 
-            elif connector.lower() == Connectors.GOOGLE_MAIL.value.lower():
-                file_id = external_record_id
-                logger.info(
-                    f"Handling Gmail request for record_id: {record_id}, type: {recordType}"
-                )
-                gmail_service = build("gmail", "v1", credentials=creds)
-
-                if recordType == RecordTypes.MAIL.value:
-                    try:
-                        # First attempt to fetch the message directly
-                        try:
-                            message = (
-                                gmail_service.users()
-                                .messages()
-                                .get(userId="me", id=file_id, format="full")
-                                .execute()
-                            )
-                        except Exception as access_error:
-                            if hasattr(access_error, 'resp') and access_error.resp.status == HttpStatusCode.NOT_FOUND.value:
-                                logger.info(f"Message not found with ID {file_id}, searching for related messages...")
-
-                                # Get messageIdHeader from the original mail
-                                file_key = await arango_service.get_key_by_external_message_id(file_id)
-                                aql_query = """
-                                FOR mail IN mails
-                                    FILTER mail._key == @file_key
-                                    RETURN mail.messageIdHeader
-                                """
-                                bind_vars = {"file_key": file_key}
-                                cursor = arango_service.db.aql.execute(aql_query, bind_vars=bind_vars)
-                                message_id_header = next(cursor, None)
-
-                                if not message_id_header:
-                                    raise HTTPException(
-                                        status_code=HttpStatusCode.NOT_FOUND.value,
-                                        detail="Original mail not found"
-                                    )
-
-                                # Find all mails with the same messageIdHeader
-                                aql_query = """
-                                FOR mail IN mails
-                                    FILTER mail.messageIdHeader == @message_id_header
-                                    AND mail._key != @file_key
-                                    RETURN mail._key
-                                """
-                                bind_vars = {"message_id_header": message_id_header, "file_key": file_key}
-                                cursor = arango_service.db.aql.execute(aql_query, bind_vars=bind_vars)
-                                related_mail_keys = list(cursor)
-
-                                # Try each related mail ID until we find one that works
-                                message = None
-                                for related_key in related_mail_keys:
-                                    related_mail = await arango_service.get_document(related_key, CollectionNames.RECORDS.value)
-                                    related_id = related_mail.get("externalRecordId")
-                                    try:
-                                        message = (
-                                            gmail_service.users()
-                                            .messages()
-                                            .get(userId="me", id=related_id, format="full")
-                                            .execute()
-                                        )
-                                        if message:
-                                            logger.info(f"Found accessible message with ID: {related_id}")
-                                            break
-                                    except Exception as e:
-                                        logger.warning(f"Failed to fetch message with ID {related_id}: {str(e)}")
-                                        continue
-
-                                if not message:
-                                    raise HTTPException(
-                                        status_code=HttpStatusCode.NOT_FOUND.value,
-                                        detail="No accessible messages found."
-                                    )
-                            else:
-                                raise access_error
-
-                        # Continue with existing code for processing the message
-                        def extract_body(payload: dict) -> str:
-                            # If there are no parts, return the direct body data
-                            if "parts" not in payload:
-                                return payload.get("body", {}).get("data", "")
-
-                            # Search for a text/html part that isn't an attachment (empty filename)
-                            for part in payload.get("parts", []):
-                                if (
-                                    part.get("mimeType") == "text/html"
-                                    and part.get("filename", "") == ""
-                                ):
-                                    content = part.get("body", {}).get("data", "")
-                                    return content
-
-                            # Fallback: if no html text, try to use text/plain
-                            for part in payload.get("parts", []):
-                                if (
-                                    part.get("mimeType") == "text/plain"
-                                    and part.get("filename", "") == ""
-                                ):
-                                    content = part.get("body", {}).get("data", "")
-                                    return content
-                            return ""
-
-                        # Extract the encoded body content
-                        mail_content_base64 = extract_body(message.get("payload", {}))
-                        # Decode the Gmail URL-safe base64 encoded content; errors are replaced to avoid issues with malformed text
-                        mail_content = base64.urlsafe_b64decode(
-                            mail_content_base64.encode("ASCII")
-                        ).decode("utf-8", errors="replace")
-
-                        # Async generator to stream only the mail content
-                        async def message_stream() -> AsyncGenerator[bytes, None]:
-                            yield mail_content.encode("utf-8")
-
-                        # Return the streaming response with only the mail body
-                        return StreamingResponse(
-                            message_stream(), media_type="text/plain"
-                        )
-                    except Exception as mail_error:
-                        logger.error(f"Failed to fetch mail content: {str(mail_error)}")
-                        raise HTTPException(
-                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Failed to fetch mail content"
-                        )
-
-                # Handle attachment download
-                logger.info(f"Downloading Gmail attachment for record_id: {record_id}")
-
-                # Get file metadata first
-                file = await arango_service.get_document(
-                    record_id, CollectionNames.FILES.value
-                )
-                if not file:
-                    raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="File not found")
-
-                file_name = file.get("name", "")
-                mime_type = file.get("mimeType", "application/octet-stream")
-
-                # Get the related message's externalRecordId using AQL
-                aql_query = f"""
-                FOR v, e IN 1..1 ANY '{CollectionNames.RECORDS.value}/{record_id}' {CollectionNames.RECORD_RELATIONS.value}
-                    FILTER e.relationType == '{RecordRelations.ATTACHMENT.value}'
-                    RETURN {{
-                        messageId: v.externalRecordId,
-                        _key: v._key,
-                        relationType: e.relationType
-                    }}
-                """
-
-                cursor = arango_service.db.aql.execute(aql_query)
-                messages = list(cursor)
-
-                # First try getting the attachment from Gmail
-                try:
-                    message_id = None
-                    if messages and messages[0]:
-                        message = messages[0]
-                        message_id = message["messageId"]
-                        logger.info(f"Found message ID: {message_id}")
-                    else:
-                        raise Exception("Related message not found")
-
-                    # Check if file_id is a combined ID (messageId_partId format)
-                    actual_attachment_id = file_id
-                    if "_" in file_id:
-                        try:
-                            message_id, part_id = file_id.split("_", 1)
-
-                            # Fetch the message to get the actual attachment ID
-                            try:
-                                message = (
-                                    gmail_service.users()
-                                    .messages()
-                                    .get(userId="me", id=message_id, format="full")
-                                    .execute()
-                                )
-                            except Exception as access_error:
-                                if hasattr(access_error, 'resp') and access_error.resp.status == HttpStatusCode.NOT_FOUND.value:
-                                    logger.info(f"Message not found with ID {message_id}, searching for related messages...")
-
-                                    # Get messageIdHeader from the original mail
-                                    file_key = await arango_service.get_key_by_external_message_id(message_id)
-                                    aql_query = """
-                                    FOR mail IN mails
-                                        FILTER mail._key == @file_key
-                                        RETURN mail.messageIdHeader
-                                    """
-                                    bind_vars = {"file_key": file_key}
-                                    cursor = arango_service.db.aql.execute(aql_query, bind_vars=bind_vars)
-                                    message_id_header = next(cursor, None)
-
-                                    if not message_id_header:
-                                        raise HTTPException(
-                                            status_code=HttpStatusCode.NOT_FOUND.value,
-                                            detail="Original mail not found"
-                                        )
-
-                                    # Find all mails with the same messageIdHeader
-                                    aql_query = """
-                                    FOR mail IN mails
-                                        FILTER mail.messageIdHeader == @message_id_header
-                                        AND mail._key != @file_key
-                                        RETURN mail._key
-                                    """
-                                    bind_vars = {"message_id_header": message_id_header, "file_key": file_key}
-                                    cursor = arango_service.db.aql.execute(aql_query, bind_vars=bind_vars)
-                                    related_mail_keys = list(cursor)
-
-                                    # Try each related mail ID until we find one that works
-                                    message = None
-                                    for related_key in related_mail_keys:
-                                        related_mail = await arango_service.get_document(related_key, CollectionNames.RECORDS.value)
-                                        related_message_id = related_mail.get("externalRecordId")
-                                        try:
-                                            message = (
-                                                gmail_service.users()
-                                                .messages()
-                                                .get(userId="me", id=related_message_id, format="full")
-                                                .execute()
-                                            )
-                                            if message:
-                                                logger.info(f"Found accessible message with ID: {related_message_id}")
-                                                message_id = related_message_id  # Update message_id to use the accessible one
-                                                break
-                                        except Exception as e:
-                                            logger.warning(f"Failed to fetch message with ID {related_message_id}: {str(e)}")
-                                            continue
-
-                                    if not message:
-                                        raise HTTPException(
-                                            status_code=HttpStatusCode.NOT_FOUND.value,
-                                            detail="No accessible messages found."
-                                        )
-                                else:
-                                    raise access_error
-
-                            if not message or "payload" not in message:
-                                raise Exception(f"Message or payload not found for message ID {message_id}")
-
-                            # Search for the part with matching partId
-                            parts = message["payload"].get("parts", [])
-                            for part in parts:
-                                if part.get("partId") == part_id:
-                                    actual_attachment_id = part.get("body", {}).get("attachmentId")
-                                    if not actual_attachment_id:
-                                        raise Exception("Attachment ID not found in part body")
-                                    logger.info(f"Found attachment ID: {actual_attachment_id}")
-                                    break
-                            else:
-                                raise Exception("Part ID not found in message")
-
-                        except Exception as e:
-                            logger.error(f"Error extracting attachment ID: {str(e)}")
-                            raise HTTPException(
-                                status_code=HttpStatusCode.BAD_REQUEST.value,
-                                detail=f"Invalid attachment ID format: {str(e)}"
-                            )
-
-                    # Try to get the attachment with potential fallback message_id
-                    try:
-                        attachment = (
-                            gmail_service.users()
-                            .messages()
-                            .attachments()
-                            .get(userId="me", messageId=message_id, id=actual_attachment_id)
-                            .execute()
-                        )
-                    except Exception as attachment_error:
-                        if hasattr(attachment_error, 'resp') and attachment_error.resp.status == HttpStatusCode.NOT_FOUND.value:
-                            raise HTTPException(
-                                status_code=HttpStatusCode.NOT_FOUND.value,
-                                detail="Attachment not found in accessible messages"
-                            )
-                        raise attachment_error
-
-                    # Decode the attachment data
-                    file_data = base64.urlsafe_b64decode(attachment["data"])
-
-                    if convertTo == MimeTypes.PDF.value:
-                        with tempfile.TemporaryDirectory() as temp_dir:
-                            temp_file_path = os.path.join(temp_dir, file_name)
-
-                            # Write attachment data to temp file
-                            with open(temp_file_path, "wb") as f:
-                                f.write(file_data)
-
-                            # Convert to PDF
-                            pdf_path = await convert_to_pdf(temp_file_path, temp_dir)
-                            return StreamingResponse(
-                                open(pdf_path, "rb"),
-                                media_type="application/pdf",
-                                headers={
-                                    "Content-Disposition": f'inline; filename="{Path(file_name).stem}.pdf"'
-                                },
-                            )
-
-                    # Return original file if no conversion requested
-                    return StreamingResponse(
-                        iter([file_data]), media_type="application/octet-stream"
-                    )
-
-                except Exception as gmail_error:
-                    logger.info(
-                        f"Failed to get attachment from Gmail: {str(gmail_error)}, trying Drive..."
-                    )
-
-                    # Try Drive as fallback
-                    try:
-                        drive_service = build("drive", "v3", credentials=creds)
-
-                        if convertTo == MimeTypes.PDF.value:
-                            with tempfile.TemporaryDirectory() as temp_dir:
-                                temp_file_path = os.path.join(temp_dir, file_name)
-
-                                # Download from Drive to temp file
-                                with open(temp_file_path, "wb") as f:
-                                    request = drive_service.files().get_media(
-                                        fileId=file_id
-                                    )
-                                    downloader = MediaIoBaseDownload(f, request)
-
-                                    done = False
-                                    while not done:
-                                        status, done = downloader.next_chunk()
-                                        logger.info(
-                                            f"Download {int(status.progress() * 100)}%."
-                                        )
-
-                                # Convert to PDF
-                                pdf_path = await convert_to_pdf(
-                                    temp_file_path, temp_dir
-                                )
-                                return StreamingResponse(
-                                    open(pdf_path, "rb"),
-                                    media_type="application/pdf",
-                                    headers={
-                                        "Content-Disposition": f'inline; filename="{Path(file_name).stem}.pdf"'
-                                    },
-                                )
-
-
-                        # Use the same streaming logic as Drive downloads
-                        async def file_stream() -> AsyncGenerator[bytes, None]:
-                            try:
-                                request = drive_service.files().get_media(
-                                    fileId=file_id
-                                )
-                                buffer = io.BytesIO()
-                                downloader = MediaIoBaseDownload(buffer, request)
-
-                                done = False
-                                while not done:
-                                    try:
-                                        status, done = downloader.next_chunk()
-                                        if status:
-                                            logger.debug(
-                                                f"Download progress: {int(status.progress() * 100)}%"
-                                            )
-
-                                        buffer.seek(0)
-                                        chunk = buffer.read()
-
-                                        if chunk:
-                                            yield chunk
-
-                                        buffer.seek(0)
-                                        buffer.truncate(0)
-
-                                        await asyncio.sleep(0)
-
-                                    except Exception as chunk_error:
-                                        logger.error(
-                                            f"Error streaming chunk: {str(chunk_error)}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                                            detail="Error during file streaming",
-                                        )
-
-                            except Exception as stream_error:
-                                logger.error(
-                                    f"Error in file stream: {str(stream_error)}"
-                                )
-                                raise HTTPException(
-                                    status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                                    detail="Error setting up file stream",
-                                )
-                            finally:
-                                buffer.close()
-
-                        return create_stream_record_response(
-                            file_stream(),
-                            filename=file_name,
-                            mime_type=mime_type,
-                            fallback_filename=f"record_{record_id}"
-                        )
-
-                    except Exception as drive_error:
-                        logger.error(
-                            f"Failed to get file from both Gmail and Drive. Gmail error: {str(gmail_error)}, Drive error: {str(drive_error)}"
-                        )
-                        raise HTTPException(
-                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                            detail="Failed to download file from both Gmail and Drive",
-                        )
+            # Get the buffer from connector (without passing convertTo)
+            if connector_obj.get_app_name() == Connectors.GOOGLE_DRIVE_WORKSPACE or connector_obj.get_app_name() == Connectors.GOOGLE_MAIL_WORKSPACE:
+                buffer = await connector_obj.stream_record(record, user_id)
             else:
-                container: ConnectorAppContainer = request.app.container
-                connector: BaseConnector = container.connectors_map[connector_id]
-                if not connector:
-                    raise HTTPException(
-                        status_code=HttpStatusCode.NOT_FOUND.value,
-                        detail=f"Connector '{connector_id}' not found"
-                    )
-                buffer = await connector.stream_record(record)
-                return buffer
+                buffer = await connector_obj.stream_record(record)
+
+            # Handle conversion after getting the buffer
+            if convertTo == MimeTypes.PDF.value:
+                mime_type = get_mime_type_from_record(record)
+                record_name = getattr(record, 'record_name', None) or getattr(record, 'name', None) or 'file'
+
+                file_extension = None
+                if record_name and '.' in record_name:
+                    file_extension = record_name.split('.')[-1].lower()
+
+                # Check if this file type needs conversion (PPT, PPTX, Google Slides)
+                needs_conversion = (
+                    file_extension in ['ppt', 'pptx'] or
+                    mime_type in [
+                        MimeTypes.PPT.value,
+                        MimeTypes.PPTX.value,
+                        MimeTypes.GOOGLE_SLIDES.value
+                    ]
+                )
+
+                if needs_conversion:
+                    try:
+                        return await convert_buffer_to_pdf_stream(buffer, record_name, file_extension)
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        logger.error(f"Error converting file to PDF: {str(e)}", exc_info=True)
+                        raise HTTPException(
+                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                            detail="Failed to convert file to PDF"
+                        ) from e
+
+            return buffer
+        except HTTPException:
+            # Re-raise HTTPExceptions from connectors unchanged so the original
+            # status code (403, 404, etc.) is preserved and reaches the client.
+            raise
         except Exception as e:
-            logger.error(f"Error downloading file: {str(e)}")
+            logger.error(f"Error downloading file: {str(e)}", exc_info=True)
             raise HTTPException(
                 status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=f"Error downloading file: {str(e)}"
-            )
+            ) from e
 
     except HTTPException as e:
         raise e
     except Exception as e:
         logger.error("Error downloading file: %s", str(e))
-        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error downloading file")
+        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error downloading file") from e
 
 
-@router.post("/api/v1/record/buffer/convert")
+@router.post("/api/v1/record/buffer/convert", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_record_stream(request: Request, file: UploadFile = File(...)) -> StreamingResponse:
     request.query_params.get("from")
     to_format = request.query_params.get("to")
@@ -1747,7 +774,7 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
                         conversion_output, conversion_error = await asyncio.wait_for(
                             process.communicate(), timeout=30.0
                         )
-                    except asyncio.TimeoutError:
+                    except asyncio.TimeoutError as te:
                         process.terminate()
                         try:
                             await asyncio.wait_for(process.wait(), timeout=5.0)
@@ -1758,7 +785,7 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
                         )
                         raise HTTPException(
                             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="PDF conversion timed out"
-                        )
+                        ) from te
 
                     pdf_filename = file.filename.rsplit(".", 1)[0] + ".pdf"
                     pdf_path = os.path.join(tmpdir, pdf_filename)
@@ -1784,7 +811,7 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
                             raise HTTPException(
                                 status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
                                 detail="Error reading converted PDF file",
-                            )
+                            ) from e
 
                     return create_stream_record_response(
                         file_iterator(),
@@ -1795,299 +822,187 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
 
                 except FileNotFoundError as e:
                     logger.error(str(e))
-                    raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=str(e))
+                    raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
                 except Exception as e:
                     logger.error(f"Conversion error: {str(e)}")
                     raise HTTPException(
                         status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=f"Conversion error: {str(e)}"
-                    )
+                    ) from e
         finally:
             await file.close()
 
     raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail="Invalid conversion request")
 
-
-async def get_admin_webhook_handler(request: Request) -> Optional[AdminWebhookHandler]:
-    try:
-        container: ConnectorAppContainer = request.app.container
-        admin_webhook_handler = container.admin_webhook_handler()
-        return admin_webhook_handler
-    except Exception as e:
-        logger.warning(f"Failed to get admin webhook handler: {str(e)}")
-        return None
-
-
-@router.post("/admin/webhook")
-@inject
-async def handle_admin_webhook(request: Request, background_tasks: BackgroundTasks) -> Optional[Dict[str, Any]]:
-    """Handle incoming webhook notifications from Google Workspace Admin"""
-    try:
-        verifier = WebhookAuthVerifier(logger)
-        if not await verifier.verify_request(request):
-            raise HTTPException(status_code=HttpStatusCode.UNAUTHORIZED.value, detail="Unauthorized webhook request")
-
-        admin_webhook_handler = await get_admin_webhook_handler(request)
-
-        if admin_webhook_handler is None:
-            logger.warning(
-                "Admin webhook handler not yet initialized - skipping webhook processing"
-            )
-            return {
-                "status": "skipped",
-                "message": "Webhook handler not yet initialized",
-            }
-
-        # Try to get the request body, handle empty body case
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            # This might be a verification request
-            logger.info(
-                "Received request with empty/invalid JSON body - might be verification request"
-            )
-            return {"status": "accepted", "message": "Verification request received"}
-
-        logger.info("📥 Incoming admin webhook request: %s", body)
-
-        # Get the event type from the events array
-        events = body.get("events", [])
-        if not events:
-            raise HTTPException(
-                status_code=HttpStatusCode.BAD_REQUEST.value, detail="No events found in webhook body"
-            )
-
-        event_type = events[0].get("name")  # We'll process the first event
-        if not event_type:
-            raise HTTPException(
-                status_code=HttpStatusCode.BAD_REQUEST.value, detail="Missing event name in webhook body"
-            )
-
-        # Process notification in background
-        background_tasks.add_task(
-            admin_webhook_handler.process_notification, event_type, body
-        )
-        return {"status": "accepted"}
-
-    except Exception as e:
-        logger.error("Error processing webhook: %s", str(e))
-        raise HTTPException(
-            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=str(e)
-        )
-
-
 async def convert_to_pdf(file_path: str, temp_dir: str) -> str:
-    """Helper function to convert file to PDF"""
+    """
+    Convert a file to PDF using LibreOffice.
+
+    Args:
+        file_path: Path to the input file to convert
+        temp_dir: Temporary directory where the PDF will be created
+
+    Returns:
+        Path to the converted PDF file
+
+    Raises:
+        HTTPException: If conversion fails or output file is not found
+    """
     pdf_path = os.path.join(temp_dir, f"{Path(file_path).stem}.pdf")
 
+    conversion_cmd = [
+        "soffice",
+        "--headless",
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        temp_dir,
+        file_path,
+    ]
+
     try:
-        conversion_cmd = [
-            "soffice",
-            "--headless",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            temp_dir,
-            file_path,
-        ]
         process = await asyncio.create_subprocess_exec(
             *conversion_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Add timeout to communicate
         try:
             conversion_output, conversion_error = await asyncio.wait_for(
                 process.communicate(), timeout=30.0
             )
-        except asyncio.TimeoutError:
-            # Make sure to terminate the process if it times out
+        except asyncio.TimeoutError as te:
             process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                process.kill()  # Force kill if termination takes too long
-            logger.error("LibreOffice conversion timed out after 30 seconds")
-            raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="PDF conversion timed out")
+                process.kill()
+            logger.error("PDF conversion timed out")
+            raise HTTPException(
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail="PDF conversion timed out"
+            ) from te
 
         if process.returncode != 0:
-            error_msg = f"LibreOffice conversion failed: {conversion_error.decode('utf-8', errors='replace')}"
-            logger.error(error_msg)
-            raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Failed to convert file to PDF")
-
-        if os.path.exists(pdf_path):
-            return pdf_path
-        else:
+            error_msg = conversion_error.decode('utf-8', errors='replace')
+            logger.error(f"PDF conversion failed: {error_msg}")
             raise HTTPException(
-                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="PDF conversion failed - output file not found"
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail="Failed to convert file to PDF"
             )
-    except asyncio.TimeoutError:
-        # This catch is for any other timeout that might occur
-        logger.error("Timeout during PDF conversion")
-        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="PDF conversion timed out")
-    except Exception as conv_error:
-        logger.error(f"Error during conversion: {str(conv_error)}")
-        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error converting file to PDF")
 
-
-async def get_service_account_credentials(org_id: str, user_id: str, logger, arango_service, google_token_handler, container,connector: str, connector_id: str) -> google.oauth2.credentials.Credentials:
-    """Helper function to get service account credentials"""
-    try:
-        service_creds_lock = container.service_creds_lock()
-
-        async with service_creds_lock:
-            if not hasattr(container, 'service_creds_cache'):
-                container.service_creds_cache = {}
-                logger.info("Created service credentials cache")
-
-            # Get user email
-            user = await arango_service.get_user_by_user_id(user_id)
-            if not user:
-                raise Exception(f"User not found: {user_id}")
-
-            cache_key = f"{org_id}_{user_id}_{connector_id}"
-            logger.info(f"Service account cache key: {cache_key}")
-
-            if cache_key in container.service_creds_cache:
-                logger.info(f"Service account cache hit: {cache_key}")
-                credentials = container.service_creds_cache[cache_key]
-                cached_email = credentials._subject
-
-                if cached_email == user["email"]:
-                    logger.info(f"Cached credentials are valid for {cache_key}")
-                    return container.service_creds_cache[cache_key]
-                else:
-                    # Remove expired credentials from cache
-                    logger.info(f"Removing expired credentials from cache: {cache_key}")
-                    container.service_creds_cache.pop(cache_key, None)
-
-            # Cache miss - create new credentials
-            logger.info(f"Service account cache miss: {cache_key}. Creating new credentials.")
-
-            # Create new credentials
-            SCOPES = GOOGLE_CONNECTOR_ENTERPRISE_SCOPES
-            credentials_json = await google_token_handler.get_enterprise_token(connector_id=connector_id)
-            credentials = service_account.Credentials.from_service_account_info(
-                credentials_json, scopes=SCOPES
+        if not os.path.exists(pdf_path):
+            raise HTTPException(
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail="PDF conversion failed - output file not found"
             )
-            credentials = credentials.with_subject(user["email"])
 
-            # Cache the credentials
-            container.service_creds_cache[cache_key] = credentials
-            logger.info(f"Cached new service credentials for {cache_key}")
+        return pdf_path
 
-            return credentials
-
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting service account credentials: {str(e)}")
+        logger.error(f"Error during PDF conversion: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error accessing service account credentials"
-        )
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail="Error converting file to PDF"
+        ) from e
 
-async def get_user_credentials(org_id: str, user_id: str, logger, google_token_handler, container,connector: str, connector_id: str) -> google.oauth2.credentials.Credentials:
-    """Helper function to get cached user credentials"""
-    try:
-        cache_key = f"{org_id}_{user_id}_{connector_id}"
-        user_creds_lock = container.user_creds_lock()
 
-        async with user_creds_lock:
-            if not hasattr(container, 'user_creds_cache'):
-                container.user_creds_cache = {}
-                logger.info("Created user credentials cache")
+async def convert_buffer_to_pdf_stream(
+    buffer: Union[StreamingResponse, Response, bytes, io.IOBase],
+    record_name: str,
+    file_extension: Optional[str] = None
+) -> StreamingResponse:
+    """
+    Convert a file buffer to PDF and return as a streaming response.
 
-            logger.info(f"User credentials cache key: {cache_key}")
+    Args:
+        buffer: The file buffer (StreamingResponse, Response, bytes, or file-like object)
+        record_name: Name of the record/file
+        file_extension: Optional file extension
 
-            if cache_key in container.user_creds_cache:
-                creds = container.user_creds_cache[cache_key]
-                logger.info(f"Expiry time: {creds.expiry}")
-                expiry = creds.expiry
+    Returns:
+        StreamingResponse containing the converted PDF
 
-                try:
-                    now = datetime.now(timezone.utc).replace(tzinfo=None)
-                    # Add 5 minute buffer before expiry to ensure we refresh early
-                    buffer_time = timedelta(minutes=5)
+    Raises:
+        HTTPException: If conversion fails
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_file_name = record_name if record_name else f"file.{file_extension or 'tmp'}"
+        temp_file_path = os.path.join(temp_dir, temp_file_name)
 
-                    if expiry and (expiry - buffer_time) > now:
-                        logger.info(f"User credentials cache hit: {cache_key}")
-                        return creds
-                    else:
-                        logger.info(f"User credentials expired or expiring soon for {cache_key}")
-                        # Remove expired credentials from cache
-                        container.user_creds_cache.pop(cache_key, None)
-                except Exception as e:
-                    logger.error(f"Failed to check credentials for {cache_key}: {str(e)}")
-                    container.user_creds_cache.pop(cache_key, None)
-            # Cache miss or expired - create new credentials
-            logger.info(f"User credentials cache miss: {cache_key}. Creating new credentials.")
-
-            # Create new credentials
-            SCOPES = await google_token_handler.get_account_scopes(connector_id=connector_id)
-            # Refresh token
-            await google_token_handler.refresh_token(connector_id=connector_id)
-            creds_data = await google_token_handler.get_individual_token(connector_id=connector_id)
-
-            if not creds_data.get("access_token"):
+        # Write buffer content to temporary file
+        with open(temp_file_path, "wb") as f:
+            if isinstance(buffer, StreamingResponse):
+                async for chunk in buffer.body_iterator:
+                    await asyncio.to_thread(f.write, chunk)
+            elif isinstance(buffer, Response):
+                body_content = buffer.body
+                if not body_content:
+                    raise HTTPException(
+                        status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                        detail="Response object has no body content"
+                    )
+                if callable(body_content):
+                    body_content = body_content()
+                if not isinstance(body_content, bytes):
+                    raise HTTPException(
+                        status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                        detail=f"Response body is not bytes: {type(body_content)}"
+                    )
+                await asyncio.to_thread(f.write, body_content)
+            elif hasattr(buffer, 'read'):
+                while True:
+                    chunk = await asyncio.to_thread(buffer.read, 8192)
+                    if not chunk:
+                        break
+                    await asyncio.to_thread(f.write, chunk)
+            elif isinstance(buffer, bytes):
+                await asyncio.to_thread(f.write, buffer)
+            else:
                 raise HTTPException(
-                    status_code=HttpStatusCode.UNAUTHORIZED.value,
-                    detail="Invalid credentials. Access token not found",
+                    status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                    detail=f"Unsupported buffer type for conversion: {type(buffer)}"
                 )
 
-            required_keys = {
-                CredentialKeys.ACCESS_TOKEN.value: "Access token not found",
-                CredentialKeys.REFRESH_TOKEN.value: "Refresh token not found",
-                CredentialKeys.CLIENT_ID.value: "Client ID not found",
-                CredentialKeys.CLIENT_SECRET.value: "Client secret not found",
-            }
+        # Convert to PDF
+        pdf_path = await convert_to_pdf(temp_file_path, temp_dir)
 
-            for key, error_detail in required_keys.items():
-                if not creds_data.get(key):
-                    logger.error(f"Missing {key} in credentials")
-                    raise HTTPException(
-                        status_code=HttpStatusCode.UNAUTHORIZED.value,
-                        detail=f"Invalid credentials. {error_detail}",
-                    )
+        # Handle case where LibreOffice may have renamed the file
+        if not os.path.exists(pdf_path):
+            pdf_files = [f for f in os.listdir(temp_dir) if f.endswith('.pdf')]
+            if pdf_files:
+                pdf_path = os.path.join(temp_dir, pdf_files[0])
+            else:
+                raise HTTPException(
+                    status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                    detail="PDF conversion failed - output file not found"
+                )
 
-            access_token = creds_data.get(CredentialKeys.ACCESS_TOKEN.value)
-            refresh_token = creds_data.get(CredentialKeys.REFRESH_TOKEN.value)
-            client_id = creds_data.get(CredentialKeys.CLIENT_ID.value)
-            client_secret = creds_data.get(CredentialKeys.CLIENT_SECRET.value)
+        # Read PDF into memory before temp directory cleanup
+        with open(pdf_path, "rb") as pdf_file:
+            pdf_content = await asyncio.to_thread(pdf_file.read)
 
-            new_creds = google.oauth2.credentials.Credentials(
-                token=access_token,
-                refresh_token=refresh_token,
-                token_uri="https://oauth2.googleapis.com/token",
-                client_id=client_id,
-                client_secret=client_secret,
-                scopes=SCOPES,
-            )
+        # Create streaming iterator
+        pdf_filename = f"{Path(record_name).stem}.pdf" if record_name else "converted_file.pdf"
 
-            # Update token expiry time - make it timezone-naive for Google client compatibility
-            token_expiry = datetime.fromtimestamp(
-                creds_data.get("access_token_expiry_time", 0) / 1000, timezone.utc
-            ).replace(tzinfo=None)  # Convert to naive UTC for Google client compatibility
-            new_creds.expiry = token_expiry
+        async def pdf_file_iterator() -> AsyncGenerator[bytes, None]:
+            chunk_size = 8192
+            for i in range(0, len(pdf_content), chunk_size):
+                yield pdf_content[i:i + chunk_size]
 
-            # Cache the credentials
-            container.user_creds_cache[cache_key] = new_creds
-            logger.info(f"Cached new user credentials for {cache_key} with expiry: {new_creds.expiry}")
-
-            return new_creds
-
-    except Exception as e:
-        logger.error(f"Error getting user credentials: {str(e)}")
-        # Remove from cache if there's an error
-        if hasattr(container, 'user_creds_cache'):
-            container.user_creds_cache.pop(cache_key, None)
-        raise HTTPException(
-            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Error accessing user credentials"
+        return create_stream_record_response(
+            pdf_file_iterator(),
+            filename=pdf_filename,
+            mime_type="application/pdf",
+            fallback_filename="converted_file.pdf"
         )
 
-
-@router.get("/api/v1/records")
+@router.get("/api/v1/records", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 @inject
 async def get_records(
     request:Request,
-    arango_service: BaseArangoService = Depends(get_arango_service),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
     page: int = Query(1, ge=1, description="Page number (1-based)"),
     limit: int = Query(20, ge=1, le=100, description="Number of items per page"),
     search: Optional[str] = None,
@@ -2113,7 +1028,7 @@ async def get_records(
         org_id = request.state.user.get("orgId")
 
         logger.info(f"Looking up user by user_id: {user_id}")
-        user = await arango_service.get_user_by_user_id(user_id=user_id)
+        user = await graph_provider.get_user_by_user_id(user_id=user_id)
 
         if not user:
             logger.warning(f"⚠️ User not found for user_id: {user_id}")
@@ -2137,7 +1052,7 @@ async def get_records(
         parsed_indexing_status = _parse_comma_separated_str(indexing_status)
         parsed_permissions = _parse_comma_separated_str(permissions)
 
-        records, total_count, available_filters = await arango_service.get_records(
+        records, total_count, available_filters = await graph_provider.get_records(
             user_id=user_key,
             org_id=org_id,
             skip=skip,
@@ -2191,12 +1106,12 @@ async def get_records(
             "error": str(e),
         }
 
-@router.get("/api/v1/records/{record_id}")
+@router.get("/api/v1/records/{record_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 @inject
 async def get_record_by_id(
     record_id: str,
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
 ) -> Optional[Dict]:
     """
     Check if the current user has access to a specific record
@@ -2207,7 +1122,7 @@ async def get_record_by_id(
         user_id = request.state.user.get("userId")
         org_id = request.state.user.get("orgId")
 
-        has_access = await arango_service.check_record_access_with_details(
+        has_access = await graph_provider.check_record_access_with_details(
             user_id=user_id,
             org_id=org_id,
             record_id=record_id,
@@ -2221,14 +1136,15 @@ async def get_record_by_id(
             )
     except Exception as e:
         logger.error(f"Error checking record access: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to check record access")
+        raise HTTPException(status_code=500, detail="Failed to check record access") from e
 
-@router.delete("/api/v1/records/{record_id}")
+@router.delete("/api/v1/records/{record_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_DELETE))])
 @inject
 async def delete_record(
     record_id: str,
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
+    kafka_service: KafkaService = Depends(get_kafka_service),
 ) -> Dict:
     """
     Delete a specific record with permission validation
@@ -2239,12 +1155,27 @@ async def delete_record(
         user_id = request.state.user.get("userId")
         logger.info(f"🗑️ Attempting to delete record {record_id}")
 
-        result = await arango_service.delete_record(
+        result = await graph_provider.delete_record(
             record_id=record_id,
             user_id=user_id
         )
 
         if result["success"]:
+            # Publish deletion event
+            event_data = result.get("eventData")
+            if event_data and event_data.get("payload"):
+                try:
+                    timestamp = get_epoch_timestamp_in_ms()
+                    event = {
+                        "eventType": event_data["eventType"],
+                        "timestamp": timestamp,
+                        "payload": event_data["payload"]
+                    }
+                    await kafka_service.publish_event(event_data["topic"], event)
+                    logger.info(f"✅ Published {event_data['eventType']} event for record {record_id}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to publish deletion event: {str(e)}")
+
             logger.info(f"✅ Successfully deleted record {record_id}")
             return {
                 "success": True,
@@ -2267,14 +1198,15 @@ async def delete_record(
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error while deleting record: {str(e)}"
-        )
+        ) from e
 
-@router.post("/api/v1/records/{record_id}/reindex")
+@router.post("/api/v1/records/{record_id}/reindex", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_SYNC))])
 @inject
 async def reindex_single_record(
     record_id: str,
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
+    kafka_service: KafkaService = Depends(get_kafka_service),
 ) -> Dict:
     """
     Reindex a single record with permission validation.
@@ -2290,18 +1222,17 @@ async def reindex_single_record(
         user_id = request.state.user.get("userId")
         org_id = request.state.user.get("orgId")
 
-        # Parse optional depth from request body
-        depth = 0  # Default: only this record
+        # Parse optional depth from request body (0 = only this record; 100/full from all-records tree)
+        depth = 0
         try:
             request_body = await request.json()
             depth = request_body.get("depth", 0)
-        except json.JSONDecodeError:
-            # No body or invalid JSON - use default depth
-            pass
+        except (json.JSONDecodeError, TypeError):
+            depth = 0
 
         logger.info(f"🔄 Attempting to reindex record {record_id} with depth {depth}")
 
-        result = await arango_service.reindex_single_record(
+        result = await graph_provider.reindex_single_record(
             record_id=record_id,
             user_id=user_id,
             org_id=org_id,
@@ -2310,6 +1241,21 @@ async def reindex_single_record(
         )
 
         if result["success"]:
+            # Publish event in router
+            event_data = result.get("eventData")
+            if event_data:
+                try:
+                    timestamp = get_epoch_timestamp_in_ms()
+                    event = {
+                        "eventType": event_data["eventType"],
+                        "timestamp": timestamp,
+                        "payload": event_data["payload"]
+                    }
+                    await kafka_service.publish_event(event_data["topic"], event)
+                    logger.info(f"✅ Published {event_data['eventType']} event for record {record_id}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to publish event: {str(e)}")
+
             logger.info(f"✅ Successfully initiated reindex for record {record_id} with depth {depth}")
             return {
                 "success": True,
@@ -2317,7 +1263,7 @@ async def reindex_single_record(
                 "recordId": result.get("recordId"),
                 "recordName": result.get("recordName"),
                 "connector": result.get("connector"),
-                "eventPublished": result.get("eventPublished"),
+                "eventPublished": event_data is not None,
                 "userRole": result.get("userRole"),
                 "depth": depth
             }
@@ -2335,17 +1281,17 @@ async def reindex_single_record(
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error while reindexing record: {str(e)}"
-        )
+        ) from e
 
-@router.get("/api/v1/stats")
+@router.get("/api/v1/stats", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_connector_stats_endpoint(
     request: Request,
     org_id: str,
     connector_id: str,
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 )-> Dict[str, Any]:
     try:
-        result = await arango_service.get_connector_stats(org_id, connector_id)
+        result = await graph_provider.get_connector_stats(org_id, connector_id)
         logger = request.app.container.logger()
         if result["success"]:
              return {"success": True, "data": result["data"]}
@@ -2355,14 +1301,14 @@ async def get_connector_stats_endpoint(
         raise
     except Exception as e:
         logger.error(f"Error getting connector stats: {str(e)}")
-        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=f"Internal server error while getting connector stats: {str(e)}")
+        raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=f"Internal server error while getting connector stats: {str(e)}") from e
 
-@router.post("/api/v1/record-groups/{record_group_id}/reindex")
+@router.post("/api/v1/record-groups/{record_group_id}/reindex", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_SYNC))])
 @inject
 async def reindex_record_group(
     record_group_id: str,
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
     kafka_service: KafkaService = Depends(get_kafka_service),
 ) -> Dict:
     """
@@ -2386,7 +1332,7 @@ async def reindex_record_group(
         logger.info(f"🔄 Attempting to reindex record group {record_group_id} with depth {depth}")
 
         # Get record group data and validate permissions (does not publish events)
-        result = await arango_service.reindex_record_group_records(
+        result = await graph_provider.reindex_record_group_records(
             record_group_id=record_group_id,
             depth=depth,
             user_id=user_id,
@@ -2403,6 +1349,7 @@ async def reindex_record_group(
         # Publish reindex event (router is responsible for event publishing)
         connector_id = result.get("connectorId")
         connector_name = result.get("connectorName")
+        user_key = result.get("userKey")
         depth = result.get("depth", depth)
 
         try:
@@ -2413,7 +1360,8 @@ async def reindex_record_group(
                 "orgId": org_id,
                 "recordGroupId": record_group_id,
                 "depth": depth,
-                "connectorId": connector_id
+                "connectorId": connector_id,
+                "userKey": user_key
             }
 
             # Publish event directly using KafkaService
@@ -2439,7 +1387,7 @@ async def reindex_record_group(
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to publish reindex event: {str(event_error)}"
-            )
+            ) from event_error
 
     except HTTPException:
         raise
@@ -2448,7 +1396,50 @@ async def reindex_record_group(
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error while reindexing record group: {str(e)}"
+        ) from e
+
+def _validate_connector_deletion_permissions(
+    instance: Dict[str, Any],
+    user_id: str,
+    is_admin: bool,
+    logger
+) -> None:
+    """
+    Validate that the user has permission to delete the connector instance.
+
+    Permission rules:
+    - Personal connectors: Only the owning user (creator) can delete
+    - Team connectors: Only administrators can delete
+
+    Args:
+        instance: Connector instance dictionary
+        user_id: ID of the user attempting deletion
+        is_admin: Whether the user is an administrator
+        logger: Logger instance
+
+    Raises:
+        HTTPException: 403 if user doesn't have permission to delete
+    """
+    scope = instance.get("scope")
+    created_by = instance.get("createdBy")
+
+    # For team connectors, only admins can delete
+    if scope == ConnectorScope.TEAM.value and not is_admin:
+        logger.error("Only administrators can delete team connectors")
+        raise HTTPException(
+            status_code=HttpStatusCode.FORBIDDEN.value,
+            detail="Only administrators can delete team connectors"
         )
+
+    # For personal connectors, only the creator (owning user) can delete
+    # Admins cannot delete personal connectors
+    if scope == ConnectorScope.PERSONAL.value and created_by != user_id:
+        logger.error("Only the creator can delete this personal connector")
+        raise HTTPException(
+            status_code=HttpStatusCode.FORBIDDEN.value,
+            detail="Only the creator can delete this personal connector"
+        )
+
 
 async def check_beta_connector_access(
     connector_type: str,
@@ -2511,10 +1502,9 @@ def _encode_state_with_instance(state: str, connector_id: str) -> str:
         "state": state,
         "connector_id": connector_id
     }
-    encoded = base64.urlsafe_b64encode(
+    return base64.urlsafe_b64encode(
         json.dumps(state_data).encode()
     ).decode()
-    return encoded
 
 
 def _decode_state_with_instance(encoded_state: str) -> Dict[str, str]:
@@ -2531,10 +1521,9 @@ def _decode_state_with_instance(encoded_state: str) -> Dict[str, str]:
     """
     try:
         decoded = base64.urlsafe_b64decode(encoded_state.encode()).decode()
-        state_data = json.loads(decoded)
-        return state_data
+        return json.loads(decoded)
     except Exception as e:
-        raise ValueError(f"Invalid state format: {e}")
+        raise ValueError(f"Invalid state format: {e}") from e
 
 
 def _get_config_path_for_instance(connector_id: str) -> str:
@@ -2550,18 +1539,18 @@ def _get_config_path_for_instance(connector_id: str) -> str:
     return f"/services/connectors/{connector_id}/config"
 
 
-async def _get_settings_base_path(arango_service: BaseArangoService) -> str:
+async def _get_settings_base_path(graph_provider: IGraphDBProvider) -> str:
     """
     Determine frontend settings base path based on organization account type.
 
     Args:
-        arango_service: ArangoDB service instance
+        graph_provider: Graph DB provider instance
 
     Returns:
         Settings base path URL
     """
     try:
-        organizations = await arango_service.get_all_documents(
+        organizations = await graph_provider.get_all_documents(
             CollectionNames.ORGS.value
         )
 
@@ -2583,7 +1572,7 @@ async def _get_settings_base_path(arango_service: BaseArangoService) -> str:
 # Registry & Instance Endpoints
 # ============================================================================
 
-@router.get("/api/v1/connectors/registry")
+@router.get("/api/v1/connectors/registry", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_connector_registry(
     request: Request,
     scope: Optional[str] = Query(None, description="personal | team"),
@@ -2609,7 +1598,7 @@ async def get_connector_registry(
     connector_registry = request.app.state.connector_registry
     container = request.app.container
     logger = container.logger()
-    arango_service = await get_arango_service(request)
+    graph_provider = request.app.state.graph_provider
 
     try:
         # Validate scope
@@ -2625,7 +1614,7 @@ async def get_connector_registry(
         try:
             user = getattr(request.state, 'user', None)
             if user and user.get("orgId"):
-                account_type = await arango_service.get_account_type(user.get("orgId"))
+                account_type = await graph_provider.get_account_type(user.get("orgId"))
         except Exception as e:
             # If we can't get account type, log but don't fail (fail-open)
             logger.debug(f"Could not get account type: {e}")
@@ -2658,11 +1647,11 @@ async def get_connector_registry(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Error getting connector registry: {str(e)}"
-        )
+        ) from e
 
 
 
-@router.get("/api/v1/connectors/")
+@router.get("/api/v1/connectors/", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_connector_instances(
     request: Request,
     scope: Optional[str] = Query(None, description="personal | team"),
@@ -2725,10 +1714,10 @@ async def get_connector_instances(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Error getting connector instances: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/connectors/active")
+@router.get("/api/v1/connectors/active", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_active_connector_instances(request: Request) -> Dict[str, Any]:
     """
     Get all active connector instances.
@@ -2768,10 +1757,10 @@ async def get_active_connector_instances(request: Request) -> Dict[str, Any]:
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get active connector instances: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/connectors/inactive")
+@router.get("/api/v1/connectors/inactive", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_inactive_connector_instances(request: Request) -> Dict[str, Any]:
     """
     Get all inactive connector instances.
@@ -2810,10 +1799,10 @@ async def get_inactive_connector_instances(request: Request) -> Dict[str, Any]:
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get inactive connector instances: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/connectors/configured")
+@router.get("/api/v1/connectors/configured", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_configured_connector_instances(
     request: Request,
     scope: Optional[str] = Query(None, description="personal | team"),
@@ -2872,7 +1861,7 @@ async def get_configured_connector_instances(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Error getting configured connector instances: {str(e)}"
-        )
+        ) from e
 
 # ============================================================================
 # Instance Configuration Endpoints
@@ -3144,10 +2133,10 @@ async def _prepare_connector_config(
     return prepared_config
 
 
-@router.post("/api/v1/connectors/")
+@router.post("/api/v1/connectors/", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 async def create_connector_instance(
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Dict[str, Any]:
     """
     Create a new connector instance.
@@ -3159,7 +2148,7 @@ async def create_connector_instance(
 
     Args:
         request: FastAPI request object
-        arango_service: Injected ArangoDB service
+        graph_provider: Injected graph DB provider
 
     Returns:
         Dictionary with created instance details including connector_id
@@ -3225,7 +2214,7 @@ async def create_connector_instance(
         # ============================================================
         account_type = None
         try:
-            account_type = await arango_service.get_account_type(org_id)
+            account_type = await graph_provider.get_account_type(org_id)
         except Exception as e:
             logger.debug(f"Could not get account type: {e}")
 
@@ -3267,12 +2256,15 @@ async def create_connector_instance(
             logger.info(f"Using auto-selected auth type: {selected_auth_type}")
 
         # Validate auth type compatibility
-        if supported_auth_types and selected_auth_type not in supported_auth_types:
-            if not (selected_auth_type.upper() == "NONE" and len(supported_auth_types) == 0):
-                raise HTTPException(
-                    status_code=HttpStatusCode.BAD_REQUEST.value,
-                    detail=f"Auth type '{selected_auth_type}' is not supported. Supported: {', '.join(supported_auth_types)}"
-                )
+        if (
+            supported_auth_types
+            and selected_auth_type not in supported_auth_types
+            and not (selected_auth_type.upper() == "NONE" and len(supported_auth_types) == 0)
+        ):
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail=f"Auth type '{selected_auth_type}' is not supported. Supported: {', '.join(supported_auth_types)}"
+            )
 
         # ============================================================
         # 7. Pre-validate OAuth Config (if applicable)
@@ -3341,7 +2333,7 @@ async def create_connector_instance(
             raise HTTPException(
                 status_code=HttpStatusCode.BAD_REQUEST.value,
                 detail=str(e)
-            )
+            ) from e
 
         if not instance:
             raise HTTPException(
@@ -3440,10 +2432,10 @@ async def create_connector_instance(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to create connector instance: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/connectors/{connector_id}")
+@router.get("/api/v1/connectors/{connector_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_connector_instance(
     connector_id: str,
     request: Request
@@ -3505,9 +2497,9 @@ async def get_connector_instance(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Error getting connector instance: {str(e)}"
-        )
+        ) from e
 
-@router.get("/api/v1/connectors/{connector_id}/config")
+@router.get("/api/v1/connectors/{connector_id}/config", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_connector_instance_config(
     connector_id: str,
     request: Request
@@ -3625,13 +2617,14 @@ async def get_connector_instance_config(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get connector configuration: {str(e)}"
-        )
+        ) from e
 
 
-@router.put("/api/v1/connectors/{connector_id}/config/auth")
+@router.put("/api/v1/connectors/{connector_id}/config/auth", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 async def update_connector_instance_auth_config(
     connector_id: str,
     request: Request,
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
 ) -> Dict[str, Any]:
     """
     Update authentication configuration for a connector instance.
@@ -3808,6 +2801,9 @@ async def update_connector_instance_auth_config(
                 logger.debug(f"Expected OAuth fields: {oauth_field_names}")
                 logger.debug(f"Received auth config keys: {list(auth_config_raw.keys())}")
 
+        # Merge auth config with existing to preserve important fields like connectorScope
+        existing_auth_config = existing_config.get("auth", {}) or {}
+
         # Filter out OAuth credential fields from auth config - only for OAUTH type
         # For other auth types (OAUTH_ADMIN_CONSENT, API_TOKEN, etc.), keep all fields
         # as they may be needed for those authentication methods
@@ -3834,7 +2830,12 @@ async def update_connector_instance_auth_config(
             # (e.g., clientId/clientSecret for OAUTH_ADMIN_CONSENT, API_TOKEN, etc.)
             auth_config_clean = auth_config_raw.copy()
 
-        new_config["auth"] = auth_config_clean
+        # Merge with existing auth config to preserve fields like connectorScope
+        # Start with existing config, then overlay with new values
+        merged_auth_config = existing_auth_config.copy()
+        merged_auth_config.update(auth_config_clean)
+
+        new_config["auth"] = merged_auth_config
 
         # Clear credentials and OAuth state when auth config is updated
         new_config["credentials"] = None
@@ -3847,30 +2848,43 @@ async def update_connector_instance_auth_config(
             metadata = await connector_registry.get_connector_metadata(connector_type)
             auth_metadata = metadata.get("config", {}).get("auth", {})
 
-            # Determine redirect URI
-            redirect_uri = auth_metadata.get("redirectUri", "")
-            if base_url:
-                redirect_uri = f"{base_url.rstrip('/')}/{redirect_uri}"
-            else:
-                endpoints = await config_service.get_config(
-                    "/services/endpoints",
-                    use_cache=False
-                )
-                base_url = endpoints.get("frontend",{}).get("publicEndpoint", "http://localhost:3001")
-                redirect_uri = f"{base_url.rstrip('/')}/{redirect_uri}"
+
+            # Get OAuth config from oauthConfigs (same as _prepare_connector_config)
+            oauth_configs = auth_metadata.get("oauthConfigs", {})
+            oauth_config = oauth_configs.get(auth_type, {}) if oauth_configs else {}
+
+            # Get redirect URI from auth schema (same as _prepare_connector_config)
+            auth_schemas = auth_metadata.get("schemas", {})
+            selected_auth_schema = auth_schemas.get(auth_type, {}) if auth_schemas else {}
+            redirect_uri = selected_auth_schema.get("redirectUri", "")
+            if redirect_uri:
+                if base_url:
+                    redirect_uri = f"{base_url.rstrip('/')}/{redirect_uri}"
+                else:
+                    endpoints = await config_service.get_config(
+                        "/services/endpoints",
+                        use_cache=False
+                    )
+                    base_url = endpoints.get("frontend",{}).get("publicEndpoint", "http://localhost:3001")
+                    redirect_uri = f"{base_url.rstrip('/')}/{redirect_uri}"
 
             # Only use registry defaults if user hasn't provided these values
             oauth_updates = {
-                "scopes": auth_metadata.get("scopes", []),
+                "scopes": oauth_config.get("scopes", []),
                 "redirectUri": redirect_uri,
                 "authType": auth_type,
             }
+
             # Preserve user-provided authorizeUrl and tokenUrl if they exist
             if not new_config["auth"].get("authorizeUrl"):
-                oauth_updates["authorizeUrl"] = auth_metadata.get("authorizeUrl", "")
+                oauth_updates["authorizeUrl"] = oauth_config.get("authorizeUrl", "")
             if not new_config["auth"].get("tokenUrl"):
-                oauth_updates["tokenUrl"] = auth_metadata.get("tokenUrl", "")
+                oauth_updates["tokenUrl"] = oauth_config.get("tokenUrl", "")
             new_config["auth"].update(oauth_updates)
+
+        if not new_config["auth"].get("connectorScope"):
+            connector_doc = await graph_provider.get_document(connector_id, CollectionNames.APPS.value)
+            new_config["auth"]["connectorScope"] = connector_doc.get("scope", "")
 
         # Save configuration
         await config_service.set_config(config_path, new_config)
@@ -3924,13 +2938,14 @@ async def update_connector_instance_auth_config(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to update connector authentication configuration: {str(e)}"
-        )
+        ) from e
 
 
-@router.put("/api/v1/connectors/{connector_id}/config/filters-sync")
+@router.put("/api/v1/connectors/{connector_id}/config/filters-sync", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 async def update_connector_instance_filters_sync_config(
     connector_id: str,
     request: Request,
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
 ) -> Dict[str, Any]:
     """
     Update filters and sync configuration for a connector instance.
@@ -4019,6 +3034,26 @@ async def update_connector_instance_filters_sync_config(
         await config_service.set_config(config_path, new_config)
         logger.info(f"Updated filters-sync config for instance {connector_id}")
 
+        # Cancel any running sync task for this connector (safety net — normally the
+        # connector must be disabled before filters can be changed, but a task may
+        # still be winding down from a previous run)
+        await sync_task_manager.cancel_sync(connector_id)
+        logger.info(f"Cancelled any running sync task for connector {connector_id}")
+
+        # Delete all sync points so the next sync is a clean full sweep based on
+        # the updated filter configuration
+        try:
+            deleted_count, success = await graph_provider.delete_sync_points_by_connector_id(
+                connector_id=connector_id
+            )
+            if success:
+                logger.info(f"Deleted {deleted_count} sync points for connector {connector_id} after filter change")
+            else:
+                logger.warning(f"Failed to delete sync points for connector {connector_id} after filter change, continuing anyway")
+        except Exception as sp_error:
+            logger.error(f"Error deleting sync points for connector {connector_id} after filter change: {sp_error}")
+            # Non-fatal — continue with the config update response
+
         # For filters/sync updates, keep connector status as is
         # Only update the timestamp
         updates = {
@@ -4053,10 +3088,10 @@ async def update_connector_instance_filters_sync_config(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to update connector filters and sync configuration: {str(e)}"
-        )
+        ) from e
 
 
-@router.put("/api/v1/connectors/{connector_id}/config")
+@router.put("/api/v1/connectors/{connector_id}/config", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 async def update_connector_instance_config(
     connector_id: str,
     request: Request,
@@ -4218,7 +3253,7 @@ async def update_connector_instance_config(
                         raise HTTPException(
                             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
                             detail=f"Failed to fetch OAuth configuration: {str(e)}"
-                        )
+                        ) from e
 
                 metadata = await connector_registry.get_connector_metadata(connector_type)
                 auth_metadata = metadata.get("config", {}).get("auth", {})
@@ -4318,121 +3353,12 @@ async def update_connector_instance_config(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to update connector configuration: {str(e)}"
-        )
-
-
-@router.delete("/api/v1/connectors/{connector_id}")
-async def delete_connector_instance(
-    connector_id: str,
-    request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service)
-) -> Dict[str, Any]:
-    """
-    Delete a connector instance and its configuration.
-
-    Args:
-        connector_id: Unique instance key
-        request: FastAPI request object
-        arango_service: Injected ArangoDB service
-
-    Returns:
-        Dictionary with success status
-
-    Raises:
-        HTTPException: 404 if instance not found
-    """
-    container = request.app.container
-    logger = container.logger()
-    connector_registry = request.app.state.connector_registry
-
-    try:
-        user_id = request.state.user.get("userId")
-        org_id = request.state.user.get("orgId")
-        is_admin = request.headers.get("X-Is-Admin", "false").lower() == "true"
-        if not user_id or not org_id:
-            logger.error(f"User not authenticated: {user_id} {org_id}")
-            raise HTTPException(
-                status_code=HttpStatusCode.UNAUTHORIZED.value,
-                detail="User not authenticated"
-            )
-        # Verify instance exists
-        instance = await connector_registry.get_connector_instance(
-            connector_id=connector_id,
-            user_id=user_id,
-            org_id=org_id,
-            is_admin=is_admin
-        )
-        if not instance:
-            logger.error(f"Connector instance {connector_id} not found or access denied")
-            raise HTTPException(
-                status_code=HttpStatusCode.NOT_FOUND.value,
-                detail=f"Connector instance {connector_id} not found or access denied"
-            )
-        if instance.get("scope") == ConnectorScope.TEAM.value and not is_admin:
-            logger.error("Only administrators can delete team connectors")
-            raise HTTPException(
-                status_code=HttpStatusCode.FORBIDDEN.value,
-                detail="Only administrators can delete team connectors"
-            )
-        if instance.get("createdBy") != user_id and not is_admin:
-            logger.error("Only the creator or an administrator can delete this connector")
-            raise HTTPException(
-                status_code=HttpStatusCode.FORBIDDEN.value,
-                detail="Only the creator or an administrator can delete this connector"
-            )
-        if instance.get("scope") == ConnectorScope.PERSONAL.value and instance.get("createdBy") != user_id:
-            logger.error("Only the creator can delete this connector")
-            raise HTTPException(
-                status_code=HttpStatusCode.FORBIDDEN.value,
-                detail="Only the creator can delete this connector"
-            )
-
-        connector_type = instance.get("type", "")
-        await check_beta_connector_access(connector_type, request)
-
-        # Delete configuration from etcd
-        config_service = container.config_service()
-        config_path = _get_config_path_for_instance(connector_id)
-
-        try:
-            await config_service.delete_config(config_path)
-        except Exception as e:
-            logger.warning(f"Could not delete config for {connector_id}: {e}")
-
-        # Delete instance from database
-        await arango_service.delete_nodes(
-            [connector_id],
-            CollectionNames.APPS.value
-        )
-
-        await arango_service.delete_edge(
-            org_id,
-            connector_id,
-            CollectionNames.ORG_APP_RELATION.value
-        )
-
-        logger.info(f"Deleted connector instance {connector_id}")
-
-        return {
-            "success": True,
-            "message": f"Connector instance {connector_id} deleted successfully"
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting instance {connector_id}: {e}")
-        raise HTTPException(
-            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-            detail=f"Failed to delete connector instance: {str(e)}"
-        )
-
-
-@router.put("/api/v1/connectors/{connector_id}/name")
+        ) from e
+@router.put("/api/v1/connectors/{connector_id}/name", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 async def update_connector_instance_name(
     connector_id: str,
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Dict[str, Any]:
     """
     Update the display name for a connector instance.
@@ -4521,7 +3447,7 @@ async def update_connector_instance_name(
             raise HTTPException(
                 status_code=HttpStatusCode.BAD_REQUEST.value,
                 detail=str(e)
-            )
+            ) from e
 
         if not updated:
             logger.error(f"Failed to update {instance.get('name')} connector instance name")
@@ -4547,7 +3473,7 @@ async def update_connector_instance_name(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to update connector instance name: {str(e)}"
-        )
+        ) from e
 
 
 # ============================================================================
@@ -4834,6 +3760,7 @@ async def _build_oauth_flow_config(
     Raises:
         HTTPException: If shared OAuth config is referenced but not found
     """
+
     oauth_config_id = auth_config.get("oauthConfigId")
 
     # Use shared OAuth config if available
@@ -4859,23 +3786,30 @@ async def _build_oauth_flow_config(
             )
 
         # Build flow config from shared OAuth config
+        # Prioritize values from connector instance config (auth_config) if they exist
         oauth_flow_config = {
-            "authorizeUrl": shared_oauth_config.get("authorizeUrl", ""),
-            "tokenUrl": shared_oauth_config.get("tokenUrl", ""),
-            "redirectUri": shared_oauth_config.get("redirectUri", ""),
+            "authorizeUrl": auth_config.get("authorizeUrl") or shared_oauth_config.get("authorizeUrl", ""),
+            "tokenUrl": auth_config.get("tokenUrl") or shared_oauth_config.get("tokenUrl", ""),
+            "redirectUri": auth_config.get("redirectUri") or shared_oauth_config.get("redirectUri", ""),
         }
 
-        # Convert scopes from dict to list based on connector scope
-        connector_scope = auth_config.get("connectorScope", "team").lower()
-        scopes_data = shared_oauth_config.get("scopes", {})
-
-        if isinstance(scopes_data, dict):
-            scope_key_map = {"personal": "personal_sync", "team": "team_sync", "agent": "agent"}
-            scope_key = scope_key_map.get(connector_scope, "team_sync")
-            scope_list = scopes_data.get(scope_key, [])
-            oauth_flow_config["scopes"] = scope_list if isinstance(scope_list, list) else []
+        # Prioritize scopes from connector instance config (auth_config) if they exist
+        # This ensures we use the scopes that were set during connector creation/update
+        if auth_config.get("scopes"):
+            oauth_flow_config["scopes"] = auth_config["scopes"] if isinstance(auth_config["scopes"], list) else []
         else:
-            oauth_flow_config["scopes"] = scopes_data if isinstance(scopes_data, list) else []
+            # Fall back to shared OAuth config scopes if not in connector instance config
+            # Convert scopes from dict to list based on connector scope
+            connector_scope = auth_config.get("connectorScope", "team").lower()
+            scopes_data = shared_oauth_config.get("scopes", {})
+
+            if isinstance(scopes_data, dict):
+                scope_key_map = {"personal": "personal_sync", "team": "team_sync", "agent": "agent"}
+                scope_key = scope_key_map.get(connector_scope, "team_sync")
+                scope_list = scopes_data.get(scope_key, [])
+                oauth_flow_config["scopes"] = scope_list if isinstance(scope_list, list) else []
+            else:
+                oauth_flow_config["scopes"] = scopes_data if isinstance(scopes_data, list) else []
 
         # Add optional fields
         if "tokenAccessType" in shared_oauth_config:
@@ -4908,12 +3842,12 @@ async def _build_oauth_flow_config(
     return oauth_flow_config
 
 
-@router.get("/api/v1/connectors/{connector_id}/oauth/authorize")
+@router.get("/api/v1/connectors/{connector_id}/oauth/authorize", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 async def get_oauth_authorization_url(
     connector_id: str,
     request: Request,
     base_url: Optional[str] = Query(None),
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Dict[str, Any]:
     """
     Get OAuth authorization URL for a connector instance.
@@ -4922,7 +3856,7 @@ async def get_oauth_authorization_url(
         connector_id: Unique instance key
         request: FastAPI request object
         base_url: Optional base URL for redirect
-        arango_service: Injected ArangoDB service
+        graph_provider: Injected graph DB provider
 
     Returns:
         Dictionary with authorization URL and encoded state
@@ -5001,7 +3935,7 @@ async def get_oauth_authorization_url(
             )
 
         auth_config = config["auth"]
-        connector_scope = auth_config.get("connectorScope", "team").lower()
+        connector_scope = instance.get("scope", "team").lower()
 
 
         # ============================================================
@@ -5021,11 +3955,17 @@ async def get_oauth_authorization_url(
         # 4. Generate Authorization URL
         # ============================================================
         oauth_config = get_oauth_config(oauth_flow_config)
+        # Fallback: if scope is empty, use scopes from instance document
+        if not oauth_config.scope:
+            scopes_list = instance.get("scopes", [])
+            if scopes_list and isinstance(scopes_list, list):
+                oauth_config.scope = ' '.join(scopes_list)
         logger.info(f"Using {connector_scope} with scopes: {oauth_config.scope}")
+
 
         oauth_provider = OAuthProvider(
             config=oauth_config,
-            key_value_store=container.key_value_store(),
+            configuration_service=config_service,
             credentials_path=config_path
         )
 
@@ -5073,17 +4013,17 @@ async def get_oauth_authorization_url(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to generate OAuth URL: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/connectors/oauth/callback")
+@router.get("/api/v1/connectors/oauth/callback", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 async def handle_oauth_callback(
     request: Request,
     code: Optional[str] = Query(None),
     state: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
     base_url: Optional[str] = Query(None),
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Dict[str, Any]:
     """
     Handle OAuth callback and exchange code for tokens.
@@ -5097,7 +4037,7 @@ async def handle_oauth_callback(
         state: Encoded state containing connector_id
         error: OAuth error if any
         base_url: Optional base URL for redirects
-        arango_service: Injected ArangoDB service
+        graph_provider: Injected graph DB provider
 
     Returns:
         Dictionary with redirect URL and status
@@ -5107,7 +4047,7 @@ async def handle_oauth_callback(
     config_service = container.config_service()
     connector_registry = request.app.state.connector_registry
 
-    settings_base_path = await _get_settings_base_path(arango_service)
+    settings_base_path = await _get_settings_base_path(graph_provider)
     connector_id = None  # For error handling
 
     try:
@@ -5236,7 +4176,7 @@ async def handle_oauth_callback(
         oauth_config = get_oauth_config(oauth_flow_config)
         oauth_provider = OAuthProvider(
             config=oauth_config,
-            key_value_store=container.key_value_store(),
+            configuration_service=config_service,
             credentials_path=config_path
         )
 
@@ -5276,8 +4216,7 @@ async def handle_oauth_callback(
         # ============================================================
         # Refresh configuration cache
         try:
-            kv_store = container.key_value_store()
-            updated_config = await kv_store.get_key(config_path)
+            updated_config = await config_service.get_config(config_path, use_cache=False)
             if isinstance(updated_config, dict):
                 await config_service.set_config(config_path, updated_config)
                 logger.info(f"Refreshed config cache for instance {connector_id}")
@@ -5300,7 +4239,7 @@ async def handle_oauth_callback(
                 from app.connectors.core.base.token_service.token_refresh_service import (
                     TokenRefreshService,
                 )
-                temp_service = TokenRefreshService(container.key_value_store(), arango_service)
+                temp_service = TokenRefreshService(config_service, graph_provider)
                 await temp_service.schedule_token_refresh(connector_id, connector_type, token)
                 logger.info("✅ Scheduled token refresh using temporary service")
         except Exception as sched_err:
@@ -5486,46 +4425,29 @@ def _parse_filter_response(
 
         if connector_upper == "GMAIL" and filter_type == "labels":
             labels = data.get("labels", [])
-            for label in labels:
-                if label.get("type") == "user":
-                    options.append({
-                        "value": label["id"],
-                        "label": label["name"]
-                    })
+            options.extend(
+                [{"value": label["id"], "label": label["name"]} for label in labels if label.get("type") == "user"]
+            )
 
         elif connector_upper == "DRIVE" and filter_type == "folders":
             files = data.get("files", [])
-            for file in files:
-                options.append({
-                    "value": file["id"],
-                    "label": file["name"]
-                })
+            options.extend([{"value": f["id"], "label": f["name"]} for f in files])
 
         elif connector_upper == "ONEDRIVE" and filter_type == "folders":
             items = data.get("value", [])
-            for item in items:
-                if item.get("folder"):
-                    options.append({
-                        "value": item["id"],
-                        "label": item["name"]
-                    })
+            options.extend(
+                [{"value": item["id"], "label": item["name"]} for item in items if item.get("folder")]
+            )
 
         elif connector_upper == "SLACK" and filter_type == "channels":
             channels = data.get("channels", [])
-            for channel in channels:
-                if not channel.get("is_archived"):
-                    options.append({
-                        "value": channel["id"],
-                        "label": f"#{channel['name']}"
-                    })
+            options.extend(
+                [{"value": ch["id"], "label": f"#{ch['name']}"} for ch in channels if not ch.get("is_archived")]
+            )
 
         elif connector_upper == "CONFLUENCE" and filter_type == "spaces":
             spaces = data.get("results", [])
-            for space in spaces:
-                options.append({
-                    "value": space["key"],
-                    "label": space["name"]
-                })
+            options.extend([{"value": space["key"], "label": space["name"]} for space in spaces])
 
     except Exception as e:
         logger.error(f"Error parsing {filter_type} response: {e}")
@@ -5626,11 +4548,11 @@ async def _get_fallback_filter_options(
     return fallback_options.get(connector_type.upper(), {})
 
 
-@router.get("/api/v1/connectors/{connector_id}/filters")
+@router.get("/api/v1/connectors/{connector_id}/filters", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_connector_instance_filters(
     connector_id: str,
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Dict[str, Any]:
     """
     Get filter options for a connector instance.
@@ -5638,7 +4560,7 @@ async def get_connector_instance_filters(
     Args:
         connector_id: Unique instance key
         request: FastAPI request object
-        arango_service: Injected ArangoDB service
+        graph_provider: Injected graph DB provider
 
     Returns:
         Dictionary with available filter options
@@ -5730,9 +4652,9 @@ async def get_connector_instance_filters(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get filter options: {str(e)}"
-        )
+        ) from e
 
-@router.get("/api/v1/connectors/{connector_id}/filters/{filter_key}/options")
+@router.get("/api/v1/connectors/{connector_id}/filters/{filter_key}/options", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_filter_field_options(
     connector_id: str,
     filter_key: str,
@@ -5741,7 +4663,7 @@ async def get_filter_field_options(
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
     search: Optional[str] = Query(None, description="Search text to filter options"),
     cursor: Optional[str] = Query(None, description="Cursor for cursor-based pagination (API-specific)"),
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Dict[str, Any]:
     """
     Get dynamic options for a specific filter field with pagination support.
@@ -5756,7 +4678,7 @@ async def get_filter_field_options(
         page: Page number for pagination (default: 1)
         limit: Number of items per page (default: 20, max: 100)
         search: Optional search text to filter options
-        arango_service: Injected ArangoDB service
+        graph_provider: Injected graph DB provider
 
     Returns:
         Dictionary with options and pagination info:
@@ -5836,7 +4758,7 @@ async def get_filter_field_options(
                 connector_id=connector_id,
                 connector_type=connector_type,
                 connector_registry=connector_registry,
-                arango_service=arango_service,
+                graph_provider=graph_provider,
                 user_id=user_context["user_id"],
                 org_id=user_context["org_id"],
                 is_admin=user_context["is_admin"],
@@ -5871,7 +4793,7 @@ async def get_filter_field_options(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get filter options: {str(e)}"
-        )
+        ) from e
 
 
 def _get_connector_from_container(container, connector_id: str) -> Optional[BaseConnector]:
@@ -5906,11 +4828,11 @@ def _find_filter_field_config(
     return None
 
 
-@router.post("/api/v1/connectors/{connector_id}/filters")
+@router.post("/api/v1/connectors/{connector_id}/filters", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 async def save_connector_instance_filters(
     connector_id: str,
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Dict[str, Any]:
     """
     Save filter selections for a connector instance.
@@ -5918,7 +4840,7 @@ async def save_connector_instance_filters(
     Args:
         connector_id: Unique instance key
         request: FastAPI request object
-        arango_service: Injected ArangoDB service
+        graph_provider: Injected graph DB provider
 
     Returns:
         Dictionary with success status
@@ -5989,7 +4911,7 @@ async def save_connector_instance_filters(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to save filter selections: {str(e)}"
-        )
+        ) from e
 
 
 async def _ensure_connector_initialized(
@@ -5997,7 +4919,7 @@ async def _ensure_connector_initialized(
     connector_id: str,
     connector_type: str,
     connector_registry,
-    arango_service: BaseArangoService,
+    graph_provider: IGraphDBProvider,
     user_id: str,
     org_id: str,
     is_admin: bool,
@@ -6011,7 +4933,7 @@ async def _ensure_connector_initialized(
         connector_id: Connector instance ID
         connector_type: Connector type (e.g., "ONEDRIVE", "SHAREPOINT ONLINE")
         connector_registry: Connector registry instance
-        arango_service: ArangoDB service
+        graph_provider: Graph DB provider
         user_id: User ID
         org_id: Organization ID
         is_admin: Whether user is admin
@@ -6023,14 +4945,6 @@ async def _ensure_connector_initialized(
     Raises:
         HTTPException: If initialization fails
     """
-    # Skip synchronous initialization for Gmail and Google Drive - they use event-based initialization
-    # via specialized sync services and don't extend BaseConnector
-    is_gmail_or_drive = connector_type in [Connectors.GOOGLE_MAIL.value, Connectors.GOOGLE_DRIVE.value]
-
-    if is_gmail_or_drive:
-        logger.info(f"Skipping synchronous initialization for {connector_type} - will be initialized via event handlers")
-        return None
-
     # Check if connector already exists in container
     connector_exists = (
         hasattr(container, 'connectors_map') and
@@ -6045,8 +4959,9 @@ async def _ensure_connector_initialized(
     logger.info(f"Initializing connector {connector_id} before use")
     try:
         config_service = container.config_service()
-        # Use the container's data store (GraphDataStore with graph_provider)
-        data_store_provider = await container.data_store()
+        # Create data_store manually using already-resolved graph_provider to avoid coroutine reuse
+        from app.connectors.core.base.data_store.graph_data_store import GraphDataStore
+        data_store_provider = GraphDataStore(logger, graph_provider)
 
         connector_type = connector_type.replace(" ", "").lower()
 
@@ -6074,10 +4989,8 @@ async def _ensure_connector_initialized(
             error_msg = "Failed to initialize connector. Please check your credentials and configuration."
             logger.error(f"❌ {error_msg}")
             # Cleanup on failure
-            try:
+            with contextlib.suppress(Exception):
                 await connector.cleanup()
-            except Exception:
-                pass
             raise HTTPException(
                 status_code=HttpStatusCode.BAD_REQUEST.value,
                 detail=error_msg
@@ -6091,10 +5004,8 @@ async def _ensure_connector_initialized(
                 error_msg = "Connection test failed. Please verify your credentials have proper access."
                 logger.error(f"❌ {error_msg}")
                 # Cleanup on failure
-                try:
+                with contextlib.suppress(Exception):
                     await connector.cleanup()
-                except Exception:
-                    pass
                 raise HTTPException(
                     status_code=HttpStatusCode.BAD_REQUEST.value,
                     detail=error_msg
@@ -6105,14 +5016,12 @@ async def _ensure_connector_initialized(
             error_msg = f"Connection test failed: {str(test_error)}"
             logger.error(f"❌ {error_msg}", exc_info=True)
             # Cleanup on failure
-            try:
+            with contextlib.suppress(Exception):
                 await connector.cleanup()
-            except Exception:
-                pass
             raise HTTPException(
                 status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
                 detail=error_msg
-            )
+            ) from test_error
 
         # Success! Store connector in container
         logger.info(f"✅ Successfully initialized and tested {connector_type} connector")
@@ -6139,18 +5048,18 @@ async def _ensure_connector_initialized(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=error_msg
-        )
+        ) from e
 
 
 # ============================================================================
 # Connector Toggle Endpoint
 # ============================================================================
 
-@router.post("/api/v1/connectors/{connector_id}/toggle")
+@router.post("/api/v1/connectors/{connector_id}/toggle", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_SYNC))])
 async def toggle_connector_instance(
     connector_id: str,
     request: Request,
-    arango_service: BaseArangoService = Depends(get_arango_service)
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider)
 ) -> Dict[str, Any]:
     """
     Toggle connector instance active status and trigger sync events.
@@ -6158,7 +5067,7 @@ async def toggle_connector_instance(
     Args:
         connector_id: Unique instance key
         request: FastAPI request object
-        arango_service: Injected ArangoDB service
+        graph_provider: Injected graph DB provider
 
     Returns:
         Dictionary with success status
@@ -6191,7 +5100,7 @@ async def toggle_connector_instance(
 
 
         # Get organization
-        org = await arango_service.get_document(
+        org = await graph_provider.get_document(
             user_info["orgId"],
             CollectionNames.ORGS.value
         )
@@ -6267,7 +5176,7 @@ async def toggle_connector_instance(
             org_account_type = str(org.get("accountType", "")).lower()
             custom_google_business_logic = (
                 org_account_type == "enterprise" and
-                connector_type in ["GMAIL", "DRIVE"] and
+                connector_type in ["GMAIL", "GMAIL WORKSPACE", "DRIVE", "DRIVE WORKSPACE", "GCS"] and
                 instance.get("scope") == ConnectorScope.TEAM.value
             )
 
@@ -6305,7 +5214,7 @@ async def toggle_connector_instance(
                 connector_id=connector_id,
                 connector_type=connector_type,
                 connector_registry=connector_registry,
-                arango_service=arango_service,
+                graph_provider=graph_provider,
                 user_id=user_id,
                 org_id=org_id,
                 is_admin=is_admin,
@@ -6389,7 +5298,145 @@ async def toggle_connector_instance(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to toggle connector instance {connector_id} {toggle_type}: {str(e)}"
+        ) from e
+
+
+@router.delete("/api/v1/connectors/{connector_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_DELETE))])
+async def delete_connector_instance(
+    connector_id: str,
+    request: Request,
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
+) -> JSONResponse:
+    """
+    Initiate async deletion of a connector instance.
+
+    Marks the connector as DELETING, sends an appDisabled event to stop
+    active sync, then publishes a connectorType.delete event to the
+    sync-events Kafka topic and returns 202 immediately.  The actual
+    graph-DB deletion and Qdrant cleanup run in the sync consumer.
+
+    Returns 409 if a deletion is already in progress for this connector.
+    """
+    container = request.app.container
+    logger = container.logger()
+    connector_registry = request.app.state.connector_registry
+
+    try:
+        # 1. Validate user context
+        user_id = request.state.user.get("userId")
+        org_id = request.state.user.get("orgId")
+        is_admin = request.headers.get("X-Is-Admin", "false").lower() == "true"
+
+        if not user_id or not org_id:
+            logger.error("User not authenticated for connector deletion")
+            raise HTTPException(
+                status_code=HttpStatusCode.UNAUTHORIZED.value,
+                detail="User not authenticated"
+            )
+
+        # 2. Fetch and validate connector instance
+        instance = await connector_registry.get_connector_instance(
+            connector_id=connector_id,
+            user_id=user_id,
+            org_id=org_id,
+            is_admin=is_admin
         )
+
+        if not instance:
+            logger.error(f"Connector instance {connector_id} not found or access denied")
+            raise HTTPException(
+                status_code=HttpStatusCode.NOT_FOUND.value,
+                detail=f"Connector instance {connector_id} not found or access denied"
+            )
+
+        connector_type = instance.get("type", "")
+
+        # Check beta connector access
+        await check_beta_connector_access(connector_type, request)
+
+        # 3. Permission check — only creator or admin can delete
+        _validate_connector_deletion_permissions(instance, user_id, is_admin, logger)
+
+        # 4. Guard against duplicate deletion requests
+        if instance.get("status") == "DELETING":
+            raise HTTPException(
+                status_code=HttpStatusCode.CONFLICT.value,
+                detail="Connector deletion is already in progress"
+            )
+
+        logger.info(f"🗑️ Initiating async deletion of connector {connector_id} by user {user_id}")
+
+        producer = container.messaging_producer
+
+        # 5. Stop any running sync for this connector
+        try:
+            disable_message = {
+                "eventType": "appDisabled",
+                "payload": {
+                    "orgId": org_id,
+                    "appGroup": instance.get("appGroup"),
+                    "appGroupId": instance.get("appGroupId"),
+                    "connectorId": connector_id,
+                    "apps": [connector_type.replace(" ", "").lower()],
+                    "scope": instance.get("scope"),
+                },
+                "timestamp": get_epoch_timestamp_in_ms(),
+            }
+            await producer.send_message(topic="entity-events", message=disable_message)
+            logger.info(f"✅ Sent appDisabled event for connector {connector_id}")
+        except Exception as e:
+            logger.error(
+                f"❌ Failed to send appDisabled event for connector {connector_id}: {e}. "
+                f"Sync services may continue running. Proceeding with deletion event."
+            )
+
+        # 6. Publish the async deletion event — consumed by the sync consumer (before status update so a failed publish cannot leave the connector stuck in DELETING)
+        event_type = f"{connector_type.replace(' ', '').lower()}.delete"
+        delete_message = {
+            "eventType": event_type,
+            "payload": {
+                "orgId": org_id,
+                "connectorId": connector_id,
+                "connectorType": connector_type,
+                "appGroup": instance.get("appGroup"),
+                "appGroupId": instance.get("appGroupId"),
+                "scope": instance.get("scope"),
+                "previousIsActive": instance.get("isActive", False),
+                "initiatedBy": user_id,
+            },
+            "timestamp": get_epoch_timestamp_in_ms(),
+        }
+        await producer.send_message(topic="sync-events", message=delete_message)
+        logger.info(f"✅ Published {event_type} deletion event for connector {connector_id}")
+
+        # 7. Mark connector as DELETING in the graph DB so the UI can reflect it
+        await graph_provider.batch_upsert_nodes(
+            [{
+                "id": connector_id,
+                "status": "DELETING",
+                "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+            }],
+            CollectionNames.APPS.value
+        )
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "success": True,
+                "message": "Connector deletion initiated",
+                "connectorId": connector_id,
+                "status": "DELETING",
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to initiate deletion for connector {connector_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail="Failed to initiate connector deletion. Please try again."
+        ) from e
 
 
 # ============================================================================
@@ -6442,7 +5489,7 @@ def _clean_schema_for_response(schema: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
-@router.get("/api/v1/connectors/registry/{connector_type}/schema")
+@router.get("/api/v1/connectors/registry/{connector_type}/schema", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_connector_schema(
     connector_type: str,
     request: Request
@@ -6489,9 +5536,9 @@ async def get_connector_schema(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get connector schema: {str(e)}"
-        )
+        ) from e
 
-@router.get("/api/v1/connectors/agents/active")
+@router.get("/api/v1/connectors/agents/active", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_active_agent_instances(
     request: Request,
     scope: Optional[str] = Query(None, description="personal | team"),
@@ -6551,14 +5598,14 @@ async def get_active_agent_instances(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get active agent instances: {str(e)}"
-        )
+        ) from e
 
 
 # ============================================================================
 # OAuth Config Management Endpoints
 # ============================================================================
 
-@router.get("/api/v1/oauth/registry")
+@router.get("/api/v1/oauth/registry", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_oauth_config_registry(
     request: Request,
     page: int = Query(1, ge=1),
@@ -6613,10 +5660,10 @@ async def get_oauth_config_registry(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Error getting OAuth config registry: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/oauth/registry/{connector_type}")
+@router.get("/api/v1/oauth/registry/{connector_type}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_oauth_config_registry_by_type(
     connector_type: str,
     request: Request,
@@ -6671,10 +5718,10 @@ async def get_oauth_config_registry_by_type(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Error getting OAuth config registry: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/oauth")
+@router.get("/api/v1/oauth", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 @inject
 async def get_all_oauth_configs(
     request: Request,
@@ -6814,7 +5861,7 @@ async def get_all_oauth_configs(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get all OAuth configurations: {str(e)}"
-        )
+        ) from e
 
 
 def _get_oauth_config_path(connector_type: str) -> str:
@@ -6861,8 +5908,7 @@ def _get_oauth_field_names_from_registry(connector_type: str) -> List[str]:
             return ["clientId", "clientSecret"]
 
         # Extract field names from auth_fields
-        field_names = [field.name for field in oauth_config.auth_fields]
-        return field_names
+        return [field.name for field in oauth_config.auth_fields]
     except Exception:
         # Fallback to common OAuth fields if registry lookup fails
         return ["clientId", "clientSecret"]
@@ -7064,7 +6110,7 @@ def _find_oauth_config_by_id(
     return None
 
 
-@router.post("/api/v1/oauth/{connector_type}")
+@router.post("/api/v1/oauth/{connector_type}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 @inject
 async def create_oauth_config(
     connector_type: str,
@@ -7189,10 +6235,10 @@ async def create_oauth_config(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to create OAuth configuration: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/oauth/{connector_type}")
+@router.get("/api/v1/oauth/{connector_type}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 @inject
 async def list_oauth_configs(
     connector_type: str,
@@ -7266,10 +6312,10 @@ async def list_oauth_configs(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to list OAuth configurations: {str(e)}"
-        )
+        ) from e
 
 
-@router.get("/api/v1/oauth/{connector_type}/{config_id}")
+@router.get("/api/v1/oauth/{connector_type}/{config_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 @inject
 async def get_oauth_config_by_id(
     connector_type: str,
@@ -7352,10 +6398,10 @@ async def get_oauth_config_by_id(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get OAuth configuration: {str(e)}"
-        )
+        ) from e
 
 
-@router.put("/api/v1/oauth/{connector_type}/{config_id}")
+@router.put("/api/v1/oauth/{connector_type}/{config_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_WRITE))])
 @inject
 async def update_oauth_config(
     connector_type: str,
@@ -7459,10 +6505,10 @@ async def update_oauth_config(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to update OAuth configuration: {str(e)}"
-        )
+        ) from e
 
 
-@router.delete("/api/v1/oauth/{connector_type}/{config_id}")
+@router.delete("/api/v1/oauth/{connector_type}/{config_id}", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_DELETE))])
 @inject
 async def delete_oauth_config(
     connector_type: str,
@@ -7536,4 +6582,4 @@ async def delete_oauth_config(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to delete OAuth configuration: {str(e)}"
-        )
+        ) from e

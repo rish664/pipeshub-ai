@@ -1,14 +1,8 @@
-from typing import Any, Awaitable, Callable, Dict, List, Union
+import ssl
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Union
 
-from app.config.constants.arangodb import Connectors
 from app.config.constants.service import config_node_constants
 from app.connectors.services.event_service import EventService
-from app.connectors.sources.google.gmail.services.event_service.event_service import (
-    GmailEventService,
-)
-from app.connectors.sources.google.google_drive.services.event_service.event_service import (
-    GoogleDriveEventService,
-)
 from app.containers.connector import ConnectorAppContainer
 from app.containers.indexing import IndexingAppContainer
 from app.containers.query import QueryAppContainer
@@ -34,6 +28,7 @@ class KafkaUtils:
         kafka_config = await config_service.get_config(
             config_node_constants.KAFKA.value
         )
+
         if not kafka_config:
             raise ValueError("Kafka configuration not found")
 
@@ -47,7 +42,9 @@ class KafkaUtils:
             auto_offset_reset='earliest',
             enable_auto_commit=True,
             bootstrap_servers=brokers,
-            topics=topics
+            topics=topics,
+            ssl=kafka_config.get('ssl', False),
+            sasl=kafka_config.get('sasl')
         )
 
     @staticmethod
@@ -62,7 +59,9 @@ class KafkaUtils:
 
         return KafkaProducerConfig(
             bootstrap_servers=kafka_config["brokers"], # type: ignore
-            client_id="messaging_producer_client"
+            client_id="messaging_producer_client",
+            ssl=kafka_config.get('ssl', False),
+            sasl=kafka_config.get('sasl')
         )
 
     @staticmethod
@@ -92,7 +91,7 @@ class KafkaUtils:
     @staticmethod
     async def kafka_config_to_dict(kafka_config: KafkaConsumerConfig) -> Dict[str, Any]:
         """Convert KafkaConsumerConfig dataclass to dictionary format for aiokafka consumer"""
-        return {
+        config = {
             'bootstrap_servers': ",".join(kafka_config.bootstrap_servers),
             'group_id': kafka_config.group_id,
             'auto_offset_reset': kafka_config.auto_offset_reset,
@@ -101,16 +100,30 @@ class KafkaUtils:
             'topics': kafka_config.topics  # Include topics in the dictionary
         }
 
+        # Add SSL/SASL configuration for AWS MSK
+        if kafka_config.ssl:
+            config["ssl_context"] = ssl.create_default_context()
+            sasl_config = kafka_config.sasl or {}
+            if sasl_config.get("username"):
+                config["security_protocol"] = "SASL_SSL"
+                config["sasl_mechanism"] = sasl_config.get("mechanism", "SCRAM-SHA-512").upper()
+                config["sasl_plain_username"] = sasl_config["username"]
+                config["sasl_plain_password"] = sasl_config["password"]
+            else:
+                config["security_protocol"] = "SSL"
+
+        return config
+
     @staticmethod
-    async def create_entity_message_handler(app_container: ConnectorAppContainer) -> Callable[[Dict[str, Any]], Awaitable[bool]]:
+    async def create_entity_message_handler(app_container: ConnectorAppContainer, graph_provider) -> Callable[[Dict[str, Any]], Awaitable[bool]]:
         """Create a message handler for entity events"""
         logger = app_container.logger()
-        arango_service = await app_container.arango_service()
+        # Use graph_provider passed as parameter (already resolved in lifespan)
 
         # Create the entity event service
         entity_event_service = EntityEventService(
             logger=logger,
-            arango_service=arango_service,
+            graph_provider=graph_provider,
             app_container=app_container
         )
 
@@ -141,11 +154,19 @@ class KafkaUtils:
         return handle_entity_message
 
     @staticmethod
-    async def create_record_message_handler(app_container: IndexingAppContainer) -> Callable[[Dict[str, Any]], Awaitable[bool]]:
-        """Create a message handler for record events"""
+    async def create_record_message_handler(app_container: IndexingAppContainer) -> Callable[[Dict[str, Any]], AsyncGenerator[Dict[str, Any], None]]:
+        """Create a message handler for record events.
+
+        Returns an async generator function that yields events during processing:
+        - 'parsing_complete': When document parsing is done
+        - 'indexing_complete': When indexing pipeline is done
+        """
         logger = app_container.logger()
-        event_processor = await app_container.event_processor()
-        config_service =  app_container.config_service()
+        # Use cached event_processor if available, otherwise resolve it
+        event_processor = getattr(app_container, '_event_processor', None)
+        if not event_processor:
+            event_processor = await app_container.event_processor()
+        config_service = app_container.config_service()
         # Create the entity event service
         record_event_service = RecordEventHandler(
             logger=logger,
@@ -153,39 +174,45 @@ class KafkaUtils:
             event_processor=event_processor,
         )
 
-        async def handle_record_message(message: Dict[str, Any]) -> bool:
-            """Handle incoming record messages"""
-            try:
+        async def handle_record_message(message: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+            """Handle incoming record messages, yielding events during processing.
 
+            Yields:
+                Dict with 'event' key indicating phase completion:
+                - {'event': 'parsing_complete', 'data': {...}}
+                - {'event': 'indexing_complete', 'data': {...}}
+            """
+            try:
                 if message is None:
                     logger.warning("Received a None message, likely during shutdown. Skipping.")
-                    return True
+                    return
 
                 event_type = message.get("eventType")
                 payload = message.get("payload")
 
                 if not event_type:
                     logger.error("Missing event_type in message")
-                    return False
+                    return
 
                 if not payload:
                     logger.error("Missing payload in message")
-                    return False
+                    return
 
                 logger.info(f"Processing record event: {event_type}")
-                return await record_event_service.process_event(event_type, payload)
+                # Yield events from the record event service
+                async for event in record_event_service.process_event(event_type, payload):
+                    yield event
 
             except Exception as e:
                 logger.error(f"Error processing record message: {str(e)}", exc_info=True)
-                return False
+                raise
 
         return handle_record_message
 
     @staticmethod
-    async def create_sync_message_handler(app_container: ConnectorAppContainer) -> Callable[[Dict[str, Any]], Awaitable[bool]]:
+    async def create_sync_message_handler(app_container: ConnectorAppContainer, graph_provider) -> Callable[[Dict[str, Any]], Awaitable[bool]]:
         """Create a message handler for sync events"""
         logger = app_container.logger()
-        arango_service = await app_container.arango_service()
 
         async def handle_sync_message(message: Dict[str, Any]) -> bool:
             """Handle incoming sync messages"""
@@ -207,91 +234,19 @@ class KafkaUtils:
                 else:
                     connector = payload.get("connector")
 
-                connector_id = payload.get("connectorId")
-                sync_tasks_registry = getattr(app_container, 'sync_tasks_registry', {})
-
-                if event_type == "connectorPublicUrlChanged":
-                    logger.info(f"Processing connectorPublicUrlChanged event: {payload}")
-                    drive_sync_tasks = sync_tasks_registry.get(connector_id)
-                    if not drive_sync_tasks:
-                        logger.error("Drive sync tasks not found in registry")
-                        return False
-
-                    # Handle drive sync events
-                    google_drive_event_service = GoogleDriveEventService(
-                        logger=logger,
-                        sync_tasks=drive_sync_tasks,
-                        arango_service=arango_service,
-                    )
-                    logger.info(f"Processing sync event: {event_type} for GOOGLE DRIVE")
-                    return await google_drive_event_service.process_event(event_type, payload)
-
                 if not connector:
                     logger.error("Missing connector in event_type or payload")
                     return False
 
                 logger.info(f"Processing sync event: {event_type} for connector {connector}")
 
-                connector_normalized = connector.lower().replace(" ", "")
-
-                if connector_normalized == Connectors.GOOGLE_MAIL.value.lower():
-                    # Create the sync event service
-                    if not connector_id:
-                        logger.error(f"Missing connectorId in sync event payload for connector {connector}. Payload: {payload}")
-                        return False
-                    gmail_sync_tasks = sync_tasks_registry.get(connector_id)
-                    if not gmail_sync_tasks:
-                        logger.error(f"Gmail sync tasks not found in registry for connector {connector_id}")
-                        return False
-
-                    logger.info(f"Gmail sync tasks found in registry: {gmail_sync_tasks} for connector {connector_id}")
-
-                    gmail_event_service = GmailEventService(
-                        logger=logger,
-                        sync_tasks=gmail_sync_tasks,
-                        arango_service=arango_service,
-                    )
-                    logger.info(f"Processing sync event: {event_type} for GMAIL")
-                    return await gmail_event_service.process_event(event_type, payload)
-
-                # Google Drive connector events
-                elif connector_normalized == Connectors.GOOGLE_DRIVE.value.lower():
-                    if not connector_id:
-                        logger.error(
-                            f"Missing connectorId in sync event payload for connector {connector}. Payload: {payload}"
-                        )
-                        return False
-
-                    drive_sync_tasks = (
-                        sync_tasks_registry.get(connector_id)
-                    )
-                    if not drive_sync_tasks:
-                        logger.error(
-                            f"Drive sync tasks not found in registry for connector {connector_id}"
-                        )
-                        logger.error(f"Sync tasks registry: {sync_tasks_registry}")
-                        return False
-
-                    logger.info(
-                        f"Drive sync tasks found in registry: {drive_sync_tasks} for connector {connector_id}"
-                    )
-                    # Handle drive sync events
-                    google_drive_event_service = GoogleDriveEventService(
-                        logger=logger,
-                        sync_tasks=drive_sync_tasks,
-                        arango_service=arango_service,
-                    )
-                    logger.info(f"Processing sync event: {event_type} for GOOGLE DRIVE")
-                    return await google_drive_event_service.process_event(event_type, payload)
-
-                else:
-                    event_service = EventService(
-                        logger=logger,
-                        arango_service=arango_service,
-                        app_container=app_container,
-                    )
-                    logger.info(f"Processing sync event: {event_type} for {connector}")
-                    return await event_service.process_event(event_type, payload)
+                event_service = EventService(
+                    logger=logger,
+                    graph_provider=graph_provider,
+                    app_container=app_container,
+                )
+                logger.info(f"Processing sync event: {event_type} for {connector}")
+                return await event_service.process_event(event_type, payload)
 
             except Exception as e:
                 logger.error(f"Error processing sync message: {str(e)}", exc_info=True)

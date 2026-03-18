@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from app.config.key_value_store import KeyValueStore
+from app.config.configuration_service import ConfigurationService
 from app.connectors.core.base.token_service.oauth_service import (
     OAuthConfig,
     OAuthProvider,
@@ -31,8 +31,14 @@ class AtlassianScope(Enum):
     JIRA_PROJECT_MANAGE = "manage:jira-project"
     JIRA_CONFIGURATION_MANAGE = "manage:jira-configuration"
     JIRA_DATA_PROVIDER_MANAGE = "manage:jira-data-provider"
-    JIRA_PROJECT_READ = "read:jira-project"
-    JIRA_PROJECT_WRITE = "write:jira-project"
+    JIRA_USER_VIEW = "read:user:jira"
+    JIRA_USER_COLUMNS = "read:user.columns:jira"
+
+    JIRA_PROJECT_READ = "read:project:jira"
+    JIRA_PROJECT_WRITE = "write:project:jira"
+    JIRA_AUDIT_LOG_READ = "read:audit-log:jira"
+    JIRA_APPLICATION_ROLE_READ = "read:application-role:jira"
+    JIRA_PROJECT_ROLE_READ = "read:project-role:jira"
 
     # Confluence Scopes
     CONFLUENCE_CONTENT_READ = "read:confluence-content.all"
@@ -66,6 +72,7 @@ class AtlassianScope(Enum):
     CONFLUENCE_COMMENT_WRITE = "write:comment:confluence"
     CONFLUENCE_SEARCH = "search:confluence"
     CONFLUENCE_EMAIL_READ = "read:email-address:confluence"
+    CONFLUENCE_COMMENT_DELETE = "delete:comment:confluence"
 
     # Common Scopes
     ACCOUNT_READ = "read:account"
@@ -74,15 +81,36 @@ class AtlassianScope(Enum):
 
     @classmethod
     def get_jira_basic(cls) -> List[str]:
-        """Get basic Jira scopes"""
+        """Get essential Jira scopes (for minimal user/work access)"""
         return [
             cls.JIRA_WORK_READ.value,
             cls.JIRA_USER_READ.value,
-            cls.JIRA_GROUP_READ.value,
             cls.ACCOUNT_READ.value,
             cls.OFFLINE_ACCESS.value,
-            cls.JIRA_PROJECT_READ.value,
-            cls.JIRA_PROJECT_WRITE.value,
+        ]
+
+    @classmethod
+    def get_jira_read_access(cls) -> List[str]:
+        """
+        Get read-only access scopes for Jira connector.
+        Uses classic scopes for broad access plus minimal granular scopes.
+        """
+        return [
+            # Classic scopes (recommended for broad access)
+            cls.JIRA_WORK_READ.value,           # Read project/issue data, search issues, attachments, worklogs
+            cls.JIRA_USER_READ.value,           # View user information (usernames, emails, avatars)
+
+            # Granular scopes (for specific API access)
+            cls.USER_JIRA_READ.value,           # Granular: View user details
+            cls.JIRA_GROUP_READ.value,          # Read groups and group members
+            cls.JIRA_AVATAR_READ.value,         # Read user/project avatars
+            cls.JIRA_AUDIT_LOG_READ.value,      # Read audit logs (for detecting deleted issues)
+            cls.JIRA_APPLICATION_ROLE_READ.value,  # Read application roles
+            cls.JIRA_PROJECT_ROLE_READ.value,   # Read project roles
+
+            # Common scopes
+            cls.ACCOUNT_READ.value,             # Read Atlassian account info
+            cls.OFFLINE_ACCESS.value,           # Refresh tokens
         ]
 
     @classmethod
@@ -140,6 +168,8 @@ class AtlassianScope(Enum):
             cls.JIRA_CONFIGURATION_MANAGE.value,
             cls.JIRA_PROJECT_READ.value,
             cls.JIRA_PROJECT_WRITE.value,
+            cls.JIRA_USER_VIEW.value,
+            cls.JIRA_USER_COLUMNS.value,
             # Confluence
             cls.CONFLUENCE_CONTENT_READ.value,
             cls.CONFLUENCE_CONTENT_WRITE.value,
@@ -185,7 +215,7 @@ class AtlassianOAuthProvider(OAuthProvider):
         client_id: str,
         client_secret: str,
         redirect_uri: str,
-        key_value_store: KeyValueStore,
+        configuration_service: ConfigurationService,
         credentials_path: str,
         scopes: Optional[List[str]] = None,
     ) -> None:
@@ -196,7 +226,7 @@ class AtlassianOAuthProvider(OAuthProvider):
             client_secret: OAuth 2.0 client secret
             redirect_uri: Callback URL registered with Atlassian
             scopes: List of scopes to request (uses basic scopes if not provided)
-            key_value_store: Key-value store implementation
+            configuration_service: Configuration service instance
         """
         if scopes is None:
             scopes = AtlassianScope.get_full_access()
@@ -214,7 +244,7 @@ class AtlassianOAuthProvider(OAuthProvider):
             }
         )
 
-        super().__init__(config, key_value_store, credentials_path)
+        super().__init__(config, configuration_service, credentials_path)
         self._accessible_resources: Optional[List[AtlassianCloudResource]] = None
 
     @staticmethod
@@ -235,12 +265,6 @@ class AtlassianOAuthProvider(OAuthProvider):
 
     async def handle_callback(self, code: str, state: str) -> OAuthToken:
         token = await super().handle_callback(code, state)
-        # identity = await self.get_identity(token)
-        # email = identity.get('email')
-        # if not email:
-        #     raise Exception("User email not found in Atlassian identity response")
-        # user = await self.base_arango_service.get_user_by_email(email)
-
 
         return token
 

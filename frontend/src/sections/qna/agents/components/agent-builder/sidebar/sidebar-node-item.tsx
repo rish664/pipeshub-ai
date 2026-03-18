@@ -16,18 +16,12 @@ export const SidebarNodeItem: React.FC<SidebarNodeItemProps> = ({
   connectorIconPath,
   itemIcon,
   isDynamicIcon = false,
+  isDraggable = true,
 }) => {
   const theme = useTheme();
 
-  // Get appropriate hover color based on section
-  let hoverColor = theme.palette.primary.main;
-  if (sectionType === 'apps') {
-    hoverColor = theme.palette.info.main;
-  } else if (sectionType === 'kbs') {
-    hoverColor = theme.palette.warning.main;
-  } else if (sectionType === 'connectors') {
-    hoverColor = theme.palette.info.main;
-  }
+  // Use neutral colors for minimal design
+  const hoverColor = theme.palette.text.secondary;
 
   const handleDragStart = (event: React.DragEvent) => {
     event.dataTransfer.setData('application/reactflow', template.type);
@@ -41,57 +35,89 @@ export const SidebarNodeItem: React.FC<SidebarNodeItemProps> = ({
     
     // For tools
     if (sectionType === 'tools') {
-      event.dataTransfer.setData('toolAppName', template.defaultConfig?.appName || '');
-      if (connectorStatus) {
-        event.dataTransfer.setData('isConfigured', String(connectorStatus.isConfigured));
-        event.dataTransfer.setData('isAgentActive', String(connectorStatus.isAgentActive));
-      }
-      if (connectorInstance) {
-        event.dataTransfer.setData('connectorId', connectorInstance._key || (connectorInstance as any).id || '');
-        event.dataTransfer.setData('connectorType', connectorInstance.type || '');
-        event.dataTransfer.setData('connectorName', connectorInstance.name || '');
-        event.dataTransfer.setData('scope', connectorInstance.scope || 'personal');
-      }
-      if (connectorIconPath) {
-        event.dataTransfer.setData('connectorIconPath', connectorIconPath);
+      // Check if this is a toolset tool (has toolsetName in defaultConfig)
+      if (template.defaultConfig?.toolsetName) {
+        // This is a tool from a toolset
+        const toolsetName = template.defaultConfig.toolsetName || '';
+        const toolName = template.defaultConfig.toolName || template.label || '';
+        // Construct fullName if it's missing
+        const fullName = template.defaultConfig.fullName || template.type || (toolsetName && toolName ? `${toolsetName}.${toolName}` : '');
+        
+        event.dataTransfer.setData('type', 'tool');
+        event.dataTransfer.setData('instanceId', template.defaultConfig.instanceId || '');
+        event.dataTransfer.setData('instanceName', template.defaultConfig.instanceName || '');
+        event.dataTransfer.setData('toolsetType', template.defaultConfig.toolsetType || toolsetName);
+        event.dataTransfer.setData('toolsetName', toolsetName);
+        event.dataTransfer.setData('displayName', template.defaultConfig.displayName || '');
+        event.dataTransfer.setData('toolName', toolName);
+        event.dataTransfer.setData('fullName', fullName);
+        event.dataTransfer.setData('description', template.defaultConfig.description || template.description || '');
+        event.dataTransfer.setData('iconPath', template.defaultConfig.iconPath || '');
+        event.dataTransfer.setData('isConfigured', String(template.defaultConfig.isConfigured || connectorStatus?.isConfigured || false));
+        event.dataTransfer.setData('isAuthenticated', String(template.defaultConfig.isAuthenticated || connectorStatus?.isAgentActive || false));
+        // Include all tools from toolset so toolset node can show them in add menu
+        if (template.defaultConfig.allTools) {
+          event.dataTransfer.setData('allTools', JSON.stringify(template.defaultConfig.allTools));
+          event.dataTransfer.setData('toolCount', String(template.defaultConfig.allTools.length));
+        }
+      } else {
+        // Regular connector tool
+        event.dataTransfer.setData('toolAppName', template.defaultConfig?.appName || '');
+        if (connectorStatus) {
+          event.dataTransfer.setData('isConfigured', String(connectorStatus.isConfigured));
+          event.dataTransfer.setData('isAgentActive', String(connectorStatus.isAgentActive));
+        }
+        if (connectorInstance) {
+          event.dataTransfer.setData('connectorId', connectorInstance._key || (connectorInstance as any).id || '');
+          event.dataTransfer.setData('connectorType', connectorInstance.type || '');
+          event.dataTransfer.setData('connectorName', connectorInstance.name || '');
+          event.dataTransfer.setData('scope', connectorInstance.scope || 'personal');
+        }
+        if (connectorIconPath) {
+          event.dataTransfer.setData('connectorIconPath', connectorIconPath);
+        }
       }
     }
   };
 
+  const isDark = theme.palette.mode === 'dark';
+
   return (
     <ListItem
       button
-      draggable
-      onDragStart={handleDragStart}
+      draggable={isDraggable}
+      onDragStart={isDraggable ? handleDragStart : undefined}
       sx={{
         py: 0.75,
         px: 2,
-        pl: isSubItem ? 5.5 : 4,
-        cursor: 'grab',
+        pl: isSubItem ? 5 : 3.5,
+        cursor: isDraggable ? 'grab' : 'default',
         borderRadius: 1,
         mx: isSubItem ? 1.5 : 1,
         my: 0.25,
-        border: `1px solid ${alpha(theme.palette.divider, 0.05)}`,
+        border: 'none',
         backgroundColor: 'transparent',
+        transition: 'all 0.2s ease',
         '&:hover': {
-          backgroundColor: alpha(theme.palette.action.hover, 0.04),
-          borderColor: alpha(theme.palette.divider, 0.1),
+          backgroundColor: theme.palette.action.hover,
         },
         '&:active': {
-          cursor: 'grabbing',
+          cursor: isDraggable ? 'grabbing' : 'default',
+          backgroundColor: theme.palette.action.selected,
         },
       }}
     >
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, width: '100%' }}>
-        {/* Icon */}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, width: '100%' }}>
+        {/* Minimal Icon */}
         {isDynamicIcon ? (
           <img
             src={typeof itemIcon === 'string' ? itemIcon : '/assets/icons/connectors/default.svg'}
             alt={template.label}
-            width={isSubItem ? 16 : 18}
-            height={isSubItem ? 16 : 18}
+            width={isSubItem ? 14 : 16}
+            height={isSubItem ? 14 : 16}
             style={{
               objectFit: 'contain',
+              opacity: 0.7,
             }}
             onError={(e) => {
               e.currentTarget.src = '/assets/icons/connectors/default.svg';
@@ -100,21 +126,21 @@ export const SidebarNodeItem: React.FC<SidebarNodeItemProps> = ({
         ) : (
           <Icon
             icon={itemIcon || template.icon}
-            width={isSubItem ? 16 : 18}
-            height={isSubItem ? 16 : 18}
-            style={{ color: alpha(theme.palette.text.secondary, 0.7) }}
+            width={isSubItem ? 14 : 16}
+            height={isSubItem ? 14 : 16}
+            style={{ color: theme.palette.text.secondary, opacity: 0.7 }}
           />
         )}
         
-        {/* Label */}
+        {/* Label - Minimal Typography */}
         <Typography
           variant="body2"
           sx={{
-            fontSize: isSubItem ? '0.85rem' : '0.9rem',
+            fontSize: isSubItem ? '0.8125rem' : '0.875rem',
             color: theme.palette.text.primary,
             fontWeight: 400,
             flex: 1,
-            lineHeight: 1.4,
+            lineHeight: 1.5,
           }}
         >
           {normalizeDisplayName(template.label)}

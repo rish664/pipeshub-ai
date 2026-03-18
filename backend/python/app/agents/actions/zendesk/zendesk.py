@@ -1,19 +1,136 @@
-import asyncio
-import concurrent.futures
 import json
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
+from app.agents.actions.utils import run_async
 from app.agents.tools.decorator import tool
 from app.agents.tools.enums import ParameterType
 from app.agents.tools.models import ToolParameter
-from app.sources.client.http.http_response import HTTPResponse
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.tool_builder import (
+    ToolCategory,
+    ToolDefinition,
+    ToolsetBuilder,
+)
 from app.sources.client.zendesk.zendesk import ZendeskClient
 from app.sources.external.zendesk.zendesk import ZendeskDataSource
 
 logger = logging.getLogger(__name__)
 
+# Define tools
+tools: List[ToolDefinition] = [
+    ToolDefinition(
+        name="get_current_user",
+        description="Get current user information",
+        parameters=[],
+        tags=["users", "info"]
+    ),
+    ToolDefinition(
+        name="list_tickets",
+        description="List support tickets",
+        parameters=[
+            {"name": "status", "type": "string", "description": "Ticket status filter", "required": False}
+        ],
+        tags=["tickets", "list"]
+    ),
+    ToolDefinition(
+        name="get_ticket",
+        description="Get ticket details",
+        parameters=[
+            {"name": "ticket_id", "type": "integer", "description": "Ticket ID", "required": True}
+        ],
+        tags=["tickets", "read"]
+    ),
+    ToolDefinition(
+        name="create_ticket",
+        description="Create a new ticket",
+        parameters=[
+            {"name": "subject", "type": "string", "description": "Ticket subject", "required": True},
+            {"name": "description", "type": "string", "description": "Ticket description", "required": True}
+        ],
+        tags=["tickets", "create"]
+    ),
+    ToolDefinition(
+        name="update_ticket",
+        description="Update a ticket",
+        parameters=[
+            {"name": "ticket_id", "type": "integer", "description": "Ticket ID", "required": True}
+        ],
+        tags=["tickets", "update"]
+    ),
+    ToolDefinition(
+        name="delete_ticket",
+        description="Delete a ticket",
+        parameters=[
+            {"name": "ticket_id", "type": "integer", "description": "Ticket ID", "required": True}
+        ],
+        tags=["tickets", "delete"]
+    ),
+    ToolDefinition(
+        name="list_users",
+        description="List users",
+        parameters=[],
+        tags=["users", "list"]
+    ),
+    ToolDefinition(
+        name="get_user",
+        description="Get user details",
+        parameters=[
+            {"name": "user_id", "type": "integer", "description": "User ID", "required": True}
+        ],
+        tags=["users", "read"]
+    ),
+    ToolDefinition(
+        name="search_tickets",
+        description="Search for tickets",
+        parameters=[
+            {"name": "query", "type": "string", "description": "Search query", "required": True}
+        ],
+        tags=["tickets", "search"]
+    ),
+]
 
+
+# Register Zendesk toolset
+@ToolsetBuilder("Zendesk")\
+    .in_group("Customer Support")\
+    .with_description("Zendesk integration for customer support ticket management")\
+    .with_category(ToolCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="Zendesk",
+            authorize_url="https://{subdomain}.zendesk.com/oauth/authorizations/new",
+            token_url="https://{subdomain}.zendesk.com/oauth/tokens",
+            redirect_uri="toolsets/oauth/callback/zendesk",
+            scopes=OAuthScopeConfig(
+                personal_sync=[],
+                team_sync=[],
+                agent=[
+                    "read",
+                    "write"
+                ]
+            ),
+            fields=[
+                CommonFields.client_id("Zendesk OAuth App"),
+                CommonFields.client_secret("Zendesk OAuth App")
+            ],
+            icon_path="/assets/icons/connectors/zendesk.svg",
+            app_group="Customer Support",
+            app_description="Zendesk OAuth application for agent integration"
+        ),
+        AuthBuilder.type(AuthType.API_TOKEN).fields([
+            CommonFields.api_token("Zendesk API Token", "your-api-token"),
+            CommonFields.api_token("Zendesk Subdomain", "your-subdomain", field_name="subdomain")
+        ])
+    ])\
+    .with_tools(tools)\
+    .configure(lambda builder: builder.with_icon("/assets/icons/connectors/zendesk.svg"))\
+    .build_decorator()
 class Zendesk:
     """Zendesk tool exposed to the agents"""
     def __init__(self, client: ZendeskClient) -> None:
@@ -25,21 +142,6 @@ class Zendesk:
             None
         """
         self.client = ZendeskDataSource(client)
-
-    def _run_async(self, coro) -> HTTPResponse: # type: ignore [valid method]
-        """Helper method to run async operations in sync context"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, we need to use a thread pool
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, coro)
-                    return future.result()
-            else:
-                return loop.run_until_complete(coro)
-        except Exception as e:
-            logger.error(f"Error running async operation: {e}")
-            raise
 
     @tool(
         app_name="zendesk",
@@ -55,7 +157,7 @@ class Zendesk:
         """
         try:
             # Use ZendeskDataSource method
-            response = self._run_async(self.client.show_current_user())
+            response = run_async(self.client.show_current_user())
 
             if response.success:
                 return True, response.to_json()
@@ -115,7 +217,7 @@ class Zendesk:
         """
         try:
             # Use ZendeskDataSource method
-            response = self._run_async(self.client.list_tickets(
+            response = run_async(self.client.list_tickets(
                 sort_by=sort_by,
                 sort_order=sort_order,
                 per_page=per_page,
@@ -154,7 +256,7 @@ class Zendesk:
         try:
             # Use ZendeskDataSource method (coerce ID to int)
             tid = int(ticket_id)
-            response = self._run_async(self.client.show_ticket(ticket_id=tid))
+            response = run_async(self.client.show_ticket(ticket_id=tid))
 
             if response.success:
                 return True, response.to_json()
@@ -230,7 +332,7 @@ class Zendesk:
         """
         try:
             # Map to data source flat params; description -> comment body
-            response = self._run_async(self.client.create_ticket(
+            response = run_async(self.client.create_ticket(
                 subject=subject,
                 comment={"body": description},
                 requester_id=int(requester_id) if requester_id is not None else None,
@@ -314,7 +416,7 @@ class Zendesk:
         try:
             # Use ZendeskDataSource method with flat params; description -> comment body
             tid = int(ticket_id)
-            response = self._run_async(self.client.update_ticket(
+            response = run_async(self.client.update_ticket(
                 ticket_id=tid,
                 subject=subject,
                 comment={"body": description} if description is not None else None,
@@ -355,7 +457,7 @@ class Zendesk:
         try:
             # Use ZendeskDataSource method (coerce ID to int)
             tid = int(ticket_id)
-            response = self._run_async(self.client.delete_ticket(ticket_id=tid))
+            response = run_async(self.client.delete_ticket(ticket_id=tid))
 
             if response.success:
                 return True, response.to_json()
@@ -399,7 +501,7 @@ class Zendesk:
         """
         try:
             # Use ZendeskDataSource method (supports role/include among others)
-            response = self._run_async(self.client.list_users(
+            response = run_async(self.client.list_users(
                 role=role,
                 include=include
             ))
@@ -436,7 +538,7 @@ class Zendesk:
         try:
             # Use ZendeskDataSource method (coerce ID to int)
             uid = int(user_id)
-            response = self._run_async(self.client.show_user(user_id=uid))
+            response = run_async(self.client.show_user(user_id=uid))
 
             if response.success:
                 return True, response.to_json()
@@ -502,7 +604,7 @@ class Zendesk:
         """
         try:
             # Use ZendeskDataSource method (generic search)
-            response = self._run_async(self.client.search(
+            response = run_async(self.client.search(
                 query=query,
                 sort_by=sort_by,
                 sort_order=sort_order

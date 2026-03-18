@@ -12,6 +12,7 @@ import type { AppUser, GroupUser, AppUserGroup } from './types/group-details';
 interface PasswordChangeRequest {
   currentPassword: string;
   newPassword: string;
+  'cf-turnstile-response'?: string;
 }
 
 interface AddUsersToGroupsRequest {
@@ -122,7 +123,7 @@ export const updateOrg = async (orgId: string, orgData: any) => {
   }
 };
 
-export const changePassword = async ({ currentPassword, newPassword }: PasswordChangeRequest) => {
+export const changePassword = async ({ currentPassword, newPassword, 'cf-turnstile-response': turnstileToken }: PasswordChangeRequest) => {
   try {
     const accessToken = localStorage.getItem(STORAGE_KEY);
     const response = await axios.post(
@@ -130,6 +131,7 @@ export const changePassword = async ({ currentPassword, newPassword }: PasswordC
       {
         currentPassword,
         newPassword,
+        ...(turnstileToken && { 'cf-turnstile-response': turnstileToken })
       },
       {
         headers: {
@@ -214,6 +216,14 @@ export const allGroups = async () => {
     return response.data;
   } catch (error) {
     throw new Error('Error fetching groups');
+  }
+};
+export const allblockedUsers = async () => {
+  try {
+    const response = await axios.get<GroupUser[]>(`${CONFIG.backendUrl}/api/v1/users?blocked=true`); // Replace with the actual API endpoint
+    return response.data;
+  } catch (error) {
+    throw new Error('Error fetching blocked users');
   }
 };
 
@@ -376,3 +386,13 @@ export const getDataCollectionConsent = async (): Promise<boolean> => {
     throw new Error('Error editing the consent');
   }
 };
+
+export const unblockUser = async (userId: string) => {
+  try {
+    const response = await axios.put(`${CONFIG.backendUrl}/api/v1/users/${userId}/unblock`);
+    return response.data;
+  } catch (error) {
+    throw new Error('Error unblocking user');
+  }
+};
+

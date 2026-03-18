@@ -243,7 +243,6 @@ const UnifiedPermissionsDialog: React.FC<UnifiedPermissionsDialogProps> = ({
       ]);
       setPermissions(p || []);
       setUsers(u || []);
-      console.log('users', u);
       setTeams(t || []);
     } catch (e: any) {
       setError(e?.message || 'Failed to load permissions');
@@ -1271,8 +1270,8 @@ const UnifiedPermissionsDialog: React.FC<UnifiedPermissionsDialogProps> = ({
                                 </TableCell>
                                 <TableCell align="right" sx={{ py: 1.5 }}>
                                   <Stack direction="row" spacing={0.5} justifyContent="flex-end">
-                                    {/* Only show edit button for non-OWNER users and non-TEAM types */}
-                                    {p.type !== 'TEAM' && p.role !== 'OWNER' && (
+                                    {/* Show edit button for non-TEAM types (including OWNER) */}
+                                    {p.type !== 'TEAM' && (
                                       <Tooltip title="Edit permissions">
                                         <span>
                                           <IconButton
@@ -1292,9 +1291,8 @@ const UnifiedPermissionsDialog: React.FC<UnifiedPermissionsDialogProps> = ({
                                         </span>
                                       </Tooltip>
                                     )}
-                                    {/* Only show delete button for non-OWNER users */}
-                                    {p.role !== 'OWNER' && (
-                                      <Tooltip title="Remove access">
+                                    {/* Show delete button for all users (including OWNER) */}
+                                    <Tooltip title="Remove access">
                                         <span>
                                           <IconButton
                                             size="small"
@@ -1315,7 +1313,6 @@ const UnifiedPermissionsDialog: React.FC<UnifiedPermissionsDialogProps> = ({
                                           </IconButton>
                                         </span>
                                       </Tooltip>
-                                    )}
                                   </Stack>
                                 </TableCell>
                               </TableRow>

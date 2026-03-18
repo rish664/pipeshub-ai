@@ -62,9 +62,10 @@ export interface Metadata {
 }
 
 export interface Record {
-  _key: string;
-  _id: string;
-  _rev: string;
+  _key?: string;
+  _id?: string;
+  _rev?: string;
+  id: string;
   orgId: string;
   recordName: string;
   externalRecordId: string;
@@ -80,6 +81,7 @@ export interface Record {
   isVLMOcrProcessed?: boolean;
   indexingStatus: string;
   version: number;
+  sizeInBytes?: number;
   fileRecord: FileRecord | null;
   mailRecord: MailRecord | null;
   ticketRecord: TicketRecord | null;
@@ -93,12 +95,14 @@ export interface Record {
   reason:string
   mimeType?: string;
   previewRenderable?: boolean;
+  hideWeburl?: boolean;
 }
 
 export interface FileRecord {
-  _key: string;
-  _id: string;
-  _rev: string;
+  _key?: string;
+  _id?: string;
+  _rev?: string;
+  id: string;
   orgId: string;
   name: string;
   isFile: boolean;
@@ -110,9 +114,10 @@ export interface FileRecord {
 }
 
 export interface MailRecord {
-  _key: string;
-  _id: string;
-  _rev: string;
+  _key?: string;
+  _id?: string;
+  _rev?: string;
+  id: string;
   threadId: string;
   isParent: boolean;
   internalDate: string;
@@ -129,20 +134,22 @@ export interface MailRecord {
 }
 
 export interface TicketRecord {
-  _key: string;
-  _id: string;
-  _rev: string;
+  _key?: string;
+  _id?: string;
+  _rev?: string;
+  id: string;
   orgId: string;
   name: string;
-  summary: string;
-  description: string | null;
   status: string;
   priority: string;
+  type: string;
+  deliveryStatus: string;
   assignee: string | null;
   reporterEmail: string | null;
   assigneeEmail: string | null;
   creatorEmail: string;
   creatorName: string;
+  reporterName: string | null;
 }
 
 export interface Permissions {

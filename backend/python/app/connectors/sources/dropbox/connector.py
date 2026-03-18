@@ -31,6 +31,7 @@ from app.config.constants.arangodb import (
     Connectors,
     MimeTypes,
     OriginTypes,
+    ProgressStatus,
 )
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.core.base.connector.connector_service import BaseConnector
@@ -53,6 +54,7 @@ from app.connectors.core.registry.connector_builder import (
     ConnectorBuilder,
     ConnectorScope,
     DocumentationLink,
+    SyncStrategy,
 )
 from app.connectors.core.registry.filters import (
     FilterCategory,
@@ -74,7 +76,6 @@ from app.models.entities import (
     AppUser,
     AppUserGroup,
     FileRecord,
-    IndexingStatus,
     Record,
     RecordGroup,
     RecordGroupType,
@@ -226,7 +227,7 @@ def get_mimetype_enum_for_dropbox(entry: Union[FileMetadata, FolderMetadata]) ->
             default_value=True
         ))
         .with_webhook_config(True, ["file.added", "file.modified", "file.deleted"])
-        .with_sync_strategies(["SCHEDULED", "MANUAL"])
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
         .add_sync_custom_field(CommonFields.batch_size_field())
         .with_sync_support(True)
@@ -271,7 +272,7 @@ class DropboxConnector(BaseConnector):
 
         self.data_source: Optional[DropboxDataSource] = None
         self.batch_size = 100
-        self.max_concurrent_batches = 5
+        self.max_concurrent_batches = 1 # set to 1 for now to avoid write write conflicts for small number of records
         self.rate_limiter = AsyncLimiter(50, 1)  # 50 requests per second
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
@@ -671,7 +672,7 @@ class DropboxConnector(BaseConnector):
                     files_disabled = not self.indexing_filters.is_enabled(IndexingFilterKey.FILES, default=True)
                     shared_disabled = record_update.record.is_shared and not self.indexing_filters.is_enabled(IndexingFilterKey.SHARED, default=True)
                     if files_disabled or shared_disabled:
-                        record_update.record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                        record_update.record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
 
                     yield (record_update.record, record_update.new_permissions or [], record_update)
                 await asyncio.sleep(0)
@@ -973,13 +974,12 @@ class DropboxConnector(BaseConnector):
             return None
 
         is_file = isinstance(entry, FileMetadata)
-        record_type = RecordType.FILE if is_file else RecordType.FOLDER
         mime_type, _ = mimetypes.guess_type(entry.name) if is_file else (None, None)
 
         file_record = FileRecord(
             id=str(uuid.uuid4()),
             record_name=entry.name,
-            record_type=record_type,
+            record_type=RecordType.FILE,
             record_group_type=RecordGroupType.DRIVE.value,
             external_record_id=entry.id,
             external_revision_id=entry.rev if is_file else None,
@@ -3111,18 +3111,6 @@ class DropboxConnector(BaseConnector):
     ) -> NoReturn:
         """Dropbox connector does not support dynamic filter options."""
         raise NotImplementedError("Dropbox connector does not support dynamic filter options")
-
-    # @classmethod
-    # async def create_connector(
-    #     cls, logger, arango_service: BaseArangoService, config_service: ConfigurationService
-    # ) -> "BaseConnector":
-    #     data_entities_processor = DataSourceEntitiesProcessor(
-    #         logger, arango_service, config_service
-    #     )
-    #     await data_entities_processor.initialize()
-    #     return DropboxConnector(
-    #         logger, data_entities_processor, arango_service, config_service
-    #     )
 
     @classmethod
     async def create_connector(

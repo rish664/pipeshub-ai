@@ -1,18 +1,103 @@
-import asyncio
 import json
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
+from app.agents.actions.utils import run_async
 from app.agents.tools.decorator import tool
 from app.agents.tools.enums import ParameterType
 from app.agents.tools.models import ToolParameter
-from app.sources.client.http.http_response import HTTPResponse
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.tool_builder import (
+    ToolCategory,
+    ToolDefinition,
+    ToolsetBuilder,
+)
 from app.sources.client.microsoft.microsoft import MSGraphClient
 from app.sources.external.microsoft.sharepoint.sharepoint import SharePointDataSource
 
 logger = logging.getLogger(__name__)
 
+# Define tools
+tools: List[ToolDefinition] = [
+    ToolDefinition(
+        name="get_sites",
+        description="Get SharePoint sites",
+        parameters=[
+            {"name": "search", "type": "string", "description": "Search query", "required": False}
+        ],
+        tags=["sites", "list"]
+    ),
+    ToolDefinition(
+        name="get_site",
+        description="Get site details",
+        parameters=[
+            {"name": "site_id", "type": "string", "description": "Site ID", "required": True}
+        ],
+        tags=["sites", "read"]
+    ),
+    ToolDefinition(
+        name="get_lists",
+        description="Get lists in a site",
+        parameters=[
+            {"name": "site_id", "type": "string", "description": "Site ID", "required": True}
+        ],
+        tags=["lists", "list"]
+    ),
+    ToolDefinition(
+        name="get_drives",
+        description="Get drives in a site",
+        parameters=[
+            {"name": "site_id", "type": "string", "description": "Site ID", "required": True}
+        ],
+        tags=["drives", "list"]
+    ),
+    ToolDefinition(
+        name="get_pages",
+        description="Get pages in a site",
+        parameters=[
+            {"name": "site_id", "type": "string", "description": "Site ID", "required": True}
+        ],
+        tags=["pages", "list"]
+    ),
+]
 
+
+# Register SharePoint toolset
+@ToolsetBuilder("SharePoint")\
+    .in_group("Microsoft 365")\
+    .with_description("SharePoint integration for sites, lists, and document management")\
+    .with_category(ToolCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="SharePoint",
+            authorize_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            token_url="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            redirect_uri="toolsets/oauth/callback/sharepoint",
+            scopes=OAuthScopeConfig(
+                personal_sync=[],
+                team_sync=[],
+                agent=[
+                    "Sites.ReadWrite.All",
+                    "Files.ReadWrite.All"
+                ]
+            ),
+            fields=[
+                CommonFields.client_id("Azure App Registration"),
+                CommonFields.client_secret("Azure App Registration")
+            ],
+            icon_path="/assets/icons/connectors/sharepoint.svg",
+            app_group="Microsoft 365",
+            app_description="SharePoint OAuth application for agent integration"
+        )
+    ])\
+    .with_tools(tools)\
+    .configure(lambda builder: builder.with_icon("/assets/icons/connectors/sharepoint.svg"))\
+    .build_decorator()
 class SharePoint:
     """SharePoint tool exposed to the agents"""
     def __init__(self, client: MSGraphClient) -> None:
@@ -24,22 +109,6 @@ class SharePoint:
             None
         """
         self.client = SharePointDataSource(client)
-
-    def _run_async(self, coro) -> HTTPResponse: # type: ignore [valid method]
-        """Helper method to run async operations in sync context"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, we need to use a thread pool
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, coro)
-                    return future.result()
-            else:
-                return loop.run_until_complete(coro)
-        except Exception as e:
-            logger.error(f"Error running async operation: {e}")
-            raise
 
     @tool(
         app_name="sharepointonline",
@@ -115,7 +184,7 @@ class SharePoint:
         """
         try:
             # Use SharePointDataSource method
-            response = self._run_async(self.client.sites_get_all_sites(
+            response = run_async(self.client.sites_get_all_sites(
                 search=search,
                 filter=filter,
                 orderby=orderby,
@@ -175,7 +244,7 @@ class SharePoint:
         """
         try:
             # Use SharePointDataSource method
-            response = self._run_async(self.client.sites_site_get_by_path(
+            response = run_async(self.client.sites_site_get_by_path(
                 site_id=site_id,
                 select=select,
                 expand=expand
@@ -271,7 +340,7 @@ class SharePoint:
         """
         try:
             # Use SharePointDataSource method
-            response = self._run_async(self.client.sites_list_lists(
+            response = run_async(self.client.sites_list_lists(
                 site_id=site_id,
                 search=search,
                 filter=filter,
@@ -372,7 +441,7 @@ class SharePoint:
         """
         try:
             # Use SharePointDataSource method
-            response = self._run_async(self.client.sites_list_drives(
+            response = run_async(self.client.sites_list_drives(
                 site_id=site_id,
                 search=search,
                 filter=filter,
@@ -473,7 +542,7 @@ class SharePoint:
         """
         try:
             # Use SharePointDataSource method
-            response = self._run_async(self.client.sites_list_pages(
+            response = run_async(self.client.sites_list_pages(
                 site_id=site_id,
                 search=search,
                 filter=filter,

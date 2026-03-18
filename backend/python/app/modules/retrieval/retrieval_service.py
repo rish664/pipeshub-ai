@@ -1,11 +1,12 @@
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+import traceback
+from typing import Any, Optional
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_qdrant import FastEmbedSparse, QdrantVectorStore, RetrievalMode
+from langchain_qdrant import FastEmbedSparse
 from qdrant_client import models
 
 from app.config.configuration_service import ConfigurationService
@@ -16,15 +17,14 @@ from app.config.constants.ai_models import (
 # from langchain_cohere import CohereEmbeddings
 from app.config.constants.arangodb import (
     CollectionNames,
-    Connectors,
     RecordTypes,
 )
 from app.config.constants.service import config_node_constants
-from app.connectors.services.base_arango_service import BaseArangoService
 from app.exceptions.embedding_exceptions import EmbeddingModelCreationError
 from app.exceptions.fastapi_responses import Status
 from app.models.blocks import GroupType
 from app.modules.transformers.blob_storage import BlobStorage
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.services.vector_db.interface.vector_db import IVectorDBService
 from app.sources.client.http.exception.exception import VectorDBEmptyError
 from app.utils.aimodels import (
@@ -39,7 +39,7 @@ from app.utils.chat_helpers import (
 from app.utils.mimetype_to_extension import get_extension_from_mimetype
 
 # OPTIMIZATION: User data cache with TTL
-_user_cache: Dict[str, tuple] = {}  # {user_id: (user_data, timestamp)}
+_user_cache: dict[str, tuple] = {}  # {user_id: (user_data, timestamp)}
 USER_CACHE_TTL = 300  # 5 minutes
 MAX_USER_CACHE_SIZE = 1000  # Max number of users to keep in cache
 
@@ -51,7 +51,7 @@ class RetrievalService:
         config_service: ConfigurationService,
         collection_name: str,
         vector_db_service: IVectorDBService,
-        arango_service: BaseArangoService,
+        graph_provider: IGraphDBProvider,
         blob_store: BlobStorage,
     ) -> None:
         """
@@ -61,12 +61,13 @@ class RetrievalService:
             collection_name: Name of the collection
             vector_db_service: Vector DB service
             config_service: Configuration service
+            graph_provider: Graph database provider
         """
 
         self.logger = logger
         self.config_service = config_service
         self.llm = None
-        self.arango_service = arango_service
+        self.graph_provider = graph_provider
         self.blob_store = blob_store
         # Initialize sparse embeddings
         try:
@@ -80,7 +81,6 @@ class RetrievalService:
         self.vector_db_service = vector_db_service
         self.collection_name = collection_name
         self.logger.info(f"Retrieval service initialized with collection name: {self.collection_name}")
-        self.vector_store = None
         self.embedding_model = None
         self.embedding_size = None
         self.embedding_model_instance = None
@@ -221,7 +221,7 @@ class RetrievalService:
             self.logger.error(f"Error in query preprocessing: {str(e)}")
             return query.strip()
 
-    def _format_results(self, results: List[tuple]) -> List[Dict[str, Any]]:
+    def _format_results(self, results: list[tuple]) -> list[dict[str, Any]]:
         """Format search results into a consistent structure with flattened metadata."""
         formatted_results = []
         for doc, score in results:
@@ -236,60 +236,48 @@ class RetrievalService:
 
     async def search_with_filters(
         self,
-        queries: List[str],
+        queries: list[str],
         user_id: str,
         org_id: str,
-        filter_groups: Optional[Dict[str, List[str]]] = None,
+        filter_groups: Optional[dict[str, list[str]]] = None,
         limit: int = 20,
-        virtual_record_ids_from_tool: Optional[List[str]] = None,
-        arango_service: Optional[BaseArangoService] = None,
+        virtual_record_ids_from_tool: Optional[list[str]] = None,
+        graph_provider: Optional[IGraphDBProvider] = None,
         knowledge_search:bool = False,
         is_agent:bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Perform semantic search on accessible records with multiple queries."""
 
         try:
             # Get accessible records
-            if not self.arango_service:
-                raise ValueError("ArangoService is required for permission checking")
+            if not self.graph_provider:
+                raise ValueError("GraphProvider is required for permission checking")
 
             filter_groups = filter_groups or {}
 
+            # Extract KB IDs for response metadata
             kb_ids = filter_groups.get('kb', None) if filter_groups else None
-            # Convert filter_groups to format expected by get_accessible_records
-            arango_filters = {}
+
+            # Convert filter_groups to format expected by get_accessible_virtual_record_ids
+            filters = {}
             if filter_groups:  # Only process if filter_groups is not empty
                 for key, values in filter_groups.items():
                     # Convert key to match collection naming
-                    metadata_key = (
-                        key.lower()
-                    )  # e.g., 'departments', 'categories', etc.
-                    arango_filters[metadata_key] = values
+                    metadata_key = key.lower()  # e.g., 'departments', 'categories', etc.
+                    filters[metadata_key] = values
 
             init_tasks = [
-                self._get_accessible_records_task(user_id, org_id, filter_groups, self.arango_service),
-                self._get_vector_store_task(),
+                self._get_accessible_virtual_ids_task(user_id, org_id, filters, self.graph_provider),
                 self._get_user_cached(user_id)  # Get user info in parallel with caching
             ]
 
-            accessible_records, vector_store, user = await asyncio.gather(*init_tasks)
+            accessible_virtual_record_ids, user = await asyncio.gather(*init_tasks)
 
-            if not accessible_records:
+            if not accessible_virtual_record_ids:
                 self.logger.error(f"No accessible documents found for user {user_id} and org {org_id}")
                 return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
 
-            # FIX: Filter out None records before processing
-            record_id_to_record_map = {}
-            for r in accessible_records:
-                if r:
-                    record_id_to_record_map[r["_key"]] = r
-
-            accessible_virtual_record_ids = [
-                record["virtualRecordId"] for record in record_id_to_record_map.values()
-                if record.get("virtualRecordId") is not None
-            ]
-
-            self.logger.debug(f"Accessible virtual record ids: {accessible_virtual_record_ids}")
+            self.logger.debug(f"Accessible virtual record ids count: {len(accessible_virtual_record_ids)}")
 
             if virtual_record_ids_from_tool:
                 filter  = await self.vector_db_service.filter_collection(
@@ -300,7 +288,7 @@ class RetrievalService:
                         must={"orgId": org_id},
                         should={"virtualRecordId": accessible_virtual_record_ids}  # Pass as should condition
                     )
-            search_results = await self._execute_parallel_searches(queries, filter, limit, vector_store)
+            search_results = await self._execute_parallel_searches(queries, filter, limit)
 
             if not search_results:
                 self.logger.debug("No search results found")
@@ -308,9 +296,8 @@ class RetrievalService:
 
             self.logger.info(f"Search results count: {len(search_results) if search_results else 0}")
 
-            # OPTIMIZATION: Extract virtual_record_ids using set comprehension (faster than loop)
-            self.logger.debug("Starting to extract virtual_record_ids")
-            virtual_record_ids = list({
+            self.logger.debug("Extracting virtualRecordIds from Qdrant results")
+            returned_virtual_record_ids = list({
                 result["metadata"]["virtualRecordId"]
                 for result in search_results
                 if result
@@ -319,26 +306,41 @@ class RetrievalService:
                 and result["metadata"].get("virtualRecordId") is not None
             })
 
-            virtual_record_ids = list(set(virtual_record_ids))
-            self.logger.debug(f"Extracted virtual_record_ids: {virtual_record_ids}")
+            self.logger.debug(f"Qdrant returned {len(returned_virtual_record_ids)} unique virtualRecordIds")
+
+            if not returned_virtual_record_ids:
+                return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
+
+            self.logger.debug(f"Fetching {len(returned_virtual_record_ids)} records by virtualRecordIds")
+            fetched_records = await self.graph_provider.get_records_by_virtual_record_ids(
+                returned_virtual_record_ids, org_id
+            )
+
+            if not fetched_records:
+                self.logger.error("Failed to fetch records by virtualRecordIds")
+                return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
+
+            record_id_to_record_map = {}
+            for r in fetched_records:
+                if r:
+                    record_id_to_record_map[r["_key"]] = r
 
             virtual_to_record_map = {}
             try:
-                self.logger.debug("About to call _create_virtual_to_record_mapping")
-                virtual_to_record_map = self._create_virtual_to_record_mapping(record_id_to_record_map.values(), virtual_record_ids)
+                self.logger.debug("Creating virtual_to_record_mapping from fetched records")
+                virtual_to_record_map = self._create_virtual_to_record_mapping(
+                    fetched_records, returned_virtual_record_ids
+                )
             except Exception as e:
-                self.logger.error(f"Error in _create_virtual_to_record_mapping: {e}")
-                import traceback
-                self.logger.error(f"Traceback: {traceback.format_exc()}")
+                self.logger.error("Error in _create_virtual_to_record_mapping: %s", e, exc_info=True)
                 raise
 
-            unique_record_ids = set(r.get("_key") for r in virtual_to_record_map.values() if r)
+            unique_record_ids = {r.get("_key") for r in virtual_to_record_map.values() if r}
 
             if not unique_record_ids:
                 return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
             self.logger.info(f"Unique record IDs count: {len(unique_record_ids)}")
 
-            # OPTIMIZATION: First pass - enrich metadata and collect IDs that need additional fetching
             file_record_ids_to_fetch = []
             mail_record_ids_to_fetch = []
             result_to_record_map = {}  # Map result index to record_id for later URL assignment
@@ -354,7 +356,7 @@ class RetrievalService:
                 virtual_id = result["metadata"].get("virtualRecordId")
                 if virtual_id is not None and virtual_id in virtual_to_record_map:
                     record_id = virtual_to_record_map[virtual_id].get("_key")
-                    record = record_id_to_record_map.get(record_id, None)
+                    record = record_id_to_record_map.get(record_id)
 
                     result["metadata"]["recordId"] = record_id
                     if record:
@@ -369,6 +371,7 @@ class RetrievalService:
                         result["metadata"]["webUrl"] = weburl
                         result["metadata"]["recordName"] = record.get("recordName")
                         result["metadata"]["previewRenderable"] = record.get("previewRenderable", True)
+                        result["metadata"]["hideWeburl"] = record.get("hideWeburl", False)
 
                         mime_type = record.get("mimeType")
                         if not mime_type:
@@ -385,7 +388,6 @@ class RetrievalService:
                             if ext:
                                 result["metadata"]["extension"] = ext
 
-                        # Collect IDs that need additional fetching (instead of fetching immediately)
                         if not weburl:
                             if record.get("recordType", "") == RecordTypes.FILE.value:
                                 file_record_ids_to_fetch.append(record_id)
@@ -400,7 +402,7 @@ class RetrievalService:
                             is_block_group = meta.get("isBlockGroup")
                             if is_block_group is not None:
                                 if virtual_id not in virtual_record_id_to_record:
-                                    await get_record(meta,virtual_id,virtual_record_id_to_record,self.blob_store,org_id)
+                                    await get_record(virtual_id,virtual_record_id_to_record,self.blob_store,org_id,virtual_to_record_map)
                                     record = virtual_record_id_to_record[virtual_id]
                                     if record is None:
                                         continue
@@ -409,17 +411,15 @@ class RetrievalService:
 
                 final_search_results.append(result)
 
-            # OPTIMIZATION: Batch fetch all files and mails in parallel
             files_map = {}
             mails_map = {}
 
-            async def fetch_files() -> Dict:
+            async def fetch_files() -> dict:
                 if not file_record_ids_to_fetch:
                     return {}
                 try:
-                    # Fetch files in parallel
                     file_results = await asyncio.gather(*[
-                        self.arango_service.get_document(record_id, CollectionNames.FILES.value)
+                        self.graph_provider.get_document(record_id, CollectionNames.FILES.value)
                         for record_id in file_record_ids_to_fetch
                     ], return_exceptions=True)
                     return {
@@ -431,13 +431,12 @@ class RetrievalService:
                     self.logger.warning(f"Failed to batch fetch files: {str(e)}")
                     return {}
 
-            async def fetch_mails() -> Dict:
+            async def fetch_mails() -> dict:
                 if not mail_record_ids_to_fetch:
                     return {}
                 try:
-                    # Fetch mails in parallel
                     mail_results = await asyncio.gather(*[
-                        self.arango_service.get_document(record_id, CollectionNames.MAILS.value)
+                        self.graph_provider.get_document(record_id, CollectionNames.MAILS.value)
                         for record_id in mail_record_ids_to_fetch
                     ], return_exceptions=True)
                     return {
@@ -452,7 +451,6 @@ class RetrievalService:
             if file_record_ids_to_fetch or mail_record_ids_to_fetch:
                 files_map, mails_map = await asyncio.gather(fetch_files(), fetch_mails())
 
-            # Second pass - apply fetched URLs to results
             for idx, (record_id, record_type) in result_to_record_map.items():
                 result = search_results[idx]
                 record = record_id_to_record_map.get(record_id)
@@ -464,10 +462,6 @@ class RetrievalService:
                 if record_type == "file" and record_id in files_map:
                     files = files_map[record_id]
                     weburl = files.get("webUrl")
-                    if weburl and record.get("connectorName", "") == Connectors.GOOGLE_MAIL.value:
-                        user_email = user.get("email") if user else None
-                        if user_email:
-                            weburl = weburl.replace("{user.email}", user_email)
                     fallback_mimetype = files.get("mimeType")
                 elif record_type == "mail" and record_id in mails_map:
                     mail = mails_map[record_id]
@@ -558,29 +552,38 @@ class RetrievalService:
             self.logger.error(f"ValueError: {e}")
             return self._create_empty_response(f"Bad request: {str(e)}", Status.ERROR)
         except Exception as e:
-            import traceback
-            tb_str = traceback.format_exc()
-            self.logger.error(f"Filtered search failed: {str(e)}")
-            self.logger.error(f"Full traceback:\n{tb_str}")
+            self.logger.error(f"Filtered search failed: {e}\n{traceback.format_exc()}")
             if virtual_record_ids_from_tool:
                 return {}
             return self._create_empty_response("Unexpected server error during search.", Status.ERROR)
 
-    async def _get_accessible_records_task(self, user_id, org_id, filter_groups, arango_service: BaseArangoService) -> List[Dict[str, Any]]:
-        """Separate task for getting accessible records"""
+    async def _get_accessible_records_task(self, user_id, org_id, filter_groups, graph_provider: IGraphDBProvider) -> list[dict[str, Any]]:
+        """Separate task for getting accessible records (legacy method - returns full records)"""
         filter_groups = filter_groups or {}
-        arango_filters = {}
+        filters = {}
 
         if filter_groups:
             for key, values in filter_groups.items():
                 metadata_key = key.lower()
-                arango_filters[metadata_key] = values
+                filters[metadata_key] = values
 
-        return await arango_service.get_accessible_records(
-            user_id=user_id, org_id=org_id, filters=arango_filters
+        return await graph_provider.get_accessible_records(
+            user_id=user_id, org_id=org_id, filters=filters
         )
 
-    async def _get_user_cached(self, user_id: str) -> Optional[Dict[str, Any]]:
+    async def _get_accessible_virtual_ids_task(
+        self, user_id: str, org_id: str, filters: dict[str, list[str]], graph_provider: IGraphDBProvider
+    ) -> list[str]:
+        """
+        Separate task for getting accessible virtualRecordIds (optimized version).
+
+        This is the optimized version that returns only virtualRecordIds instead of full records.
+        """
+        return await graph_provider.get_accessible_virtual_record_ids(
+            user_id=user_id, org_id=org_id, filters=filters
+        )
+
+    async def _get_user_cached(self, user_id: str) -> Optional[dict[str, Any]]:
         """
         OPTIMIZATION: Get user data with caching to avoid repeated DB calls.
         Cache expires after USER_CACHE_TTL seconds (default 5 minutes).
@@ -599,7 +602,7 @@ class RetrievalService:
 
         # Cache miss - fetch from database
         self.logger.debug(f"User cache miss for user_id: {user_id}")
-        user_data = await self.arango_service.get_user_by_user_id(user_id)
+        user_data = await self.graph_provider.get_user_by_user_id(user_id)
 
         # Store in cache
         _user_cache[user_id] = (user_data, time.time())
@@ -612,60 +615,61 @@ class RetrievalService:
 
         return user_data
 
+    # Convert sparse embeddings to Qdrant's SparseVector format; FastEmbedSparse returns
+    # LangChain's SparseVector, which Prefetch does not accept.
+    @staticmethod
+    def to_qdrant_sparse(sparse: models.SparseVector | dict[str, Any] | object) -> models.SparseVector:
+        if isinstance(sparse, models.SparseVector):
+            return sparse
+        if hasattr(sparse, "indices") and hasattr(sparse, "values"):
+            return models.SparseVector(indices=list(sparse.indices), values=list(sparse.values))
+        if isinstance(sparse, dict) and "indices" in sparse and "values" in sparse:
+            return models.SparseVector(indices=sparse["indices"], values=sparse["values"])
+        raise ValueError("Cannot convert sparse embedding to Qdrant SparseVector")
 
-    async def _get_vector_store_task(self) -> QdrantVectorStore:
-        """Cached vector store retrieval"""
-        if not self.vector_store:
-            # Check collection exists
-            collections = await self.vector_db_service.get_collections()
-            self.logger.info(f"Collections: {collections}")
-            collection_info = (
-                await self.vector_db_service.get_collection(self.collection_name)
-                if any(col.name == self.collection_name for col in collections.collections) # type: ignore
-                else None
-            )
-            if not collection_info or collection_info.points_count == 0: # type: ignore
-                raise VectorDBEmptyError("Vector DB is empty or collection not found")
-
-            # Get cached embedding model
-            dense_embeddings = await self.get_embedding_model_instance()
-            self.logger.info(f"Dense embeddings: {dense_embeddings}")
-            if not dense_embeddings:
-                raise ValueError("No dense embeddings found")
-
-            self.vector_store = QdrantVectorStore(
-                client=self.vector_db_service.get_service_client(),
-                collection_name=self.collection_name,
-                vector_name="dense",
-                sparse_vector_name="sparse",
-                embedding=dense_embeddings,
-                sparse_embedding=self.sparse_embeddings,
-                retrieval_mode=RetrievalMode.HYBRID,
-            )
-            self.logger.info(f"Vector store: {self.vector_store}")
-        return self.vector_store
-
-
-    async def _execute_parallel_searches(self, queries, filter, limit, vector_store) -> List[Dict[str, Any]]:
-        """Execute all searches in parallel"""
+    async def _execute_parallel_searches(self, queries, filter, limit) -> list[dict[str, Any]]:
+        """Execute all searches in parallel using hybrid (dense + sparse) retrieval with RRF fusion."""
         all_results = []
 
         dense_embeddings = await self.get_embedding_model_instance()
         if not dense_embeddings:
             raise ValueError("No dense embeddings found")
+        if not self.sparse_embeddings:
+            raise ValueError("No sparse embeddings found")
 
-        # OPTIMIZATION: Parallelize embedding generation for multiple queries
-        query_embeddings = await asyncio.gather(*[
-            dense_embeddings.aembed_query(query) for query in queries
-        ])
+        # OPTIMIZATION: Parallelize dense and sparse embedding generation for multiple queries
+        dense_tasks = [dense_embeddings.aembed_query(query) for query in queries]
+        sparse_tasks = [
+            asyncio.to_thread(self.sparse_embeddings.embed_query, query) for query in queries
+        ]
+        dense_query_embeddings, sparse_query_embeddings = await asyncio.gather(
+            asyncio.gather(*dense_tasks),
+            asyncio.gather(*sparse_tasks),
+        )
 
-        query_requests = [models.QueryRequest(
-            query=query_embedding,
-            with_payload=True,
-            limit=limit,
-            using="dense",
-            filter=filter,
-        ) for query_embedding in query_embeddings]
+
+
+        query_requests = [
+            models.QueryRequest(
+                prefetch=[
+                    models.Prefetch(
+                        query=dense_embedding,
+                        using="dense",
+                        limit=limit * 2,  # Fetch more candidates
+                    ),
+                    models.Prefetch(
+                        query=self.to_qdrant_sparse(sparse_embedding),
+                        using="sparse",
+                        limit=limit * 2,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),  # Reciprocal Rank Fusion
+                with_payload=True,
+                limit=limit,
+                filter=filter,
+            )
+            for dense_embedding, sparse_embedding in zip(dense_query_embeddings, sparse_query_embeddings)
+        ]
         search_results = self.vector_db_service.query_nearest_points(
             collection_name=self.collection_name,
             requests=query_requests,
@@ -688,7 +692,7 @@ class RetrievalService:
 
         return self._format_results(all_results)
 
-    def _create_empty_response(self, message: str, status: Status) -> Dict[str, Any]:
+    def _create_empty_response(self, message: str, status: Status) -> dict[str, Any]:
         """Helper to create empty response with appropriate HTTP status codes"""
         # Map status types to appropriate HTTP status codes
         status_code_mapping = {
@@ -713,9 +717,9 @@ class RetrievalService:
 
     def _create_virtual_to_record_mapping(
         self,
-        accessible_records: List[Dict[str, Any]],
-        virtual_record_ids: List[str]
-    ) -> Dict[str, Dict[str, Any]]:
+        accessible_records: list[dict[str, Any]],
+        virtual_record_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
         """
         Create virtual record ID to record mapping from already fetched accessible_records.
         This eliminates the need for an additional database query.
@@ -731,7 +735,6 @@ class RetrievalService:
             if record and isinstance(record, dict):
                 virtual_id = record.get("virtualRecordId", None)
                 record_id = record.get("_key", None)
-                # self.logger.info(f"Virtual ID: {virtual_id}, Record ID: {record_id}")
                 if virtual_id and record_id:
                     if virtual_id not in virtual_to_records:
                         virtual_to_records[virtual_id] = []
