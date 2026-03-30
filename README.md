@@ -74,7 +74,27 @@
   </a>
 </p>
 
+<!--Table of Contents-->
+
+## Table of Contents
+
+- [About PipesHub](#about-pipeshub)
+- [High Level Architecture Diagram](#high-level-architecture-diagram)
+- [Spotlight Features](#spotlight-features)
+- [Unmatched Value of PipesHub](#unmatched-value-of-pipeshub)
+- [Connectors](#connectors)
+- [File Formats Supported](#file-formats-supported)
+- [Tech Stack](#tech-stack)
+- [MCP Server](#mcp-server)
+- [SDKs](#sdks)
+- [RoadMap](#roadmap)
+- [Deployment Guide](#-deployment-guide)
+- [Contributing](#-contributing)
+- [Star Us on GitHub](#star--us-on-github)
+
 <!--Intro-->
+
+<h2 id="about-pipeshub">About PipesHub</h2>
 
 <strong>[PipesHub](https://www.pipeshub.com/)</strong> is a fully extensible and explainable workplace AI platform for enterprise search and workflow automation.
 In most companies, important work data is spread across multiple apps like Google Workspace, Microsoft 365, Slack, Jira, Confluence, and more. PipesHub AI helps you quickly find the right information using natural language search—just like Google.
@@ -242,6 +262,24 @@ docker compose -f docker-compose.dev.yml -p pipeshub-ai up --build -d
 # 🛑 To stop the services
 docker compose -f docker-compose.dev.yml -p pipeshub-ai down
 ```
+
+## MCP Server
+
+Use PipesHub with any MCP-compatible client to bring your enterprise context into AI workflows. Check the README for setup and usage.
+
+**Repository:** [pipeshub-ai/mcp-server](https://github.com/pipeshub-ai/mcp-server/)
+
+## SDKs
+
+PipesHub provides developer SDKs for Python, TypeScript, and Go to help you integrate quickly. Check the respective SDK repository README for setup and usage details.
+
+| Name | Description | Link |
+|------|-------------|------|
+| **Python SDK** | Python SDK for PipesHub | [pipeshub-ai/pipeshub-sdk-python](https://github.com/pipeshub-ai/pipeshub-sdk-python) |
+| **TypeScript SDK** | TypeScript SDK for PipesHub | [pipeshub-ai/pipeshub-sdk-typescript](https://github.com/pipeshub-ai/pipeshub-sdk-typescript) |
+| **Go SDK** | Go SDK for PipesHub | [pipeshub-ai/pipeshub-sdk-go](https://github.com/pipeshub-ai/pipeshub-sdk-go) |
+
+> Need an SDK in another language? Reach out to us at developer@pipeshub.com
 
 ## 👥 Contributing
 
