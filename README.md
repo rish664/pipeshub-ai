@@ -204,13 +204,13 @@ Beyond search, our platform allows enterprises to create custom apps and AI agen
 
 ## RoadMap
 
-- Code Search
-- Workplace AI Agents
-- MCP
-- APIs and SDKs
-- Personalized Search
-- Highly available and scalable Kubernetes deployment
-- PageRank
+[ ] Code Search
+[x] Workplace AI Agents
+[x] MCP
+[x] APIs and SDKs
+[ ] Personalized Search
+[ ] Highly available and scalable Kubernetes deployment
+[ ] PageRank
 
 ## 🚀 Deployment Guide
 
