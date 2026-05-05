@@ -2,7 +2,7 @@
 
 <img src="https://raw.githubusercontent.com/pipeshub-ai/media-assets/refs/heads/main/images/pipeshub-logo.svg" alt="PipesHub" width="280"/>
 
-<h3>The open-source workplace AI platform. Built to be self-hosted, grounded in a knowledge graph, and honest about its sources.</h3>
+<h3>The Open Source Workplace AI Platform</h3>
 
 <p>
   <a href="https://www.pipeshub.com/">Website</a> ·
