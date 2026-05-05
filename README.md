@@ -1,78 +1,29 @@
-<a name="readme-top"></a>
-
-<p align="center">
-<a href="https://www.pipeshub.com/">
-<img width="10%" alt="PipesHub Logo" src="https://raw.githubusercontent.com/pipeshub-ai/media-assets/refs/heads/main/images/pipeshub-logo.svg"/> 
-</a>
-</p>
-<p align="center"></p>
-<p align="center"><b>Workplace AI Platform</b></p>
-
-<p align="center" style="display: flex; justify-content: center; gap: 20px; align-items: center;">
-  <a href="https://trendshift.io/repositories/14618" target="_blank">
-    <img src="https://trendshift.io/api/badge/repositories/14618" alt="pipeshub-ai%2Fpipeshub-ai | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/>
-  </a>
-
 <div align="center">
-<b>⭐ Star the repo! It helps the platform reach more developers and grow the community.</b>
-</div>
 
-<h2 align="center"></h2>
+<img src="https://raw.githubusercontent.com/pipeshub-ai/media-assets/refs/heads/main/images/pipeshub-logo.svg" alt="PipesHub" width="280"/>
 
-<!--Links in Readme-->
-<p align="center">
-  <a href="https://docs.pipeshub.com/" target="_blank">
-    <img src="https://img.shields.io/badge/Docs-View-informational?style=flat-square&logo=readthedocs&logoColor=white" 
-        alt="Docs" style="height:28px;">
-  </a>
-  &nbsp;&nbsp;
-  <a href="https://discord.com/invite/K5RskzJBm2" target="_blank">
-    <img src="https://img.shields.io/discord/1359557598222745670?label=Discord&logo=discord&logoColor=white&style=flat-square" 
-        alt="Discord" style="height:28px;">
-  </a>
+<h3>The open-source workplace AI platform. Built to be self-hosted, grounded in a knowledge graph, and honest about its sources.</h3>
+
+<p>
+  <a href="https://www.pipeshub.com/">Website</a> ·
+  <a href="https://docs.pipeshub.com/">Docs</a> ·
+  <a href="https://discord.com/invite/K5RskzJBm2">Discord</a> ·
+  <a href="https://plum-myrtle-9f7.notion.site/Pipeshub-s-Product-Roadmap-33841c164f54803a9989fd0fdbfdb1ee">Roadmap</a>
 </p>
 
-<p align="center">
-  <a href="https://github.com/pipeshub-ai/pipeshub-ai/stargazers">
-    <img src="https://img.shields.io/github/stars/pipeshub-ai/pipeshub-ai?style=social" alt="GitHub Repo stars">
-  </a>
-  &nbsp;
-  <a href="https://github.com/pipeshub-ai/pipeshub-ai/network/members">
-    <img src="https://img.shields.io/github/forks/pipeshub-ai/pipeshub-ai?style=social" alt="GitHub forks">
-  </a>
-  &nbsp;
-  <a href="https://hub.docker.com/r/pipeshubai/pipeshub-ai">
-    <img src="https://img.shields.io/docker/pulls/pipeshubai/pipeshub-ai?logo=docker&logoColor=white" alt="Docker Prod Pulls">
-  </a>
-</p>
+<a href="https://trendshift.io/repositories/14618"><img src="https://trendshift.io/api/badge/repositories/14618" alt="PipesHub on Trendshift" height="40"/></a>
 
-<p align="center">
-  <a href="https://github.com/pipeshub-ai/pipeshub-ai/issues">
-    <img src="https://img.shields.io/github/issues/pipeshub-ai/pipeshub-ai" alt="GitHub issues">
-  </a>
-  &nbsp;
-  <a href="https://github.com/pipeshub-ai/pipeshub-ai/pulls">
-    <img src="https://img.shields.io/github/issues-pr/pipeshub-ai/pipeshub-ai" alt="GitHub pull requests">
-  </a>
-  &nbsp;
-  <a href="https://github.com/pipeshub-ai/pipeshub-ai/graphs/contributors">
-    <img src="https://img.shields.io/github/contributors/pipeshub-ai/pipeshub-ai" alt="Contributors">
-  </a>
-  &nbsp;
+<p>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="https://github.com/pipeshub-ai/pipeshub-ai/releases"><img src="https://img.shields.io/github/v/release/pipeshub-ai/pipeshub-ai?color=success&amp;label=release" alt="Release"></a>
+  <a href="https://hub.docker.com/r/pipeshubai/pipeshub-ai"><img src="https://img.shields.io/docker/pulls/pipeshubai/pipeshub-ai?logo=docker&amp;logoColor=white" alt="Docker Pulls"></a>
+  <a href="https://discord.com/invite/K5RskzJBm2"><img src="https://img.shields.io/discord/1359557598222745670?label=Discord&amp;logo=discord&amp;logoColor=white" alt="Discord"></a>
   <img src="https://img.shields.io/github/last-commit/pipeshub-ai/pipeshub-ai" alt="Last commit">
+  <img src="https://img.shields.io/github/commit-activity/m/pipeshub-ai/pipeshub-ai" alt="Commits per month">
+  <a href="https://x.com/PipesHub"><img src="https://img.shields.io/twitter/follow/PipesHub?style=social" alt="Twitter"></a>
 </p>
 
-<p align="center">
-  <a href="https://opensource.org/licenses/Apache-2.0">
-    <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache-2.0">
-  </a>
-  <a href="https://x.com/PipesHub">
-    <img src="https://img.shields.io/twitter/follow/PipesHub?style=social" alt="Twitter Follow">
-  </a>
-  <a href="https://www.linkedin.com/company/pipeshub/" target="_blank">
-    <img src="https://img.shields.io/badge/LinkedIn-Follow-blue?logo=linkedin&logoColor=white&style=flat-square" alt="Follow on LinkedIn">
-  </a>
-</p>
+</div>
 
 <!--Table of Contents-->
 
